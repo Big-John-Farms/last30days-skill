@@ -204,6 +204,7 @@ def _extract_chromium_cookies_macos(
     keychain_service: str,
     domain: str,
     cookie_names: list[str],
+    key_cache: Optional[dict[str, Optional[bytes]]] = None,
 ) -> Optional[dict[str, str]]:
     """Extract cookies from any Chromium-based browser on macOS.
 
@@ -277,8 +278,13 @@ def _extract_chromium_cookies_macos(
                     # Keychain prompt for browsers that don't hold the requested
                     # cookie, which matters for FROM_BROWSER=auto across several
                     # installed Chromium browsers.
-                    passphrase = _get_chromium_encryption_key(keychain_service)
-                    aes_key = _derive_aes_key(passphrase) if passphrase else None
+                    if key_cache is not None and keychain_service in key_cache:
+                        aes_key = key_cache[keychain_service]
+                    else:
+                        passphrase = _get_chromium_encryption_key(keychain_service)
+                        aes_key = _derive_aes_key(passphrase) if passphrase else None
+                        if key_cache is not None:
+                            key_cache[keychain_service] = aes_key
                     key_fetched = True
                 if aes_key is None:
                     logger.debug("Skipping encrypted cookie %s — no Keychain access", name)
@@ -350,28 +356,12 @@ def _find_chromium_cookies_db(base_dir: Path) -> Optional[Path]:
     recently used one is the likeliest to hold current cookies. Lexicographic
     sort would visit "Profile 10" before "Profile 2", which can return the
     wrong profile, so we sort by mtime.
+
+    Kept for backward compatibility; new code should use
+    _find_all_chromium_cookies_dbs() to search across all profiles.
     """
-    found = _profile_cookie_db(base_dir / "Default")
-    if found:
-        return found
-
-    found = _profile_cookie_db(base_dir)
-    if found:
-        return found
-
-    try:
-        candidates = [
-            child for child in base_dir.iterdir()
-            if child.is_dir() and child.name.startswith("Profile ")
-        ]
-        for child in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
-            found = _profile_cookie_db(child)
-            if found:
-                return found
-    except OSError:
-        pass
-
-    return None
+    dbs = _find_all_chromium_cookies_dbs(base_dir)
+    return dbs[0] if dbs else None
 
 
 def _find_all_chromium_cookies_dbs(base_dir: Path) -> list[Path]:
@@ -421,8 +411,11 @@ def _extract_chromium_cookies_any_profile(
         logger.info("%s cookies database not found under %s", keychain_service, base_dir)
         return None
     best: Optional[dict[str, str]] = None
+    key_cache: dict[str, Optional[bytes]] = {}
     for db_path in db_paths:
-        got = _extract_chromium_cookies_macos(db_path, keychain_service, domain, cookie_names)
+        got = _extract_chromium_cookies_macos(
+            db_path, keychain_service, domain, cookie_names, key_cache=key_cache
+        )
         if got:
             if all(name in got for name in cookie_names):
                 logger.debug("Found complete cookie set for %s in %s", domain, db_path)

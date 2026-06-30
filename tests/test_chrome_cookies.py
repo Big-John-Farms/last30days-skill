@@ -26,6 +26,7 @@ from lib.chrome_cookies import (
     _remove_pkcs7_padding,
     _extract_chromium_cookies_macos,
     _decrypt_v10_value,
+    _find_chromium_cookies_db,
     extract_chrome_cookies_macos,
 )
 
@@ -207,11 +208,26 @@ class TestDecryption:
 class TestChromeNotInstalled:
     def test_db_not_found(self):
         with mock.patch(
-            "lib.chrome_cookies._find_chromium_cookies_db",
-            return_value=None,
+            "lib.chrome_cookies._find_all_chromium_cookies_dbs",
+            return_value=[],
         ):
             result = extract_chrome_cookies_macos(".x.com", ["auth_token"])
             assert result is None
+
+
+class TestChromiumCookieDbFinder:
+    def test_legacy_single_db_finder_returns_first_all_profile_candidate(self, tmp_path):
+        first = tmp_path / "Default" / "Network" / "Cookies"
+        second = tmp_path / "Profile 1" / "Network" / "Cookies"
+
+        with mock.patch(
+            "lib.chrome_cookies._find_all_chromium_cookies_dbs",
+            return_value=[first, second],
+        ) as find_all:
+            result = _find_chromium_cookies_db(tmp_path)
+
+        assert result == first
+        find_all.assert_called_once_with(tmp_path)
 
 # ---------------------------------------------------------------------------
 # Keychain access denied → returns None
@@ -312,7 +328,10 @@ class TestUnencryptedCookies:
             (".x.com", "ct0", "plain_ct0_value", b""),
         ])
 
-        with mock.patch("lib.chrome_cookies._find_chromium_cookies_db", return_value=Path(db_path)):
+        with mock.patch(
+            "lib.chrome_cookies._find_all_chromium_cookies_dbs",
+            return_value=[Path(db_path)],
+        ):
             # No keychain needed for unencrypted values
             with mock.patch("lib.chrome_cookies._get_chromium_encryption_key", return_value=None):
                 result = extract_chrome_cookies_macos(".x.com", ["auth_token", "ct0"])
@@ -341,7 +360,10 @@ class TestFullExtraction:
             (".other.com", "other", "", b""),  # unrelated cookie
         ])
 
-        with mock.patch("lib.chrome_cookies._find_chromium_cookies_db", return_value=Path(db_path)):
+        with mock.patch(
+            "lib.chrome_cookies._find_all_chromium_cookies_dbs",
+            return_value=[Path(db_path)],
+        ):
             with mock.patch(
                 "lib.chrome_cookies._get_chromium_encryption_key",
                 return_value=KNOWN_PASSPHRASE,
@@ -358,7 +380,10 @@ class TestFullExtraction:
             (".other.com", "session", "val", b""),
         ])
 
-        with mock.patch("lib.chrome_cookies._find_chromium_cookies_db", return_value=Path(db_path)):
+        with mock.patch(
+            "lib.chrome_cookies._find_all_chromium_cookies_dbs",
+            return_value=[Path(db_path)],
+        ):
             with mock.patch("lib.chrome_cookies._get_chromium_encryption_key", return_value=None):
                 result = extract_chrome_cookies_macos(".x.com", ["auth_token"])
 
@@ -375,7 +400,10 @@ class TestFullExtraction:
             (".x.com", "auth_token", "", encrypted_auth),
         ], db_version=24)
 
-        with mock.patch("lib.chrome_cookies._find_chromium_cookies_db", return_value=Path(db_path)):
+        with mock.patch(
+            "lib.chrome_cookies._find_all_chromium_cookies_dbs",
+            return_value=[Path(db_path)],
+        ):
             with mock.patch(
                 "lib.chrome_cookies._get_chromium_encryption_key",
                 return_value=KNOWN_PASSPHRASE,
@@ -384,6 +412,36 @@ class TestFullExtraction:
 
         assert result is not None
         assert result["auth_token"] == auth_val
+
+    @pytest.mark.skipif(not OPENSSL_AVAILABLE, reason="openssl not installed")
+    def test_multi_profile_extraction_reuses_keychain_key(self, tmp_path):
+        """Profiles for one browser share a Keychain service; fetch it once."""
+        first_db = tmp_path / "Default.sqlite"
+        second_db = tmp_path / "Profile1.sqlite"
+        auth_val = "profile_auth_token"
+        ct0_val = "profile_ct0_value"
+
+        _create_chrome_cookies_db(str(first_db), [
+            (".x.com", "auth_token", "", _encrypt_value_v10(auth_val, KNOWN_AES_KEY)),
+        ])
+        _create_chrome_cookies_db(str(second_db), [
+            (".x.com", "auth_token", "", _encrypt_value_v10(auth_val, KNOWN_AES_KEY)),
+            (".x.com", "ct0", "", _encrypt_value_v10(ct0_val, KNOWN_AES_KEY)),
+        ])
+
+        with mock.patch(
+            "lib.chrome_cookies._find_all_chromium_cookies_dbs",
+            return_value=[first_db, second_db],
+        ):
+            with mock.patch(
+                "lib.chrome_cookies._get_chromium_encryption_key",
+                return_value=KNOWN_PASSPHRASE,
+            ) as get_key:
+                result = extract_chrome_cookies_macos(".x.com", ["auth_token", "ct0"])
+
+        assert result is not None
+        assert result["ct0"] == ct0_val
+        get_key.assert_called_once_with("Chrome Safe Storage")
 
 # ---------------------------------------------------------------------------
 # DB version detection
