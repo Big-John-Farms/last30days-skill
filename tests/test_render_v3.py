@@ -531,6 +531,13 @@ class SynthesisDirectiveSurvivesTruncationTests(unittest.TestCase):
         report = sample_report()
         text = render.render_comparison_multi([("Topic A", report), ("Topic B", report)])
         self.assertIn("SYNTHESIS CONTRACT", text)
+        # Survive head-truncation: the directive must precede the FIRST entity
+        # evidence cluster heading (H3 in the comparison path), not merely the
+        # envelope close tag — that is the real point a `| head -N` capture cuts.
+        self.assertLess(
+            text.index("SYNTHESIS CONTRACT"),
+            text.index("### Ranked Evidence Clusters"),
+        )
         self.assertLess(
             text.index("SYNTHESIS CONTRACT"),
             text.index("<!-- END EVIDENCE FOR SYNTHESIS -->"),
