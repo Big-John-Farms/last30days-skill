@@ -319,12 +319,8 @@ def extract_chrome_cookies_macos(domain: str, cookie_names: list[str]) -> Option
     same modern ``Default/Network/Cookies`` (Chromium >= 96) and legacy
     ``Default/Cookies`` probing as the rest of the Chromium family.
     """
-    db_path = _find_chromium_cookies_db(CHROME_BASE_DIR)
-    if db_path is None:
-        logger.info("Chrome cookies database not found under %s", CHROME_BASE_DIR)
-        return None
-    return _extract_chromium_cookies_macos(
-        db_path, "Chrome Safe Storage", domain, cookie_names
+    return _extract_chromium_cookies_any_profile(
+        CHROME_BASE_DIR, "Chrome Safe Storage", domain, cookie_names
     )
 
 
@@ -378,6 +374,64 @@ def _find_chromium_cookies_db(base_dir: Path) -> Optional[Path]:
     return None
 
 
+def _find_all_chromium_cookies_dbs(base_dir: Path) -> list[Path]:
+    """Return ALL candidate Cookies DBs under base_dir, best-guess order first.
+
+    Order: Default, the base dir itself (Opera's flat layout), then numbered
+    "Profile N" dirs by most-recently-modified. Unlike _find_chromium_cookies_db
+    (which returns the first DB that merely EXISTS), this returns every profile
+    so the caller can pick the one that actually holds the target domain's
+    cookies. Needed because a logged-in session often lives in a non-Default
+    profile while Default still has a (guest-only) cookie DB.
+    """
+    paths: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(p: Optional[Path]) -> None:
+        if p is not None and p not in seen:
+            seen.add(p)
+            paths.append(p)
+
+    add(_profile_cookie_db(base_dir / "Default"))
+    add(_profile_cookie_db(base_dir))
+    try:
+        candidates = [
+            child for child in base_dir.iterdir()
+            if child.is_dir() and child.name.startswith("Profile ")
+        ]
+        for child in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
+            add(_profile_cookie_db(child))
+    except OSError:
+        pass
+    return paths
+
+
+def _extract_chromium_cookies_any_profile(
+    base_dir: Path, keychain_service: str, domain: str, cookie_names: list[str]
+) -> Optional[dict[str, str]]:
+    """Try every profile under base_dir and return the best cookie match.
+
+    Returns the first profile that yields ALL requested cookie_names. If no
+    profile has the complete set, returns the first partial match found, or
+    None if no profile yielded any. This fixes the single-profile limitation
+    where a guest-only Default profile shadowed a logged-in "Profile N".
+    """
+    db_paths = _find_all_chromium_cookies_dbs(base_dir)
+    if not db_paths:
+        logger.info("%s cookies database not found under %s", keychain_service, base_dir)
+        return None
+    best: Optional[dict[str, str]] = None
+    for db_path in db_paths:
+        got = _extract_chromium_cookies_macos(db_path, keychain_service, domain, cookie_names)
+        if got:
+            if all(name in got for name in cookie_names):
+                logger.debug("Found complete cookie set for %s in %s", domain, db_path)
+                return got
+            if best is None:
+                best = got
+    return best
+
+
 def _find_brave_cookies_db() -> Optional[Path]:
     """Find Brave's Cookies database on macOS (Default, then Profile N)."""
     return _find_chromium_cookies_db(BRAVE_BASE_DIR)
@@ -389,11 +443,9 @@ def extract_brave_cookies_macos(domain: str, cookie_names: list[str]) -> Optiona
     Brave uses the same v10 AES-128-CBC encryption as Chrome; only the DB
     path and Keychain service name differ.
     """
-    db_path = _find_brave_cookies_db()
-    if db_path is None:
-        logger.info("Brave cookies database not found under %s", BRAVE_BASE_DIR)
-        return None
-    return _extract_chromium_cookies_macos(db_path, "Brave Safe Storage", domain, cookie_names)
+    return _extract_chromium_cookies_any_profile(
+        BRAVE_BASE_DIR, "Brave Safe Storage", domain, cookie_names
+    )
 
 
 def extract_chromium_browser_cookies_macos(
@@ -410,8 +462,6 @@ def extract_chromium_browser_cookies_macos(
         logger.debug("Unknown Chromium browser: %s", browser)
         return None
     base_dir, keychain_service = spec
-    db_path = _find_chromium_cookies_db(base_dir)
-    if db_path is None:
-        logger.info("%s cookies database not found under %s", keychain_service, base_dir)
-        return None
-    return _extract_chromium_cookies_macos(db_path, keychain_service, domain, cookie_names)
+    return _extract_chromium_cookies_any_profile(
+        base_dir, keychain_service, domain, cookie_names
+    )
