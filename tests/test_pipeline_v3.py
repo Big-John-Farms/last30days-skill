@@ -142,6 +142,30 @@ class PipelineV3Tests(unittest.TestCase):
         self.assertEqual(["jobs"], sorted(report.items_by_source))
         self.assertTrue(report.artifacts["hiring_signals"]["include"])
 
+    def test_explicit_sources_suppress_automatic_company_jobs(self):
+        report = pipeline.run(
+            topic="Listen Labs",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            requested_sources=["grounding", "x"],
+            mock=True,
+        )
+        self.assertEqual({"grounding", "x"}, set(report.items_by_source))
+        self.assertTrue(
+            all("jobs" not in subquery.sources for subquery in report.query_plan.subqueries)
+        )
+
+    def test_hiring_signals_forces_jobs_with_explicit_non_jobs_sources(self):
+        report = pipeline.run(
+            topic="Listen Labs",
+            config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+            depth="quick",
+            requested_sources=["grounding", "x"],
+            mock=True,
+            hiring_signals_mode=True,
+        )
+        self.assertEqual({"grounding", "jobs", "x"}, set(report.items_by_source))
+
     def test_standard_company_run_fetches_jobs_for_signal_gate(self):
         report = pipeline.run(
             topic="Listen Labs",

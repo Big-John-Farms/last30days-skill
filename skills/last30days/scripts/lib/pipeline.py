@@ -1956,7 +1956,10 @@ def run(
         available = [s for s in available if s != "grounding"]
     elif web_backend in ("brave", "exa", "serper", "parallel", "keyless") and "grounding" not in available:
         available.append("grounding")
-    if (hiring_signals_mode or _company_topic_likely(topic)) and "jobs" not in available:
+    if (
+        hiring_signals_mode
+        or (not requested_sources and _company_topic_likely(topic))
+    ) and "jobs" not in available:
         available.append("jobs")
     if hiring_signals_mode:
         config = dict(config)
