@@ -4,6 +4,56 @@ from lib import planner
 
 
 class PlannerV3Tests(unittest.TestCase):
+    def test_external_plan_rejects_valid_json_with_wrong_structure(self):
+        with self.assertRaisesRegex(ValueError, "intent"):
+            planner.validate_external_plan({"queries": {"web": ["Berlin"]}})
+
+    def test_external_plan_accepts_documented_shape_without_source_weights(self):
+        planner.validate_external_plan(
+            {
+                "intent": "breaking_news",
+                "freshness_mode": "strict_recent",
+                "cluster_mode": "story",
+                "subqueries": [
+                    {
+                        "label": "primary",
+                        "search_query": "kanye west",
+                        "ranking_query": "What happened with Kanye West?",
+                        "sources": ["reddit", "x"],
+                        "weight": 1.0,
+                    }
+                ],
+            }
+        )
+
+    def test_external_plan_rejects_non_numeric_weight(self):
+        base_plan = {
+            "intent": "breaking_news",
+            "freshness_mode": "strict_recent",
+            "cluster_mode": "story",
+            "subqueries": [
+                {
+                    "label": "primary",
+                    "search_query": "kanye west",
+                    "ranking_query": "What happened with Kanye West?",
+                    "sources": ["reddit", "x"],
+                    "weight": 1.0,
+                }
+            ],
+        }
+        for invalid_weight in ("heavy", True):
+            with self.subTest(subquery_weight=invalid_weight):
+                invalid_plan = dict(base_plan)
+                invalid_plan["subqueries"] = [
+                    dict(base_plan["subqueries"][0], weight=invalid_weight)
+                ]
+                with self.assertRaisesRegex(ValueError, "weight"):
+                    planner.validate_external_plan(invalid_plan)
+
+        invalid_source_weight = dict(base_plan, source_weights={"x": True})
+        with self.assertRaisesRegex(ValueError, "source_weights"):
+            planner.validate_external_plan(invalid_source_weight)
+
     def test_default_how_to_expands_past_llm_narrow_source_weights(self):
         raw = {
             "intent": "how_to",
