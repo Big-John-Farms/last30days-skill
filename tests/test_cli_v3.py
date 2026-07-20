@@ -1,3 +1,4 @@
+# fmt: off
 import contextlib
 import json
 import io
@@ -324,6 +325,84 @@ class CliV3Tests(unittest.TestCase):
             self.assertEqual("dated content", dated.read_text(encoding="utf-8"))
             self.assertTrue(saved.exists())
 
+    def test_save_output_render_fn_footer_names_actual_collision_path(self):
+        from lib import render as render_module
+
+        report = self.make_report()
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = Path(tmp)
+            today = datetime.now().strftime("%Y-%m-%d")
+            base = save_dir / "openclaw-vs-nanoclaw-raw.md"
+            dated = save_dir / f"openclaw-vs-nanoclaw-raw-{today}.md"
+            base.write_text("base content", encoding="utf-8")
+            dated.write_text("dated content", encoding="utf-8")
+
+            def render_fn(actual_path: Path) -> str:
+                return render_module.render_compact(report, save_path=str(actual_path))
+
+            saved = cli.save_output(report, "md", tmp, render_fn=render_fn)
+
+            expected = (save_dir / f"openclaw-vs-nanoclaw-raw-{today}-1.md").resolve()
+            self.assertEqual(expected, saved.resolve())
+            content = saved.read_text(encoding="utf-8")
+            self.assertIn(f"Raw results saved to {saved}", content)
+            self.assertNotIn(f"Raw results saved to {base}", content)
+            self.assertNotIn(f"Raw results saved to {dated}", content)
+            self.assertEqual("base content", base.read_text(encoding="utf-8"))
+            self.assertEqual("dated content", dated.read_text(encoding="utf-8"))
+
+    def test_save_output_removes_reserved_candidate_when_deferred_render_fails(self):
+        report = self.make_report()
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = Path(tmp)
+
+            def fail_render(_actual_path: Path) -> str:
+                raise RuntimeError("render failed")
+
+            with self.assertRaisesRegex(RuntimeError, "render failed"):
+                cli.save_output(report, "md", tmp, render_fn=fail_render)
+
+            self.assertEqual([], list(save_dir.iterdir()))
+
+    def test_render_save_and_print_uses_actual_collision_path_in_file_and_stdout(self):
+        report = self.make_report(topic="Collision Topic")
+        with tempfile.TemporaryDirectory() as tmp:
+            save_dir = Path(tmp)
+            today = datetime.now().strftime("%Y-%m-%d")
+            base = save_dir / "collision-topic-raw.md"
+            dated = save_dir / f"collision-topic-raw-{today}.md"
+            expected = save_dir / f"collision-topic-raw-{today}-1.md"
+            base.write_text("base content", encoding="utf-8")
+            dated.write_text("dated content", encoding="utf-8")
+            args = types.SimpleNamespace(
+                topic=["Collision Topic"],
+                competitors=None,
+                competitors_list=None,
+                competitors_plan=None,
+                drill=False,
+                register=None,
+                emit="compact",
+                output=None,
+                save_dir=str(save_dir),
+                save_suffix="",
+                json_profile="agent",
+                publish_html=False,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = cli._render_save_and_print(args, report, None, None, {})
+
+            self.assertEqual(0, rc)
+            expected_display = cli.compute_output_path_display(str(expected))
+            footer = f"Raw results saved to {expected_display}"
+            self.assertTrue(expected.exists())
+            self.assertIn(footer, expected.read_text(encoding="utf-8"))
+            self.assertIn(footer, stdout.getvalue())
+            self.assertEqual("base content", base.read_text(encoding="utf-8"))
+            self.assertEqual("dated content", dated.read_text(encoding="utf-8"))
+
     def test_save_output_writes_utf8_encoded_markdown(self):
         report = self.make_report()
         with tempfile.TemporaryDirectory() as tmp:
@@ -531,11 +610,15 @@ class CliV3Tests(unittest.TestCase):
 
             self.assertEqual(0, rc)
             output_display = cli.compute_output_path_display(str(output_path))
-            _, kwargs = emit_comparison.call_args
-            self.assertEqual(output_display, kwargs["save_path"])
+            comparison_saved = save_dir / "alpha-vs-beta-raw-html.html"
+            self.assertEqual(2, emit_comparison.call_count)
+            first_kwargs = emit_comparison.call_args_list[0].kwargs
+            second_kwargs = emit_comparison.call_args_list[1].kwargs
+            self.assertEqual(output_display, first_kwargs["save_path"])
+            comparison_display = cli.compute_output_path_display(str(comparison_saved))
+            self.assertEqual(comparison_display, second_kwargs["save_path"])
             self.assertEqual("<html>comparison</html>\n", stdout.getvalue())
             self.assertEqual("<html>comparison</html>", output_path.read_text(encoding="utf-8"))
-            comparison_saved = save_dir / "alpha-vs-beta-raw-html.html"
             self.assertEqual(
                 "<html>comparison</html>",
                 comparison_saved.read_text(encoding="utf-8"),
