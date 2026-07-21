@@ -1,6 +1,8 @@
 """U6 - rich discovery rendering: enriched trend cards, the global-trending
 header, and the honest nothing-solid empty state."""
 
+from unittest import mock
+
 from lib import pipeline, render, schema
 
 
@@ -130,3 +132,130 @@ def test_best_community_comment_none_when_no_comments():
         item_id="a", source="reddit", title="t", body="t", url="https://r.example/a",
     )]
     assert pipeline._best_community_comment(items) is None
+
+
+# --- U5 angle and pipeline card lines ----------------------------------------
+
+
+def test_angle_lines_render_in_order_between_voice_and_evidence():
+    report = _report(topics=[_topic(
+        1, "OpenAI Agent SDK",
+        top_comment='"This changes agent tooling" - dev_voice (1,200 votes)',
+        podcast_angle="Is the Agent SDK a platform play or a lock-in play?",
+        x_article_angle="Five signs the agent stack just consolidated around one SDK.",
+    )])
+    rendered = render.render_discovery(report)
+    assert (
+        "**Podcast angle:** Is the Agent SDK a platform play or a lock-in play?"
+        in rendered
+    )
+    assert (
+        "**X article angle:** Five signs the agent stack just consolidated around one SDK."
+        in rendered
+    )
+    voice = rendered.index("**Community voice:**")
+    podcast = rendered.index("**Podcast angle:**")
+    article = rendered.index("**X article angle:**")
+    evidence = rendered.index("**Evidence:**")
+    assert voice < podcast < article < evidence
+
+
+def test_no_angle_lines_when_fields_none():
+    rendered = render.render_discovery(_report())
+    assert "**Podcast angle:**" not in rendered
+    assert "**X article angle:**" not in rendered
+
+
+def test_single_angle_renders_without_empty_sibling_label():
+    report = _report(topics=[_topic(
+        1, "OpenAI Agent SDK",
+        podcast_angle="What breaks first when every agent shares one SDK?",
+    )])
+    rendered = render.render_discovery(report)
+    assert (
+        "**Podcast angle:** What breaks first when every agent shares one SDK?"
+        in rendered
+    )
+    assert "**X article angle:**" not in rendered
+
+
+def test_pipeline_line_renders_surfaced_and_covered_comma_joined():
+    report = _report(topics=[_topic(
+        1, "OpenAI Agent SDK",
+        previously_surfaced_count=3,
+        last_surfaced="2026-07-14",
+        covered=True,
+    )])
+    rendered = render.render_discovery(report)
+    assert (
+        "**Pipeline:** surfaced 3rd time in 30 days, marked covered 2026-07-14"
+        in rendered
+    )
+
+
+def test_pipeline_line_surfaced_only():
+    report = _report(topics=[_topic(
+        1, "OpenAI Agent SDK", previously_surfaced_count=1,
+    )])
+    rendered = render.render_discovery(report)
+    assert "**Pipeline:** surfaced 1st time in 30 days" in rendered
+    assert "marked covered" not in rendered
+
+
+def test_pipeline_line_covered_only_without_date():
+    report = _report(topics=[_topic(1, "OpenAI Agent SDK", covered=True)])
+    rendered = render.render_discovery(report)
+    assert "**Pipeline:** marked covered" in rendered
+    assert "surfaced" not in rendered
+
+
+def test_pipeline_line_sits_after_angles_before_evidence():
+    report = _report(topics=[_topic(
+        1, "OpenAI Agent SDK",
+        podcast_angle="A tension to talk through?",
+        x_article_angle="A claim worth writing down.",
+        previously_surfaced_count=2,
+    )])
+    rendered = render.render_discovery(report)
+    assert (
+        rendered.index("**X article angle:**")
+        < rendered.index("**Pipeline:**")
+        < rendered.index("**Evidence:**")
+    )
+
+
+def test_no_pipeline_line_for_fresh_topic():
+    """previously_surfaced_count=0 and covered=False never render the line."""
+    rendered = render.render_discovery(_report())
+    assert "**Pipeline:**" not in rendered
+
+
+def test_nothing_solid_output_stays_byte_identical():
+    """The empty state predates U5 and must not grow angle or pipeline text."""
+    report = _report(
+        topics=[],
+        outcome="nothing-solid",
+        weak_signal="Wii Sports nostalgia thread",
+        warnings=[
+            "No topic cleared the discovery confidence floor this window; "
+            "reporting nothing solid instead of ranked noise."
+        ],
+    )
+    with mock.patch.object(render, "_render_badge", return_value=["BADGE", ""]):
+        rendered = render.render_discovery(report)
+    assert rendered == (
+        "BADGE\n\n"
+        "# Trending discovery: AI agents\n\n"
+        "Window: 2026-06-10 to 2026-07-10\n"
+        "Feeds: reddit, hackernews\n"
+        "Communities: r/all\n\n"
+        "**Nothing solid this window.** No topic cleared the confidence "
+        "floor - not enough cross-source confirmation or engagement to "
+        "call anything a trend, and ranked noise would be worse than an "
+        "honest empty result.\n\n"
+        "Closest weak signal: Wii Sports nostalgia thread (sub-floor; "
+        "single-source or too little engagement).\n\n"
+        "### Coverage notes\n\n"
+        "- No topic cleared the discovery confidence floor this window; "
+        "reporting nothing solid instead of ranked noise.\n"
+    )

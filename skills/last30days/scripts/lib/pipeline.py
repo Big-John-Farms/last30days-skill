@@ -12,7 +12,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from shutil import which
@@ -1132,6 +1132,7 @@ def run_discover(
         ]
 
     topics: list[schema.DiscoveryTopic] = []
+    angle_entries: list[dict[str, str]] = []
     weak_signal: tuple[float, str] | None = None
     junk_weak_signal: tuple[float, str] | None = None
     for entry in enriched_entries:
@@ -1174,6 +1175,7 @@ def run_discover(
             f"{source_phrase} generated {native_total:,.0f} native interactions. "
             f"{nomination.summary[:220]}"
         )
+        top_comment = _best_community_comment(evidence_items) if entry.report is not None else None
         topics.append(schema.DiscoveryTopic(
             rank=len(topics) + 1,
             name=nomination.name,
@@ -1184,9 +1186,51 @@ def run_discover(
             engagement_by_source=_discovery_engagement(evidence_items),
             command=f'/last30days "{nomination.name.replace(chr(34), chr(39))}"',
             evidence_urls=list(dict.fromkeys(item.url for item in evidence_items if item.url))[:5],
-            top_comment=_best_community_comment(evidence_items) if entry.report is not None else None,
+            top_comment=top_comment,
             corroboration_count=len(sources),
         ))
+        # Stage-2 angle input: the survivor's strongest evidence, enriched
+        # corpus when the pipeline pass succeeded, seed items otherwise
+        # (evidence_items already resolves that).
+        top_titles = [
+            item.title.strip()
+            for item in sorted(
+                evidence_items,
+                key=rerank.discovery_engagement_total,
+                reverse=True,
+            )
+            if item.title and item.title.strip()
+        ][:3]
+        angle_entries.append({
+            "topic_id": f"topic-{len(topics)}",
+            "name": nomination.name,
+            "titles": "; ".join(top_titles),
+            "top_comment": top_comment or "",
+            "engagement": f"{native_total:,.0f} native interactions across {source_phrase}",
+        })
+
+    # Stage-2 angle pass: ONE batched call over the floor survivors turns
+    # each surfaced topic into a podcast hook and an X-article hook, reusing
+    # the runtime resolved above. Keyless/mock runs (judge_provider None)
+    # never reach the LLM; a failed or partial response leaves the affected
+    # topics' angles None - the run never crashes on this pass.
+    angle_map = rerank.generate_discovery_angles(
+        domain=plan.domain,
+        entries=angle_entries,
+        provider=judge_provider,
+        model=judge_model,
+    ) or {}
+    if angle_map:
+        topics = [
+            replace(
+                topic,
+                podcast_angle=angles.podcast_angle,
+                x_article_angle=angles.x_article_angle,
+            )
+            if (angles := angle_map.get(f"topic-{topic.rank}")) is not None
+            else topic
+            for topic in topics
+        ]
 
     if weak_signal is None:
         weak_signal = junk_weak_signal

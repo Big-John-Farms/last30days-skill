@@ -820,6 +820,116 @@ def _parse_discovery_judge_payload(payload: dict) -> dict[str, DiscoveryJudgeVer
     return verdicts
 
 
+class DiscoveryAngles(NamedTuple):
+    """One surfaced topic's stage-2 content hooks (see
+    generate_discovery_angles). Either field may be None when the model
+    returned nothing usable for that medium."""
+
+    podcast_angle: str | None
+    x_article_angle: str | None
+
+
+def generate_discovery_angles(
+    *,
+    domain: str,
+    entries: list[dict[str, str]],
+    provider: providers.ReasoningClient | None,
+    model: str | None,
+) -> dict[str, DiscoveryAngles] | None:
+    """Stage-2 discovery angle pass: one batched LLM call AFTER the floor,
+    turning every surfaced topic into a podcast hook and an X-article hook.
+
+    ``entries`` carries one dict per floor survivor: ``topic_id`` plus the
+    topic's ``name`` and its strongest evidence (``titles``, ``top_comment``,
+    ``engagement``, fenced as untrusted in the prompt). Returns a mapping
+    keyed by ``topic_id``; a key missing from a structurally valid response
+    means the model skipped that topic and it ships with None angles.
+    Returns ``None`` when no provider is configured or the call failed
+    outright - every topic then ships without angles. Never raises.
+    """
+    if not (provider and model and entries):
+        return None
+    try:
+        payload = provider.generate_json(
+            model, _build_discovery_angle_prompt(domain, entries)
+        )
+        return _parse_discovery_angle_payload(payload)
+    except (ValueError, KeyError, json.JSONDecodeError, OSError, http.HTTPError) as exc:
+        log.source_log(
+            "Discover",
+            f"stage-2 angle pass failed, topics ship without content angles: "
+            f"{type(exc).__name__}: {exc}",
+            tty_only=False,
+        )
+        return None
+
+
+def _build_discovery_angle_prompt(domain: str, entries: list[dict[str, str]]) -> str:
+    entry_block = "\n".join(
+        "\n".join([
+            f"- topic_id: {entry['topic_id']}",
+            f"  name: {str(entry.get('name') or '')[:96]}",
+            f"  evidence_titles: {str(entry.get('titles') or '')[:420]}",
+            f"  top_comment: {str(entry.get('top_comment') or '')[:340]}",
+            f"  engagement: {str(entry.get('engagement') or '')[:200]}",
+        ])
+        for entry in entries
+    )
+    domain_label = domain or "global trending (no domain filter)"
+    return (
+        "You are the stage-2 content-angle writer for a trend-research tool. "
+        "The reader is a podcaster who also writes X articles. Each entry "
+        "below is one CONFIRMED trending topic with its strongest evidence.\n\n"
+        f"Domain being swept: {domain_label}\n\n"
+        "For EVERY entry return two hooks, one sentence each:\n"
+        "- podcast_angle: a discussion hook for a podcast segment - the "
+        "question or tension a host would talk through on air. Frame it as "
+        "something to argue about or unpack, never a summary.\n"
+        "- x_article_angle: a written-take hook for an X article - the "
+        "claim, thesis, or listicle-able angle the piece would open with.\n\n"
+        "Ground each hook in the evidence shown; never invent facts.\n\n"
+        "Return JSON only:\n"
+        '{"topics": [{"topic_id": "id", "podcast_angle": "one sentence", '
+        '"x_article_angle": "one sentence"}]}\n\n'
+        f"{_fenced_untrusted_content(entry_block)}"
+    )
+
+
+# Defensive cap on angle sentences: they render verbatim on trend cards, so a
+# runaway (or adversarial) response never yields an unbounded string.
+_ANGLE_MAX_CHARS = 200
+
+
+def _sanitized_angle(raw: object) -> str | None:
+    """One whitespace-collapsed, length-capped angle sentence, or None for
+    anything unusable. Non-strings are rejected outright, never coerced."""
+    if not isinstance(raw, str):
+        return None
+    text = " ".join(raw.split())
+    if len(text) > _ANGLE_MAX_CHARS:
+        text = text[:_ANGLE_MAX_CHARS].rsplit(" ", 1)[0].rstrip(" \"'`,;:!?-")
+    return text or None
+
+
+def _parse_discovery_angle_payload(payload: dict) -> dict[str, DiscoveryAngles]:
+    angles: dict[str, DiscoveryAngles] = {}
+    for row in payload.get("topics") or []:
+        if not isinstance(row, dict):
+            continue
+        topic_id = str(row.get("topic_id") or "").strip()
+        podcast = _sanitized_angle(row.get("podcast_angle"))
+        article = _sanitized_angle(row.get("x_article_angle"))
+        if not topic_id or (podcast is None and article is None):
+            # Missing identity or no usable hook at all: treat the row as
+            # absent so the topic ships without angles.
+            continue
+        angles[topic_id] = DiscoveryAngles(
+            podcast_angle=podcast,
+            x_article_angle=article,
+        )
+    return angles
+
+
 def score_fun(
     *,
     topic: str,

@@ -62,6 +62,15 @@ def _render_badge() -> list[str]:
     ]
 
 
+def _ordinal(count: int) -> str:
+    """1 -> 1st, 2 -> 2nd, 3 -> 3rd, 11-13 -> th (Pipeline card line)."""
+    if 10 <= count % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(count % 10, "th")
+    return f"{count}{suffix}"
+
+
 def _format_discovery_engagement(
     engagement: dict[str, dict[str, float | int]],
 ) -> str:
@@ -129,6 +138,31 @@ def render_discovery(report: schema.DiscoveryReport) -> str:
         if topic.top_comment:
             lines.extend([
                 f"**Community voice:** {topic.top_comment}",
+                "",
+            ])
+        if topic.podcast_angle:
+            lines.extend([
+                f"**Podcast angle:** {topic.podcast_angle}",
+                "",
+            ])
+        if topic.x_article_angle:
+            lines.extend([
+                f"**X article angle:** {topic.x_article_angle}",
+                "",
+            ])
+        pipeline_notes: list[str] = []
+        if topic.previously_surfaced_count > 0:
+            pipeline_notes.append(
+                f"surfaced {_ordinal(topic.previously_surfaced_count)} time in 30 days"
+            )
+        if topic.covered:
+            covered_note = "marked covered"
+            if topic.last_surfaced:
+                covered_note += f" {topic.last_surfaced}"
+            pipeline_notes.append(covered_note)
+        if pipeline_notes:
+            lines.extend([
+                f"**Pipeline:** {', '.join(pipeline_notes)}",
                 "",
             ])
         lines.extend([

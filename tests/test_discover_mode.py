@@ -547,6 +547,34 @@ def test_discovery_topic_constructs_with_only_pre_existing_fields():
     assert result["covered"] is False
 
 
+def test_discovery_cli_mock_render_has_no_angle_or_pipeline_lines():
+    """--mock runs never resolve a reasoning provider, so rendered cards must
+    omit the U5 angle and Pipeline lines entirely - and stay deterministic
+    across runs (same-day mock fixtures)."""
+    def _run_once() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                sys.executable,
+                "skills/last30days/scripts/last30days.py",
+                "--discover",
+                "AI agents",
+                "--mock",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    first = _run_once()
+    second = _run_once()
+    assert first.returncode == 0, first.stderr
+    assert "**Podcast angle:**" not in first.stdout
+    assert "**X article angle:**" not in first.stdout
+    assert "**Pipeline:**" not in first.stdout
+    assert first.stdout == second.stdout
+
+
 def test_discovery_cli_bare_discover_is_global_trending():
     """Bare --discover (no domain) must run global trending, not error."""
     result = subprocess.run(
