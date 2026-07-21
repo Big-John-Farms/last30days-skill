@@ -8,7 +8,9 @@ supports. The heuristic (no-provider) naming path is pinned here; the LLM
 stage-1 judge path lives in test_discover_judge.py.
 """
 
-from lib import pipeline, schema, topic_shape
+from unittest import mock
+
+from lib import dates, pipeline, render, rerank, schema, topic_shape
 
 
 def _item(
@@ -199,3 +201,151 @@ def test_nomination_carries_leader_summary_and_items():
     top = nominations[0]
     assert top.items and top.items[0].item_id == "s1"
     assert top.summary
+
+
+# --- U3 leg 1: nominate-only judge pool ---------------------------------------
+
+
+def test_nominate_topic_pool_pairs_nominations_with_cluster_ids():
+    """The pool variant returns the SAME nominations as nominate_topics, each
+    paired with its non-empty, unique source cluster id."""
+    items = [
+        _item("hot1", "hackernews", "GPT-6 rumors flood the valley",
+              engagement={"points": 900, "num_comments": 400}),
+        _item("warm1", "hackernews", "Quantum error correction milestone announced",
+              engagement={"points": 250, "num_comments": 60}),
+    ]
+    bundle = _bundle(items)
+    query_plan = _query_plan("AI", ["hackernews"])
+    plan = _plan("AI", ["hackernews"])
+    pool = pipeline.nominate_topic_pool(
+        bundle, query_plan, plan, to_date="2026-07-10", limit=10,
+    )
+    nominations = pipeline.nominate_topics(
+        bundle, query_plan, plan, to_date="2026-07-10", limit=10,
+    )
+    assert [nomination for nomination, _cluster_id in pool] == nominations
+    cluster_ids = [cluster_id for _nomination, cluster_id in pool]
+    assert all(cluster_ids)
+    assert len(set(cluster_ids)) == len(cluster_ids)
+
+
+# Ten clearly distinct stories: enough clusters to prove the judge pool
+# reaches past the ENRICH_LIMIT cut that the one-shot path applies.
+POOL_TITLES = [
+    "Kestrel avionics merger approved by regulators",
+    "Sourdough robot bakery raises series B",
+    "Quantum error correction milestone announced",
+    "Rust rewrite of the Linux scheduler lands",
+    "Solar balcony panels top German sales charts",
+    "Deep sea mining moratorium gains momentum",
+    "Vertical farming startup exits stealth with kale gigafactory",
+    "Formula E battery swap trial starts in Rome",
+    "Open source weather models beat commercial forecasts",
+    "Cheese aging caves converted to data centers",
+]
+
+
+def _hn_raw(item_id: str, title: str, points: int, comments: int, *, date: str = "2026-07-09") -> dict:
+    return {
+        "id": item_id,
+        "title": title,
+        "url": f"https://example.com/{item_id}",
+        "hn_url": f"https://news.ycombinator.com/item?id={item_id}",
+        # Distinct authors: weighted_rrf caps the pool per author, and this
+        # fixture exists to overflow the ENRICH_LIMIT cut, not that cap.
+        "author": f"author-{item_id}",
+        "date": date,
+        "engagement": {"points": points, "comments": comments},
+        "relevance": 0.9,
+    }
+
+
+def _nominate_only(items_by_source: dict[str, list[dict]], **kwargs) -> "pipeline.DiscoverNominateResult":
+    def fake_fetch(source, plan, *, from_date, to_date, depth, mock, config, keyword_gate=True):
+        return items_by_source.get(source, []), None
+
+    with mock.patch.object(
+        pipeline, "available_sources", return_value=list(items_by_source),
+    ), mock.patch.object(
+        pipeline, "_fetch_discovery_source", side_effect=fake_fetch,
+    ):
+        return pipeline.run_discover_nominate(
+            domain=kwargs.pop("domain", ""),
+            config={},
+            as_of_date="2026-07-10",
+            **kwargs,
+        )
+
+
+def _full_pool_items() -> dict[str, list[dict]]:
+    return {"hackernews": [
+        _hn_raw(f"hn{index}", title, 900 - index * 40, 120 - index * 5)
+        for index, title in enumerate(POOL_TITLES)
+    ]}
+
+
+def test_nominate_only_emits_full_judge_pool_beyond_enrich_cut():
+    """Leg 1 hands the host the FULL judge pool (up to JUDGE_POOL_LIMIT), not
+    the one-shot path's post-cut enrichment list."""
+    result = _nominate_only(_full_pool_items())
+    assert len(result.pool) > pipeline.ENRICH_LIMIT
+    assert len(result.pool) <= rerank.JUDGE_POOL_LIMIT
+    names = [nomination.name.casefold() for nomination, _cluster_id in result.pool]
+    assert len(names) == len(set(names))
+
+
+def test_nominate_only_is_heuristic_deterministic_and_provider_free():
+    """Leg 1 never resolves a reasoning provider: names/junk flags are the
+    deterministic topic_shape heuristics and two runs agree exactly."""
+    items = _full_pool_items()
+    items["hackernews"].append(
+        _hn_raw("junk1", HELP_TITLE, 400, 90)
+    )
+    with mock.patch.object(pipeline.providers, "resolve_runtime") as resolve:
+        first = _nominate_only(items)
+        second = _nominate_only(items)
+    resolve.assert_not_called()
+    assert [
+        (nomination.name, nomination.junk_shape, cluster_id)
+        for nomination, cluster_id in first.pool
+    ] == [
+        (nomination.name, nomination.junk_shape, cluster_id)
+        for nomination, cluster_id in second.pool
+    ]
+    assert all(nomination.worthiness is None for nomination, _ in first.pool)
+    junk_flags = {
+        nomination.items[0].item_id: nomination.junk_shape
+        for nomination, _ in first.pool
+    }
+    assert junk_flags.get("junk1") is True
+
+
+def test_nominate_only_window_matches_sweep_dates():
+    result = _nominate_only(_full_pool_items(), lookback_days=7)
+    assert (result.from_date, result.to_date) == dates.get_date_range(
+        7, as_of_date="2026-07-10"
+    )
+
+
+def test_nominate_only_never_enriches_or_researches():
+    """No enrichment, no full research sub-runs on leg 1 - the host judges
+    the seed evidence first."""
+    with mock.patch.object(pipeline, "enrich_nominations") as enrich, \
+         mock.patch.object(pipeline, "run") as full_run:
+        result = _nominate_only(_full_pool_items())
+    enrich.assert_not_called()
+    full_run.assert_not_called()
+    assert result.pool
+
+
+def test_nominate_only_zero_pool_renders_nothing_solid_brief():
+    """An empty sweep short-circuits to the existing nothing-solid brief."""
+    result = _nominate_only({"hackernews": []})
+    assert result.pool == []
+    report = pipeline.nominate_nothing_solid_report(result)
+    assert report.outcome == "nothing-solid"
+    assert report.topics == []
+    assert (report.range_from, report.range_to) == (result.from_date, result.to_date)
+    rendered = render.render_discovery(report)
+    assert "Nothing solid this window." in rendered

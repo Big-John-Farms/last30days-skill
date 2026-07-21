@@ -701,7 +701,7 @@ def _disambiguated_topic_name(
     return None
 
 
-def nominate_topics(
+def nominate_topic_pool(
     bundle: schema.RetrievalBundle,
     query_plan: schema.QueryPlan,
     plan: schema.DiscoveryPlan,
@@ -710,9 +710,13 @@ def nominate_topics(
     limit: int,
     provider: providers.ReasoningClient | None = None,
     model: str | None = None,
-) -> list[Nomination]:
+) -> list[tuple[Nomination, str]]:
     """Stage 1b of discovery: cluster nominated items into named candidate
-    topics and rank them for enrichment.
+    topics, rank them, and pair each with its source cluster id.
+
+    This is the shared core behind ``nominate_topics`` (the one-shot path,
+    which drops the cluster ids) and the leg-1 nominate-only sweep (which
+    keys nominations-bundle rows on them, see ``run_discover_nominate``).
 
     Naming and content judgment run as a stage-1 judge pass BEFORE the limit
     cut: the top ``rerank.JUDGE_POOL_LIMIT`` clusters by velocity share one
@@ -733,9 +737,10 @@ def nominate_topics(
     story surfacing twice) or when no distinguishing entity token yields an
     unused name.
 
-    Returns at most ``limit`` nominations, never padded - fewer clusters than
-    ``limit`` means a shorter list, and the confidence floor downstream
-    decides whether what survived is worth showing.
+    Returns at most ``limit`` ``(nomination, cluster_id)`` pairs, never
+    padded - fewer clusters than ``limit`` means a shorter list, and the
+    confidence floor downstream decides whether what survived is worth
+    showing.
     """
     candidates = weighted_rrf(bundle.items_by_source_and_query, query_plan, pool_limit=80)
     for candidate in candidates:
@@ -799,7 +804,7 @@ def nominate_topics(
         judged.append((blended, cluster, cluster_items, name, junk_shape, worthiness))
     judged.sort(key=lambda entry: (-entry[0], entry[3].lower()))
 
-    nominations: list[Nomination] = []
+    pool: list[tuple[Nomination, str]] = []
     taken_names: dict[str, schema.Cluster] = {}
     entity_counts_cache: dict[str, Counter] = {}
     for blended, cluster, cluster_items, name, junk_shape, worthiness in judged:
@@ -819,17 +824,38 @@ def nominate_topics(
         taken_names[name_key] = cluster
         leader = candidate_map.get(cluster.representative_ids[0]) if cluster.representative_ids else None
         summary = (leader.snippet if leader else "") or (leader.title if leader else name)
-        nominations.append(Nomination(
+        pool.append((Nomination(
             name=name,
             seed_score=blended,
             items=cluster_items,
             summary=summary,
             junk_shape=junk_shape,
             worthiness=worthiness,
-        ))
-        if len(nominations) >= limit:
+        ), cluster.cluster_id))
+        if len(pool) >= limit:
             break
-    return nominations
+    return pool
+
+
+def nominate_topics(
+    bundle: schema.RetrievalBundle,
+    query_plan: schema.QueryPlan,
+    plan: schema.DiscoveryPlan,
+    *,
+    to_date: str,
+    limit: int,
+    provider: providers.ReasoningClient | None = None,
+    model: str | None = None,
+) -> list[Nomination]:
+    """``nominate_topic_pool`` without the cluster ids: the one-shot
+    discovery path's contract (see that function for the full semantics)."""
+    return [
+        nomination
+        for nomination, _cluster_id in nominate_topic_pool(
+            bundle, query_plan, plan,
+            to_date=to_date, limit=limit, provider=provider, model=model,
+        )
+    ]
 
 
 # Enrichment fan-out bounds. Sub-runs hit the same upstream APIs as a normal
@@ -1010,29 +1036,38 @@ def _best_community_comment(items: list[schema.SourceItem]) -> str | None:
     return f'"{body}"{attribution}{votes}'
 
 
-def run_discover(
+@dataclass(frozen=True)
+class _DiscoverySweep:
+    """The shared front half of both discovery entry points: the resolved
+    plan and window, the swept listing bundle, and finalized per-source
+    status. Everything downstream (judging, enrichment, floor, queue)
+    belongs to the caller's leg."""
+
+    plan: schema.DiscoveryPlan
+    query_plan: schema.QueryPlan
+    from_date: str
+    to_date: str
+    bundle: schema.RetrievalBundle
+    source_status: dict[str, schema.SourceOutcome]
+
+
+def _discovery_sweep(
     *,
     domain: str,
     config: dict[str, Any],
-    depth: str = "default",
-    requested_sources: list[str] | None = None,
-    mock: bool = False,
-    subreddits: list[str] | None = None,
-    lookback_days: int = 30,
-    as_of_date: str | None = None,
-    limit: int = 10,
-    enrich: bool = False,
-    enrich_requested_sources: list[str] | None = None,
-) -> schema.DiscoveryReport:
-    """Sweep category listings and rank the topics gaining velocity.
+    depth: str,
+    requested_sources: list[str] | None,
+    mock: bool,
+    subreddits: list[str] | None,
+    lookback_days: int,
+    as_of_date: str | None,
+) -> _DiscoverySweep:
+    """Resolve the momentum window, validate/bound the listing sources, build
+    the discovery plan, sweep the river feeds, and finalize source status.
 
-    ``requested_sources`` bounds the listing sweep (discovery-capable feeds
-    only). ``enrich_requested_sources`` bounds the per-topic research passes:
-    None means every available source - which is what lets Techmeme, arXiv,
-    YouTube, Polymarket, and community comments reach discovery despite having
-    no river feed of their own. Pass the user's original --search list here so
-    an explicit source boundary holds through enrichment too.
-    """
+    Shared verbatim by ``run_discover`` (one-shot) and
+    ``run_discover_nominate`` (protocol leg 1) so the two paths can never
+    drift on what a sweep means."""
     from_date, to_date = dates.get_date_range(lookback_days, as_of_date=as_of_date)
     requested = normalize_requested_sources(requested_sources)
     unsupported = sorted(set(requested or []) - set(DISCOVERY_SOURCES))
@@ -1041,25 +1076,6 @@ def run_discover(
             "Discovery supports listing sources only: reddit, hackernews, digg "
             f"(unsupported: {', '.join(unsupported)})"
         )
-
-    # Stage-1 judge runtime, resolved ONCE here (mirrors run()'s provider
-    # resolution). In mock runs the judge is skipped outright and
-    # providers.resolve_runtime is NEVER called: subprocess tests inherit the
-    # caller's env, so an ungated resolve could pick up ambient keys and let a
-    # --mock run reach the network.
-    judge_provider: providers.ReasoningClient | None = None
-    judge_model: str | None = None
-    if not mock:
-        judge_runtime, judge_provider = providers.resolve_runtime(config, depth)
-        judge_model = judge_runtime.rerank_model if judge_provider else None
-        if judge_provider is None:
-            log.source_log(
-                "Discover",
-                "topic names and angles are using the deterministic fallback - "
-                "no reasoning provider configured (set GEMINI_API_KEY, "
-                "XAI_API_KEY, OPENROUTER_API_KEY, or OpenAI auth)",
-                tty_only=False,
-            )
     available = list(DISCOVERY_SOURCES) if mock else [
         source for source in available_sources(config, requested, x_pending=False)
         if source in DISCOVERY_SOURCES
@@ -1074,7 +1090,6 @@ def run_discover(
 
     global_mode = not plan.domain
     domain_label = plan.domain or "everything"
-    source_status: dict[str, schema.SourceOutcome] = {}
     query_plan = schema.QueryPlan(
         intent="breaking_news",
         freshness_mode="breaking",
@@ -1103,6 +1118,7 @@ def run_discover(
         keyword_gate=not global_mode,
     )
 
+    source_status: dict[str, schema.SourceOutcome] = {}
     for source in DISCOVERY_SOURCES:
         if source in bundle.source_status:
             continue
@@ -1117,10 +1133,169 @@ def run_discover(
             fix_hint="doctor",
         )
     source_status.update(_finalize_source_status(bundle.source_status, bundle.items_by_source))
+    return _DiscoverySweep(
+        plan=plan,
+        query_plan=query_plan,
+        from_date=from_date,
+        to_date=to_date,
+        bundle=bundle,
+        source_status=source_status,
+    )
+
+
+def _degraded_discovery_sources(
+    source_status: dict[str, schema.SourceOutcome],
+) -> list[str]:
+    """Sources whose outcome is neither clean nor an expected skip."""
+    return [
+        source for source, outcome_state in source_status.items()
+        if outcome_state.state not in {health.OK, schema.NO_RESULTS, schema.SKIPPED_UNCONFIGURED}
+    ]
+
+
+@dataclass(frozen=True)
+class DiscoverNominateResult:
+    """Leg 1 output of the host-judged discovery protocol: the ranked judge
+    pool as ``(nomination, cluster_id)`` pairs plus the sweep context the CLI
+    needs to write the nominations bundle - or to render the nothing-solid
+    brief when the pool is empty."""
+
+    plan: schema.DiscoveryPlan
+    from_date: str
+    to_date: str
+    source_status: dict[str, schema.SourceOutcome]
+    pool: list[tuple[Nomination, str]]
+
+
+def run_discover_nominate(
+    *,
+    domain: str,
+    config: dict[str, Any],
+    depth: str = "default",
+    requested_sources: list[str] | None = None,
+    mock: bool = False,
+    subreddits: list[str] | None = None,
+    lookback_days: int = 30,
+    as_of_date: str | None = None,
+) -> DiscoverNominateResult:
+    """Protocol leg 1: sweep the listings and build the FULL judge pool.
+
+    Same sweep and clustering as ``run_discover``, but the pool is cut at
+    ``rerank.JUDGE_POOL_LIMIT`` (not the enrichment limit) and stays on the
+    deterministic heuristic path: no provider is ever resolved, so names and
+    junk flags are the ``topic_shape`` fallbacks the host judges against.
+    No stage-1 judge, no enrichment, no confidence floor, no queue writes -
+    those belong to legs 2 and 3.
+    """
+    sweep = _discovery_sweep(
+        domain=domain,
+        config=config,
+        depth=depth,
+        requested_sources=requested_sources,
+        mock=mock,
+        subreddits=subreddits,
+        lookback_days=lookback_days,
+        as_of_date=as_of_date,
+    )
+    pool = nominate_topic_pool(
+        sweep.bundle, sweep.query_plan, sweep.plan,
+        to_date=sweep.to_date,
+        limit=rerank.JUDGE_POOL_LIMIT,
+        provider=None,
+        model=None,
+    )
+    return DiscoverNominateResult(
+        plan=sweep.plan,
+        from_date=sweep.from_date,
+        to_date=sweep.to_date,
+        source_status=sweep.source_status,
+        pool=pool,
+    )
+
+
+def nominate_nothing_solid_report(result: DiscoverNominateResult) -> schema.DiscoveryReport:
+    """The honest-empty leg-1 report: a zero-nomination sweep renders the
+    same nothing-solid brief a one-shot run would (and writes no bundle)."""
+    warnings = [
+        "The listing sweep nominated no topics this window; reporting "
+        "nothing solid instead of ranked noise."
+    ]
+    failed = _degraded_discovery_sources(result.source_status)
+    if failed:
+        warnings.append(f"Some discovery sources degraded: {', '.join(sorted(failed))}.")
+    return schema.DiscoveryReport(
+        domain=result.plan.domain,
+        range_from=result.from_date,
+        range_to=result.to_date,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        plan=result.plan,
+        topics=[],
+        source_status=result.source_status,
+        warnings=warnings,
+        outcome="nothing-solid",
+        weak_signal=None,
+    )
+
+
+def run_discover(
+    *,
+    domain: str,
+    config: dict[str, Any],
+    depth: str = "default",
+    requested_sources: list[str] | None = None,
+    mock: bool = False,
+    subreddits: list[str] | None = None,
+    lookback_days: int = 30,
+    as_of_date: str | None = None,
+    limit: int = 10,
+    enrich: bool = False,
+    enrich_requested_sources: list[str] | None = None,
+) -> schema.DiscoveryReport:
+    """Sweep category listings and rank the topics gaining velocity.
+
+    ``requested_sources`` bounds the listing sweep (discovery-capable feeds
+    only). ``enrich_requested_sources`` bounds the per-topic research passes:
+    None means every available source - which is what lets Techmeme, arXiv,
+    YouTube, Polymarket, and community comments reach discovery despite having
+    no river feed of their own. Pass the user's original --search list here so
+    an explicit source boundary holds through enrichment too.
+    """
+    sweep = _discovery_sweep(
+        domain=domain,
+        config=config,
+        depth=depth,
+        requested_sources=requested_sources,
+        mock=mock,
+        subreddits=subreddits,
+        lookback_days=lookback_days,
+        as_of_date=as_of_date,
+    )
+    plan = sweep.plan
+    from_date, to_date = sweep.from_date, sweep.to_date
+    source_status = sweep.source_status
+
+    # Stage-1 judge runtime, resolved ONCE here (mirrors run()'s provider
+    # resolution). In mock runs the judge is skipped outright and
+    # providers.resolve_runtime is NEVER called: subprocess tests inherit the
+    # caller's env, so an ungated resolve could pick up ambient keys and let a
+    # --mock run reach the network.
+    judge_provider: providers.ReasoningClient | None = None
+    judge_model: str | None = None
+    if not mock:
+        judge_runtime, judge_provider = providers.resolve_runtime(config, depth)
+        judge_model = judge_runtime.rerank_model if judge_provider else None
+        if judge_provider is None:
+            log.source_log(
+                "Discover",
+                "topic names and angles are using the deterministic fallback - "
+                "no reasoning provider configured (set GEMINI_API_KEY, "
+                "XAI_API_KEY, OPENROUTER_API_KEY, or OpenAI auth)",
+                tty_only=False,
+            )
 
     topic_limit = max(5, min(10, limit))
     nominations = nominate_topics(
-        bundle, query_plan, plan,
+        sweep.bundle, sweep.query_plan, plan,
         to_date=to_date,
         limit=ENRICH_LIMIT if enrich else topic_limit,
         provider=judge_provider,
@@ -1307,10 +1482,7 @@ def run_discover(
         warnings.append("Fewer than five topic clusters cleared the confidence floor this window.")
     if topics and all(len(topic.sources) == 1 for topic in topics):
         warnings.append("Discovery evidence is single-source; configure Digg for broader confirmation.")
-    failed = [
-        source for source, outcome_state in source_status.items()
-        if outcome_state.state not in {health.OK, schema.NO_RESULTS, schema.SKIPPED_UNCONFIGURED}
-    ]
+    failed = _degraded_discovery_sources(source_status)
     if failed:
         warnings.append(f"Some discovery sources degraded: {', '.join(sorted(failed))}.")
 

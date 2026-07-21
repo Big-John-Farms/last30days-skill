@@ -1471,6 +1471,47 @@ def _run_queue_cover(
     return 0
 
 
+def _resolve_discovery_source_boundary(
+    args: argparse.Namespace, config: dict[str, object],
+) -> tuple[list[str] | None, list[str] | None] | None:
+    """Resolve the discovery sweep's source lists from the user's boundary.
+
+    Returns ``(listing_sources, enrichment_boundary)`` - the discovery-capable
+    subset for the sweep, and the user's ORIGINAL boundary honored by the
+    per-topic research passes (which reach beyond the listing feeds - e.g.
+    Techmeme, arXiv, YouTube, Polymarket); both None mean every available
+    source. Returns None (after writing the exit-2 error) when the configured
+    boundary leaves nothing to sweep: silently widening to all feeds would
+    query sources the user filtered out.
+    """
+    requested_sources = resolve_requested_sources(args.search, config)
+    enrich_requested_sources = list(requested_sources) if requested_sources else None
+    if requested_sources:
+        discovery_sources = [
+            source for source in requested_sources
+            if source in pipeline.DISCOVERY_SOURCES
+        ]
+        if not discovery_sources:
+            origin = "--search" if args.search is not None else "LAST30DAYS_DEFAULT_SEARCH"
+            sys.stderr.write(
+                f"[last30days] {origin} has no discovery-capable sources "
+                f"(unsupported: {', '.join(requested_sources)}); discovery "
+                f"sweeps use: {', '.join(pipeline.DISCOVERY_SOURCES)}. Pass "
+                "--search with one of those (or clear the source filter) to "
+                "run a sweep.\n"
+            )
+            return None
+        requested_sources = discovery_sources
+    return requested_sources, enrich_requested_sources
+
+
+def _discover_subreddits(args: argparse.Namespace) -> list[str] | None:
+    return (
+        [value.strip().removeprefix("r/") for value in args.subreddits.split(",") if value.strip()]
+        if args.subreddits else None
+    )
+
+
 def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
     domain = " ".join(str(args.discover or "").split())
     # Empty domain = global trending: sweep every river feed's hot list with no
@@ -1487,34 +1528,11 @@ def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
     if args.synthesis_file:
         sys.stderr.write("[last30days] Warning: --synthesis-file is not used by discovery mode.\n")
 
-    requested_sources = resolve_requested_sources(args.search, config)
-    # The user's original source boundary, honored by the per-topic research
-    # passes (which reach beyond the discovery-capable listing feeds - e.g.
-    # Techmeme, arXiv, YouTube, Polymarket). None = every available source.
-    enrich_requested_sources = list(requested_sources) if requested_sources else None
-    if requested_sources:
-        discovery_sources = [
-            source for source in requested_sources
-            if source in pipeline.DISCOVERY_SOURCES
-        ]
-        if not discovery_sources:
-            # A configured source boundary holds even when it leaves nothing
-            # to sweep: silently widening to all feeds would query sources
-            # the user filtered out.
-            origin = "--search" if args.search is not None else "LAST30DAYS_DEFAULT_SEARCH"
-            sys.stderr.write(
-                f"[last30days] {origin} has no discovery-capable sources "
-                f"(unsupported: {', '.join(requested_sources)}); discovery "
-                f"sweeps use: {', '.join(pipeline.DISCOVERY_SOURCES)}. Pass "
-                "--search with one of those (or clear the source filter) to "
-                "run a sweep.\n"
-            )
-            return 2
-        requested_sources = discovery_sources
-    subreddits = (
-        [value.strip().removeprefix("r/") for value in args.subreddits.split(",") if value.strip()]
-        if args.subreddits else None
-    )
+    boundary = _resolve_discovery_source_boundary(args, config)
+    if boundary is None:
+        return 2
+    requested_sources, enrich_requested_sources = boundary
+    subreddits = _discover_subreddits(args)
     depth = "deep" if args.deep else "quick" if args.quick else "default"
     try:
         report = pipeline.run_discover(
@@ -1593,10 +1611,74 @@ def _discover_handoff_state_dir(args: argparse.Namespace) -> Path | None:
 
 
 def _run_discover_nominate(args: argparse.Namespace, config: dict[str, object]) -> int:
-    """Protocol leg 1: sweep and write the nominations bundle (U3 stub)."""
-    raise NotImplementedError(
-        "--discover --nominate-only leg is not implemented yet (U3 replaces this stub)"
+    """Protocol leg 1: sweep the listings, build the full judge pool, write
+    the nominations bundle, and print the host-facing judging digest.
+
+    No stage-1 judge, enrichment, confidence floor, or queue writes happen on
+    this leg - the host judges from the bundle and leg 2 (--judgments)
+    resumes from it. A zero-nomination sweep short-circuits to the existing
+    nothing-solid brief with NO bundle written: there is nothing to judge.
+    """
+    domain = " ".join(str(args.discover or "").split())
+    boundary = _resolve_discovery_source_boundary(args, config)
+    if boundary is None:
+        return 2
+    requested_sources, enrich_requested_sources = boundary
+    lookback_days = args.lookback_days or 30
+    try:
+        result = pipeline.run_discover_nominate(
+            domain=domain,
+            config=config,
+            depth="deep" if args.deep else "quick" if args.quick else "default",
+            requested_sources=requested_sources,
+            mock=args.mock,
+            subreddits=_discover_subreddits(args),
+            lookback_days=lookback_days,
+            as_of_date=args.as_of_date,
+        )
+    except ValueError as exc:
+        sys.stderr.write(f"[last30days] {exc}\n")
+        return 2
+
+    if not result.pool:
+        print(render.render_discovery(pipeline.nominate_nothing_solid_report(result)))
+        return 0
+
+    entries = [
+        discovery_handoff.PoolEntry(
+            nomination=nomination,
+            cluster_id=cluster_id,
+            # No provider runs on this leg, so the nomination's name and junk
+            # flag ARE the topic_shape heuristics - stored on the row as
+            # leg 2's fallback for anything the host leaves unjudged.
+            heuristic_name=nomination.name,
+            heuristic_junk=nomination.junk_shape,
+        )
+        for nomination, cluster_id in result.pool
+    ]
+    bundle = discovery_handoff.write_nominations_bundle(
+        entries,
+        domain=result.plan.domain,
+        tier="shallow" if args.discover_shallow else "deep",
+        from_date=result.from_date,
+        to_date=result.to_date,
+        lookback_days=lookback_days,
+        enrichment_source_boundary=enrich_requested_sources,
+        requested_sources=requested_sources,
+        # Same resolution as _discover_handoff_state_dir: save dir when
+        # given, else the config dir.
+        save_dir=getattr(args, "save_dir", None),
+        config_dir=env.CONFIG_DIR,
     )
+    print(discovery_handoff.build_host_digest(bundle))
+    print(
+        "\nJudgments file schema (leg 2): "
+        f'{{"bundle_id": "{bundle.bundle_id}", "judgments": '
+        '[{"id": "n1", "name": "<short topic name>", "junk": false, '
+        '"worthiness": 0-100}, ...]}. '
+        "Then resume with: --discover --judgments <path>."
+    )
+    return 0
 
 
 def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) -> int:

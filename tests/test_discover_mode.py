@@ -9,7 +9,7 @@ from unittest import mock
 import pytest
 
 import last30days as cli
-from lib import discovery_handoff, pipeline, planner, reddit_listing, render, rerank, schema
+from lib import dates, discovery_handoff, pipeline, planner, reddit_listing, render, rerank, schema
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1267,21 +1267,177 @@ def test_discovery_cli_mock_protocol_leg_requires_save_dir(leg_argv):
 @pytest.mark.parametrize(
     ("leg_argv", "marker"),
     [
-        (["--nominate-only"], "nominate-only leg"),
         (["--judgments", "judgments.json"], "judgments resume leg"),
         (["--finalize"], "finalize leg"),
     ],
 )
 def test_discovery_cli_protocol_flags_reach_their_leg_stub(tmp_path, leg_argv, marker):
-    """With --save-dir, each protocol flag routes to its own leg. The legs are
-    U3-U5 stubs for now, so the distinct NotImplementedError message is the
-    dispatch evidence (U3-U5 will retarget these pins to real behavior)."""
+    """With --save-dir, each protocol flag routes to its own leg. Legs 2 and 3
+    are U4/U5 stubs for now, so the distinct NotImplementedError message is
+    the dispatch evidence (U4/U5 will retarget these pins to real behavior);
+    leg 1's real behavior is pinned below."""
     result = _run_protocol_cli(
         ["--discover", "AI agents", "--mock", "--save-dir", str(tmp_path), *leg_argv],
     )
     assert result.returncode == 1, result.stderr
     assert "NotImplementedError" in result.stderr
     assert marker in result.stderr
+
+
+# --- U3 leg 1: --discover --nominate-only (sweep, bundle, digest) -------------
+
+
+def _run_nominate_only(save_dir, *extra_argv):
+    return _run_protocol_cli(
+        [
+            "--discover", "AI agents", "--mock",
+            "--save-dir", str(save_dir), "--nominate-only", *extra_argv,
+        ],
+        # Pin the default-search seam empty so a dev machine's configured
+        # boundary cannot leak into the bundle-context assertions.
+        env_overrides={"LAST30DAYS_DEFAULT_SEARCH": ""},
+    )
+
+
+def test_discovery_cli_nominate_only_writes_bundle_and_digest(tmp_path):
+    """Leg 1 exits 0, writes the nominations bundle under the save dir, and
+    prints the host digest naming the bundle path with one line per
+    nomination - no judging, enrichment, floor, or queue on this leg."""
+    result = _run_nominate_only(tmp_path)
+    assert result.returncode == 0, result.stderr
+    bundle_path = tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME
+    assert bundle_path.is_file()
+    payload = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert payload["kind"] == schema.DISCOVERY_NOMINATIONS_KIND
+    assert payload["schema_version"] == schema.DISCOVERY_NOMINATIONS_SCHEMA_VERSION
+    assert payload["domain"] == "AI agents"
+    assert payload["tier"] == "deep"
+    # Leg-1 invocation context rides along for leg 2.
+    assert payload["context"]["lookback_days"] == 30
+    assert payload["context"]["requested_sources"] is None
+    assert payload["context"]["enrichment_source_boundary"] is None
+    # Momentum window matches the sweep dates (computed the same day).
+    assert (payload["from_date"], payload["to_date"]) == dates.get_date_range(30)
+    assert payload["nominations"]
+    for row in payload["nominations"]:
+        # Heuristic fallbacks: no provider ran, so the nomination's own
+        # name/junk ARE the topic_shape heuristics.
+        assert row["heuristic_name"] == row["nomination"]["name"]
+        assert row["heuristic_junk"] == row["nomination"]["junk_shape"]
+        assert row["sources"] == sorted({
+            item["source"] for item in row["nomination"]["items"]
+        })
+    # Digest on stdout: names the bundle file, instructs reading it before
+    # judging, and carries exactly one line per nomination id.
+    assert str(bundle_path) in result.stdout
+    assert "before judging" in result.stdout
+    for row in payload["nominations"]:
+        matching = [
+            line for line in result.stdout.splitlines()
+            if line.startswith(f"{row['id']} | ")
+        ]
+        assert len(matching) == 1
+    # No queue writes on leg 1.
+    assert not (tmp_path / "research.db").exists()
+
+
+def test_discovery_cli_nominate_only_source_boundary_rides_into_bundle(tmp_path):
+    result = _run_nominate_only(tmp_path, "--search", "reddit")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(
+        (tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["context"]["requested_sources"] == ["reddit"]
+    assert payload["context"]["enrichment_source_boundary"] == ["reddit"]
+    for row in payload["nominations"]:
+        assert row["sources"] == ["reddit"]
+
+
+def test_discovery_cli_nominate_only_mock_is_deterministic(tmp_path):
+    """Two mock leg-1 runs agree on every nomination row and digest line
+    (only bundle_id/generated_at/path may differ)."""
+    def run_leg(save_dir):
+        save_dir.mkdir()
+        result = _run_nominate_only(save_dir)
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(
+            (save_dir / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        return payload, result.stdout
+
+    first_payload, first_out = run_leg(tmp_path / "a")
+    second_payload, second_out = run_leg(tmp_path / "b")
+    assert first_payload["nominations"] == second_payload["nominations"]
+    assert (first_payload["from_date"], first_payload["to_date"]) == (
+        second_payload["from_date"], second_payload["to_date"],
+    )
+    ids = [row["id"] for row in first_payload["nominations"]]
+
+    def digest_lines(out: str) -> list[str]:
+        return [
+            line for line in out.splitlines()
+            if any(line.startswith(f"{row_id} | ") for row_id in ids)
+        ]
+
+    assert digest_lines(first_out) == digest_lines(second_out)
+
+
+def test_discovery_cli_nominate_only_shallow_marks_tier(tmp_path):
+    result = _run_nominate_only(tmp_path, "--discover-shallow")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(
+        (tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert payload["tier"] == "shallow"
+
+
+def test_discovery_cli_nominate_only_zero_nominations_nothing_solid(tmp_path, capsys):
+    """An empty sweep short-circuits to the existing nothing-solid brief:
+    exit 0, NO bundle file, nothing for later legs."""
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args(
+        ["--discover", "AI agents", "--save-dir", str(tmp_path), "--nominate-only"]
+    )
+
+    def empty_fetch(source, plan, *, from_date, to_date, depth, mock, config, keyword_gate=True):
+        return [], None
+
+    with mock.patch.object(
+        pipeline, "available_sources", return_value=["hackernews"],
+    ), mock.patch.object(
+        pipeline, "_fetch_discovery_source", side_effect=empty_fetch,
+    ), mock.patch.object(pipeline, "enrich_nominations") as enrich:
+        assert cli._run_discover_protocol_leg(args, {}) == 0
+
+    enrich.assert_not_called()
+    out = capsys.readouterr().out
+    assert "Nothing solid this window." in out
+    assert not (tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).exists()
+    assert not (tmp_path / "research.db").exists()
+
+
+def test_discovery_cli_nominate_only_skips_enrichment_providers_and_queue(tmp_path):
+    """Spies on the leg-1 boundary: enrichment, provider resolution, and the
+    queue hook are never touched, and no research.db appears."""
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args(
+        ["--discover", "AI agents", "--mock", "--save-dir", str(tmp_path), "--nominate-only"]
+    )
+    with mock.patch.object(pipeline, "enrich_nominations") as enrich, \
+         mock.patch.object(pipeline.providers, "resolve_runtime") as resolve, \
+         mock.patch.object(cli, "_annotate_and_record_discovery_queue") as queue_hook:
+        assert cli._run_discover_protocol_leg(args, {}) == 0
+    enrich.assert_not_called()
+    resolve.assert_not_called()
+    queue_hook.assert_not_called()
+    assert (tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).is_file()
+    assert not (tmp_path / "research.db").exists()
 
 
 def test_discover_handoff_state_dir_scopes_to_save_dir_then_config(tmp_path, monkeypatch):
