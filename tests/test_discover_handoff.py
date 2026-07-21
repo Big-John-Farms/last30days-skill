@@ -11,6 +11,7 @@ and the host-facing digest.
 
 import inspect
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -277,6 +278,85 @@ def test_junk_accepted_even_without_usable_name(tmp_path):
     assert judgments["n2"].name is None
 
 
+def test_junk_null_and_string_false_are_per_row_absent(tmp_path):
+    """Only real JSON booleans count as a junk verdict. ``"junk": null`` and
+    ``"junk": "false"`` are per-row-absent (fall back to the bundle
+    heuristic) - a truthy non-empty string must never read as junk=True."""
+    bundle = _write(tmp_path)
+    path = _judgments_file(tmp_path, {
+        "bundle_id": bundle.bundle_id,
+        "judgments": [
+            {"id": "n1", "junk": None, "worthiness": 60},
+            {"id": "n2", "junk": "false", "worthiness": 40},
+        ],
+    })
+    judgments = handoff.read_judgments(path, bundle)
+    assert judgments["n1"].junk is None
+    assert judgments["n2"].junk is None
+    # The rest of each row still applies.
+    assert judgments["n1"].worthiness == 60
+    assert judgments["n2"].worthiness == 40
+
+
+def test_bundle_reader_warns_and_keeps_valid_rows(tmp_path, capsys):
+    """Lenient per row: a non-object row and a row whose nested nomination
+    fails to construct are each warned (always visible) and skipped, while
+    every valid row still parses."""
+    _write(tmp_path)
+    path = tmp_path / handoff.NOMINATIONS_BUNDLE_FILENAME
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["nominations"] = [
+        "not an object",
+        {"id": "nbad", "nomination": {"worthiness": "not-a-number"}},
+        *payload["nominations"],
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    read = handoff.read_nominations_bundle(config_dir=tmp_path)
+    assert [row.nomination_id for row in read.nominations] == ["n1", "n2"]
+    err = capsys.readouterr().err
+    assert "skipping malformed nomination row 1" in err
+    assert "skipping unparseable nomination row 2" in err
+
+
+def test_judgments_reader_warns_on_non_object_and_blank_id_rows(tmp_path, capsys):
+    bundle = _write(tmp_path)
+    path = _judgments_file(tmp_path, {
+        "bundle_id": bundle.bundle_id,
+        "judgments": [
+            "not an object",
+            {"name": "No Id Here", "worthiness": 90},
+            {"id": "   ", "worthiness": 90},
+            {"id": "n1", "worthiness": 70},
+        ],
+    })
+    judgments = handoff.read_judgments(path, bundle)
+    assert set(judgments) == {"n1"}
+    assert judgments["n1"].worthiness == 70
+    err = capsys.readouterr().err
+    assert "skipping malformed judgments row (not an object)" in err
+    assert err.count("skipping judgments row with no nomination id") == 2
+
+
+def test_angles_reader_warns_on_non_object_and_blank_id_rows(tmp_path, capsys):
+    bundle = _write(tmp_path)
+    path = tmp_path / "angles.json"
+    path.write_text(json.dumps({
+        "bundle_id": bundle.bundle_id,
+        "angles": [
+            "not an object",
+            {"podcast": "No id on this row"},
+            {"id": "", "podcast": "Blank id"},
+            {"id": "n1", "podcast": "A real hook about agent SDK churn"},
+        ],
+    }), encoding="utf-8")
+    angles = handoff.read_angles(path, bundle)
+    assert set(angles) == {"n1"}
+    assert angles["n1"].podcast == "A real hook about agent SDK churn"
+    err = capsys.readouterr().err
+    assert "skipping malformed angles row (not an object)" in err
+    assert err.count("skipping angles row with no nomination id") == 2
+
+
 # --- Scenario 4: error matrix -------------------------------------------------
 
 
@@ -303,6 +383,70 @@ def test_error_top_level_non_dict(tmp_path):
     )
     with pytest.raises(handoff.HandoffContractError):
         handoff.read_nominations_bundle(config_dir=tmp_path)
+
+
+def test_error_bundle_nominations_must_be_a_list(tmp_path):
+    """A dict (or anything non-list) under "nominations" is corrupt state:
+    fail closed with the re-sweep remedy, never an empty pool."""
+    _write(tmp_path)
+    path = tmp_path / handoff.NOMINATIONS_BUNDLE_FILENAME
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["nominations"] = {"n1": {"id": "n1"}}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_nominations_bundle(config_dir=tmp_path)
+    message = excinfo.value.message
+    assert "nominations" in message
+    assert "--discover --nominate-only" in message
+
+
+def test_error_bundle_all_rows_malformed_fails_closed(tmp_path):
+    """Leg 1 never writes an empty bundle (a zero-nomination sweep
+    short-circuits with no bundle file), so a non-empty nominations array
+    that parses to ZERO valid rows is corrupt state: HandoffContractError
+    with the re-sweep remedy, not a silent empty pool."""
+    _write(tmp_path)
+    path = tmp_path / handoff.NOMINATIONS_BUNDLE_FILENAME
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["nominations"] = [
+        "not an object",
+        {"id": "n1", "nomination": {"worthiness": "not-a-number"}},
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_nominations_bundle(config_dir=tmp_path)
+    assert "--discover --nominate-only" in excinfo.value.message
+
+
+def test_error_bundle_empty_nominations_list_fails_closed(tmp_path):
+    _write(tmp_path)
+    path = tmp_path / handoff.NOMINATIONS_BUNDLE_FILENAME
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["nominations"] = []
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_nominations_bundle(config_dir=tmp_path)
+    assert "--discover --nominate-only" in excinfo.value.message
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permission bits",
+)
+def test_write_bundle_unwritable_dir_is_contract_error_not_traceback(tmp_path):
+    """A locked/read-only/full state dir must be the protocol's clean exit-2
+    path (HandoffContractError naming the path), never a raw OSError."""
+    state_dir = tmp_path / "readonly"
+    state_dir.mkdir()
+    state_dir.chmod(0o500)
+    try:
+        with pytest.raises(handoff.HandoffContractError) as excinfo:
+            _write(state_dir)
+        message = excinfo.value.message
+        assert str(state_dir / handoff.NOMINATIONS_BUNDLE_FILENAME) in message
+        assert "Permission denied" in message
+    finally:
+        state_dir.chmod(0o700)
 
 
 def test_error_wrong_schema_version(tmp_path):
@@ -345,19 +489,51 @@ def test_ttl_is_not_the_report_cache_env_knob(tmp_path, monkeypatch):
     assert handoff.DISCOVERY_HANDOFF_TTL_SECONDS == 3600.0
 
 
-def test_error_bundle_not_found_names_both_locations_and_remedy(tmp_path):
+def test_error_bundle_not_found_with_save_dir_names_only_save_dir(tmp_path):
+    """An explicit save dir is the protocol's single handoff store: the
+    not-found error names ONLY the save-dir location, never the config dir."""
     save_dir = tmp_path / "saves"
     config_dir = tmp_path / "config"
     with pytest.raises(handoff.HandoffContractError) as excinfo:
         handoff.read_nominations_bundle(save_dir=save_dir, config_dir=config_dir)
     message = excinfo.value.message
     assert str(save_dir / handoff.NOMINATIONS_BUNDLE_FILENAME) in message
-    assert str(config_dir / handoff.NOMINATIONS_BUNDLE_FILENAME) in message
+    assert str(config_dir) not in message
     assert "--discover --nominate-only" in message
     assert message.rstrip().endswith("re-sweep.")
 
 
-def test_error_bundle_id_mismatch_names_locations_and_remedy(tmp_path):
+def test_error_bundle_not_found_without_save_dir_names_config_dir(tmp_path):
+    config_dir = tmp_path / "config"
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_nominations_bundle(save_dir=None, config_dir=config_dir)
+    message = excinfo.value.message
+    assert str(config_dir / handoff.NOMINATIONS_BUNDLE_FILENAME) in message
+    assert "--discover --nominate-only" in message
+
+
+def test_explicit_save_dir_never_falls_back_to_config_bundle(tmp_path):
+    """SKILL.md contract: a different or missing save dir on a later leg
+    means the leg cannot find the handoff files. A fresh bundle in the
+    config dir must never silently satisfy a save-dir run (the same
+    scoping _scoped_store_db applies to research.db)."""
+    save_dir = tmp_path / "saves"
+    save_dir.mkdir()
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    _write(config_dir)  # fresh, valid bundle in the config store
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_nominations_bundle(save_dir=save_dir, config_dir=config_dir)
+    message = excinfo.value.message
+    assert str(save_dir / handoff.NOMINATIONS_BUNDLE_FILENAME) in message
+    assert str(config_dir) not in message
+
+
+def test_error_bundle_id_mismatch_names_locations_and_fix_id_remedy(tmp_path):
+    """A bundle_id MISMATCH means the host echoed the wrong id: the remedy is
+    to correct the bundle_id field and re-run this same leg - never the
+    expensive re-sweep/resume remedies (those belong to missing/stale
+    state)."""
     save_dir = tmp_path / "saves"
     config_dir = tmp_path / "config"
     bundle = _write(config_dir)
@@ -368,10 +544,19 @@ def test_error_bundle_id_mismatch_names_locations_and_remedy(tmp_path):
     with pytest.raises(handoff.HandoffContractError) as excinfo:
         handoff.read_judgments(path, bundle, save_dir=save_dir, config_dir=config_dir)
     message = excinfo.value.message
+    # Both ids and the searched location (save dir only: explicit save dir
+    # is the single handoff store) stay named.
+    assert "deadbeefdeadbeef" in message
+    assert bundle.bundle_id in message
     assert str(save_dir / handoff.NOMINATIONS_BUNDLE_FILENAME) in message
-    assert str(config_dir / handoff.NOMINATIONS_BUNDLE_FILENAME) in message
-    assert "--discover --nominate-only" in message
-    assert message.rstrip().endswith("re-sweep.")
+    assert str(config_dir) not in message
+    # The remedy is the cheap one: fix the id, re-run this leg.
+    assert "Correct the bundle_id field in your judgments file" in message
+    assert "re-run this same leg" in message
+    # The expensive-leg remedies must NOT appear on a mismatch.
+    assert "--discover --nominate-only" not in message
+    assert "--discover --judgments" not in message
+    assert "re-sweep" not in message
 
 
 def test_error_unreadable_judgments_path(tmp_path):
@@ -510,22 +695,55 @@ def test_digest_names_bundle_path_instruction_and_capped_evidence(tmp_path):
     # (b) names the bundle file path and instructs reading it before judging.
     assert str(bundle.path) in digest
     assert "before judging" in digest
-    # (a) one line per nomination, keyed by nomination id.
+    # (a) one structural line per nomination, keyed by nomination id.
     lines = digest.splitlines()
     n1_lines = [line for line in lines if line.startswith("n1 | ")]
     n2_lines = [line for line in lines if line.startswith("n2 | ")]
     assert len(n1_lines) == 1
     assert len(n2_lines) == 1
-    # Evidence caps: the old judge surface (title ~220, snippet ~420).
-    assert LONG_TITLE[:220] in n1_lines[0]
-    assert LONG_TITLE[:230] not in digest
+    # Structural line carries id/sources/signal only - the third-party title
+    # lives inside the untrusted-content fence, never on the structural line.
     assert "hackernews" in n1_lines[0]  # seed source names
     assert "1,500 native interactions" in n1_lines[0]  # engagement signal
+    assert LONG_TITLE[:40] not in n1_lines[0]
+    # Evidence caps: the old judge surface (title ~220, snippet ~420).
+    assert LONG_TITLE[:220] in digest
+    assert LONG_TITLE[:230] not in digest
     assert long_snippet[:420] in digest
     assert long_snippet[:430] not in digest
     assert "consolidate the whole agent ecosystem" in digest  # top comment
     # Plain text: no markdown tables.
     assert not any(line.lstrip().startswith("|") for line in lines)
+
+
+def test_digest_fences_untrusted_evidence_like_the_engine_judge(tmp_path):
+    """F12: titles/snippets/comments are scraped third-party data. The digest
+    wraps them in the same fence the rerank judge uses (security-notice
+    header + <untrusted_content> tags); the structural surfaces (nomination
+    id/sources/signal lines, bundle path, judging instructions) stay outside
+    the fence."""
+    bundle = _write(tmp_path)
+    digest = handoff.build_host_digest(bundle)
+    # The exact rerank fence: notice header and tags, reused not re-invented.
+    assert rerank.UNTRUSTED_CONTENT_NOTICE in digest
+    fence_open = digest.index("<untrusted_content>")
+    fence_close = digest.index("</untrusted_content>")
+    assert fence_open < fence_close
+    # Every evidence surface (leader title, leader snippet, top community
+    # comment) sits inside the fence.
+    leader_title = (
+        "Agent SDK Wars heat up as Anthropic ships a Claude agent runtime"
+    )
+    assert fence_open < digest.index(leader_title) < fence_close
+    assert fence_open < digest.index(f"Evidence about {leader_title}") < fence_close
+    assert fence_open < digest.index(
+        "The SDK churn is unsustainable for small teams"
+    ) < fence_close
+    # Structural surfaces stay outside (before) the fence.
+    assert digest.index(str(bundle.path)) < fence_open
+    assert digest.index("before judging") < fence_open
+    assert digest.index("n1 | ") < fence_open
+    assert digest.index("n2 | ") < fence_open
 
 
 # --- U5: pending-report reader (leg 3) ----------------------------------------
@@ -582,18 +800,42 @@ def test_pending_report_save_dir_takes_precedence(tmp_path):
     assert pending.bundle_id == "fromsavedir00001"
 
 
-def test_pending_report_not_found_names_both_locations_and_remedy(tmp_path):
+def test_pending_report_not_found_with_save_dir_names_only_save_dir(tmp_path):
     save_dir = tmp_path / "saves"
     config_dir = tmp_path / "config"
     with pytest.raises(handoff.HandoffContractError) as excinfo:
         handoff.read_pending_report(save_dir=save_dir, config_dir=config_dir)
     message = excinfo.value.message
     assert str(save_dir / handoff.PENDING_REPORT_FILENAME) in message
-    assert str(config_dir / handoff.PENDING_REPORT_FILENAME) in message
+    assert str(config_dir) not in message
     # Remedy: re-run the resume leg, or the full protocol when the bundle is
     # stale too.
     assert "--discover --judgments" in message
     assert "--discover --nominate-only" in message
+
+
+def test_pending_report_not_found_without_save_dir_names_config_dir(tmp_path):
+    config_dir = tmp_path / "config"
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_pending_report(save_dir=None, config_dir=config_dir)
+    message = excinfo.value.message
+    assert str(config_dir / handoff.PENDING_REPORT_FILENAME) in message
+    assert "--discover --judgments" in message
+
+
+def test_explicit_save_dir_never_falls_back_to_config_pending(tmp_path):
+    """The mandated F2 pin: explicit save dir + missing pending file there +
+    a FRESH pending report in the config dir = HandoffContractError naming
+    only the save-dir location. No silent cross-store load."""
+    save_dir = tmp_path / "saves"
+    save_dir.mkdir()
+    config_dir = tmp_path / "config"
+    _write_pending(config_dir)  # fresh, valid pending report in config store
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_pending_report(save_dir=save_dir, config_dir=config_dir)
+    message = excinfo.value.message
+    assert str(save_dir / handoff.PENDING_REPORT_FILENAME) in message
+    assert str(config_dir) not in message
 
 
 def test_pending_report_invalid_json(tmp_path):
@@ -686,14 +928,19 @@ def test_angles_bundle_id_mismatch_against_pending_report(tmp_path):
     assert "deadbeefdeadbeef" in message
     assert pending.bundle_id in message
     # The finalize leg validates against the PENDING report - the mismatch
-    # message must point the host's retry at discover-pending.json and the
-    # resume-leg remedy, never at the nominations bundle (regression: the
-    # binding error used to name the wrong file on this leg).
+    # message must point the host's retry at discover-pending.json, never at
+    # the nominations bundle (regression: the binding error used to name the
+    # wrong file on this leg).
     assert "pending discovery report" in message
     assert "Pending-report locations searched" in message
     assert handoff.PENDING_REPORT_FILENAME in message
-    assert "--discover --judgments" in message
     assert handoff.NOMINATIONS_BUNDLE_FILENAME not in message
+    # A MISMATCH is a wrong echoed id: the remedy is to fix the id and re-run
+    # this same leg - the expensive re-sweep/resume remedies must not appear.
+    assert "Correct the bundle_id field in your angles file" in message
+    assert "re-run this same leg" in message
+    assert "--discover --judgments" not in message
+    assert "--discover --nominate-only" not in message
 
 
 # --- Hygiene ---------------------------------------------------------------------

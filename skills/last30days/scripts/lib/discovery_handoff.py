@@ -201,16 +201,18 @@ def _search_paths(
     config_dir: Path | None,
     path_fn: Callable[[Path], Path],
 ) -> list[Path]:
-    """Candidate handoff-file locations in lookup order: save-dir, then
-    config dir. ``path_fn`` picks which handoff file (bundle vs pending)."""
-    paths: list[Path] = []
+    """Candidate handoff-file locations: ONLY the save dir when one was
+    supplied, else the config dir. An explicit save dir is the protocol's
+    single handoff store (mirroring ``_scoped_store_db`` and SKILL.md's "a
+    different or missing save dir on a later leg means the leg cannot find
+    them" contract), so a handoff file in the config dir must never silently
+    satisfy a save-dir run. ``path_fn`` picks which handoff file (bundle vs
+    pending)."""
     if save_dir:
-        paths.append(path_fn(Path(save_dir).expanduser().resolve()))
+        return [path_fn(Path(save_dir).expanduser().resolve())]
     if config_dir is not None:
-        candidate = path_fn(Path(config_dir))
-        if candidate not in paths:
-            paths.append(candidate)
-    return paths
+        return [path_fn(Path(config_dir))]
+    return []
 
 
 def _searched_lines(searched: list[Path]) -> str:
@@ -299,8 +301,15 @@ def write_nominations_bundle(
         "nominations": rows,
     }
     path = nominations_bundle_path(state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        # A locked/read-only/full disk is the protocol's clean exit-2 path,
+        # never a traceback.
+        raise HandoffContractError(
+            f"Could not write nominations bundle {path}: {exc}"
+        ) from exc
     return NominationsBundle(
         schema_version=schema.DISCOVERY_NOMINATIONS_SCHEMA_VERSION,
         bundle_id=bundle_id,
@@ -330,8 +339,9 @@ def read_nominations_bundle(
 ) -> NominationsBundle:
     """Locate and parse the nominations bundle for legs 2 and 3.
 
-    Lookup order is save-dir then config dir. Raises HandoffContractError
-    (naming every searched location and the re-sweep remedy) when no bundle
+    The bundle lives in the save dir when one was supplied, else the config
+    dir - never both (no cross-store fallback). Raises HandoffContractError
+    (naming the searched location and the re-sweep remedy) when no bundle
     exists, and for any top-level contract violation in the file found.
     """
     searched = _search_paths(save_dir, config_dir, nominations_bundle_path)
@@ -423,8 +433,16 @@ def _parse_bundle_file(path: Path) -> NominationsBundle:
     except (TypeError, ValueError):
         lookback_days = 30
 
+    rows_raw = payload.get("nominations")
+    if not isinstance(rows_raw, list):
+        raise HandoffContractError(
+            f"Nominations bundle {path} must carry a top-level "
+            f"\"nominations\" list, got {type(rows_raw).__name__}. "
+            f"{_RESWEEP_REMEDY}"
+        )
+
     nominations: list[BundleNomination] = []
-    for position, row in enumerate(payload.get("nominations") or [], start=1):
+    for position, row in enumerate(rows_raw, start=1):
         # Lenient per row: the bundle is engine-written, but one corrupted
         # row must not discard the rest of the pool.
         if not isinstance(row, dict):
@@ -461,6 +479,16 @@ def _parse_bundle_file(path: Path) -> NominationsBundle:
             engagement_by_source=engagement,
         ))
 
+    if not nominations:
+        # Leg 1 never writes an empty bundle (a zero-nomination sweep
+        # short-circuits with no bundle file), so an empty or all-invalid
+        # nominations array is corrupt state: fail closed, never hand the
+        # resume leg a silently empty pool.
+        raise HandoffContractError(
+            f"Nominations bundle {path} contains no readable nominations "
+            f"(leg 1 never writes an empty pool). {_RESWEEP_REMEDY}"
+        )
+
     return NominationsBundle(
         schema_version=str(version),
         bundle_id=bundle_id,
@@ -490,8 +518,9 @@ def read_pending_report(
 ) -> PendingReport:
     """Locate and parse the leg-2 pending report for the finalize leg.
 
-    Same strictness family as the bundle reader: missing file (every searched
-    location named), unreadable, invalid JSON, wrong kind or schema version,
+    Same strictness family as the bundle reader: missing file (the searched
+    location named - save dir when supplied, else config dir, never a
+    cross-store fallback), unreadable, invalid JSON, wrong kind or schema version,
     missing bundle_id, or stale TTL all raise HandoffContractError (mapped to
     exit 2 by the CLI layer). Staleness is measured from the PENDING report's
     own generated_at - the leg-2 write started a fresh authoring window - and
@@ -582,7 +611,10 @@ def _require_bundle_binding(
     (or, on the finalize leg, the pending report that inherited its id).
     The mismatch message names the file actually validated against - the
     pending report on the finalize leg - so a host's retry is not misdirected
-    at the nominations bundle."""
+    at the nominations bundle. A mismatch means the host echoed the wrong id
+    into an otherwise-current file, so the remedy is the cheap one - correct
+    the bundle_id field and re-run this same leg - never the expensive
+    re-sweep/resume remedies (those belong to missing/stale state)."""
     file_bundle_id = str(payload.get("bundle_id") or "")
     if file_bundle_id == bundle.bundle_id:
         return
@@ -590,18 +622,18 @@ def _require_bundle_binding(
         searched = _search_paths(save_dir, config_dir, pending_report_path)
         noun = "current pending discovery report"
         location_label = "Pending-report locations searched"
-        remedy = _RESUME_REMEDY
     else:
         searched = _search_paths(save_dir, config_dir, nominations_bundle_path)
         noun = "current nominations bundle"
         location_label = "Bundle locations searched"
-        remedy = _RESWEEP_REMEDY
     if not searched and bundle.path is not None:
         searched = [bundle.path]
     raise HandoffContractError(
         f"The {label} file is bound to bundle_id {file_bundle_id!r} but the "
         f"{noun} is {bundle.bundle_id!r}. {location_label}:\n"
-        f"{_searched_lines(searched)}\n{remedy}"
+        f"{_searched_lines(searched)}\n"
+        f"Correct the bundle_id field in your {label} file to "
+        f"{bundle.bundle_id!r} and re-run this same leg."
     )
 
 
@@ -701,9 +733,13 @@ def read_judgments(
     for row_id, row in _known_rows(
         rows, known, row_label="judgments", unknown_label="judgment"
     ):
+        # Only a real JSON boolean is a junk verdict: null, "false", 0, or
+        # any other non-bool value is per-row-absent (bundle heuristic),
+        # never coerced - bool("false") is True.
+        raw_junk = row.get("junk")
         judgments[row_id] = HostJudgment(
             name=_sanitized_name(row.get("name")),
-            junk=bool(row["junk"]) if "junk" in row else None,
+            junk=raw_junk if isinstance(raw_junk, bool) else None,
             worthiness=_clamped_worthiness(row.get("worthiness")),
         )
     return judgments
@@ -842,11 +878,19 @@ def _one_line(text: str) -> str:
 
 def build_host_digest(bundle: NominationsBundle) -> str:
     """The host-facing judging digest for a nominations bundle: plain,
-    promptable text with one line per nomination (id, leader title, seed
-    source names, velocity/engagement signal) plus capped evidence lines
-    (leader snippet, strongest community comment - the surface the engine
-    judge used to see). Names the bundle file and instructs the host to read
-    its full evidence before judging."""
+    promptable text with one structural line per nomination (id, seed source
+    names, velocity/engagement signal) plus capped evidence lines (leader
+    title, leader snippet, strongest community comment - the surface the
+    engine judge used to see). Names the bundle file and instructs the host
+    to read its full evidence before judging.
+
+    The evidence lines are scraped third-party text, so they are fenced the
+    way the deleted engine judge fenced its candidate block (the exact
+    ``rerank._fenced_untrusted_content`` fence: a security-notice header
+    stating the fenced content is data, never instructions, around
+    ``<untrusted_content>`` tags). The structural lines - nomination ids,
+    sources, signal, bundle path, judging instructions - stay outside the
+    fence."""
     location = str(bundle.path) if bundle.path is not None else (
         NOMINATIONS_BUNDLE_FILENAME
     )
@@ -861,6 +905,7 @@ def build_host_digest(bundle: NominationsBundle) -> str:
         "lines below are only a digest.",
         "",
     ]
+    evidence_lines: list[str] = []
     for entry in bundle.nominations:
         items = entry.nomination.items
         leader = items[0] if items else None
@@ -870,20 +915,26 @@ def build_host_digest(bundle: NominationsBundle) -> str:
             rerank.discovery_engagement_total(item) for item in items
         )
         lines.append(
-            f"{entry.nomination_id} | {title[:_DIGEST_TITLE_MAX_CHARS]} | "
-            f"sources: {sources} | signal: seed velocity "
-            f"{entry.nomination.seed_score:.1f}, "
+            f"{entry.nomination_id} | sources: {sources} | "
+            f"signal: seed velocity {entry.nomination.seed_score:.1f}, "
             f"{native_total:,.0f} native interactions"
         )
+        evidence_lines.append(f"- id: {entry.nomination_id}")
+        evidence_lines.append(f"  title: {title[:_DIGEST_TITLE_MAX_CHARS]}")
         snippet_text = _one_line(
             (leader.snippet if leader else "") or entry.nomination.summary
         )
         if snippet_text:
-            lines.append(f"  snippet: {snippet_text[:_DIGEST_SNIPPET_MAX_CHARS]}")
+            evidence_lines.append(
+                f"  snippet: {snippet_text[:_DIGEST_SNIPPET_MAX_CHARS]}"
+            )
         top_comment = pipeline._best_community_comment(items)
         if top_comment:
-            lines.append(
+            evidence_lines.append(
                 f"  top comment: "
                 f"{_one_line(top_comment)[:_DIGEST_COMMENT_MAX_CHARS]}"
             )
+    if evidence_lines:
+        lines.append("")
+        lines.append(rerank._fenced_untrusted_content("\n".join(evidence_lines)))
     return "\n".join(lines)

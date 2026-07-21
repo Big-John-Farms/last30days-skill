@@ -2012,16 +2012,17 @@ def test_discovery_cli_finalize_stale_pending_exits_2(tmp_path, capsys):
     assert "--discover --judgments" in err
 
 
-def test_discovery_cli_finalize_missing_pending_names_both_locations(tmp_path, monkeypatch, capsys):
-    """The not-found message names BOTH searched locations (save dir and
-    config dir) and the resume-leg remedy."""
+def test_discovery_cli_finalize_missing_pending_names_save_dir_only(tmp_path, monkeypatch, capsys):
+    """With an explicit --save-dir the not-found message names ONLY the
+    save-dir location (the single handoff store - no config-dir fallback)
+    plus the resume-leg remedy."""
     config_dir = tmp_path / "config"
     monkeypatch.setattr(cli.env, "CONFIG_DIR", config_dir)
     save_dir = tmp_path / "client"
     assert _run_leg3(save_dir) == 2
     err = capsys.readouterr().err
     assert str(save_dir.resolve() / discovery_handoff.PENDING_REPORT_FILENAME) in err
-    assert str(config_dir / discovery_handoff.PENDING_REPORT_FILENAME) in err
+    assert str(config_dir) not in err
     assert "--discover --judgments" in err
     assert "--discover --nominate-only" in err
 
