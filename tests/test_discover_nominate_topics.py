@@ -2,10 +2,11 @@
 candidate topics.
 
 nominate_topics() is the contract between the nominate stage and the
-enrichment fan-out: short distilled names ordered by worthiness-blended seed
-velocity, casefold-collision-safe, never padded past what the evidence
-supports. The heuristic (no-provider) naming path is pinned here; the LLM
-stage-1 judge path lives in test_discover_judge.py.
+enrichment fan-out: short distilled names ordered by seed velocity,
+casefold-collision-safe, never padded past what the evidence supports.
+Naming and junk flags are ALWAYS the deterministic topic_shape heuristics -
+the engine-side LLM judge is gone; reasoning-model judgment happens in the
+host-judged protocol (see test_discover_handoff.py / test_discover_mode.py).
 """
 
 from unittest import mock
@@ -153,9 +154,9 @@ def test_names_are_short_distilled_topics_not_raw_titles():
 
 
 def test_no_provider_names_are_distilled_and_deterministic():
-    """provider=None (keyless/mock) is the pure-heuristic path: names come
-    from topic_shape.distill_topic_name, junk flags from is_junk_shape, and
-    two identical runs produce identical output - no LLM, no randomness."""
+    """Nomination is the pure-heuristic path, always: names come from
+    topic_shape.distill_topic_name, junk flags from is_junk_shape, and two
+    identical runs produce identical output - no LLM, no randomness."""
     items = [
         _item("story1", "hackernews", ANECDOTE_TITLE,
               engagement={"points": 400, "comments": 100}),
@@ -168,7 +169,7 @@ def test_no_provider_names_are_distilled_and_deterministic():
         return pipeline.nominate_topics(
             bundle, _query_plan("AI agents", ["hackernews"]),
             _plan("AI agents", ["hackernews"]),
-            to_date="2026-07-10", limit=10, provider=None, model=None,
+            to_date="2026-07-10", limit=10,
         )
 
     first, second = run(), run()
@@ -184,7 +185,8 @@ def test_no_provider_names_are_distilled_and_deterministic():
     assert story.name == topic_shape.distill_topic_name(ANECDOTE_TITLE)
     assert story.junk_shape is False
     assert by_leader["junk1"].junk_shape is True
-    # No provider -> no worthiness signal; ranking stays velocity-only.
+    # No engine judge -> no worthiness signal; ranking stays velocity-only
+    # (worthiness is host-supplied on the protocol resume leg only).
     assert all(nomination.worthiness is None for nomination in first)
 
 
@@ -201,6 +203,166 @@ def test_nomination_carries_leader_summary_and_items():
     top = nominations[0]
     assert top.items and top.items[0].item_id == "s1"
     assert top.summary
+
+
+# --- casefold collision handling (relocated from the retired judge suite) -----
+# Short distilled names collide far more often than raw titles: distinct
+# stories that share a lead entity must disambiguate (appending the later
+# cluster's strongest non-shared entity token), while true duplicates dedupe.
+
+
+def test_same_entity_clusters_disambiguate_instead_of_dropping():
+    """Two DISTINCT stories whose titles distill to the same heuristic name
+    both survive: the later cluster's name gains its strongest non-shared
+    entity token."""
+    items = [
+        _item("launch1", "hackernews",
+              "Gemma 4 quietly wrecked every leaderboard chart overnight worldwide",
+              engagement={"points": 300, "comments": 50}),
+        _item("price1", "hackernews",
+              "Gemma 4 pricing revolt stuns skeptical enterprise procurement teams",
+              engagement={"points": 200, "comments": 40}),
+    ]
+    nominations = pipeline.nominate_topics(
+        _bundle(items), _query_plan("AI agents", ["hackernews"]),
+        _plan("AI agents", ["hackernews"]),
+        to_date="2026-07-10", limit=10,
+    )
+
+    assert len(nominations) == 2
+    names = [n.name for n in nominations]
+    # Both long titles distill to the bare entity phrase "Gemma 4".
+    assert names[0] == "Gemma 4"
+    # Deterministic disambiguation: strongest non-shared entity token,
+    # alphabetical tie-break ("enterprise" over "pricing"/"revolt"/...).
+    assert names[1] == "Gemma 4 enterprise"
+    assert len({name.casefold() for name in names}) == 2
+    assert [n.items[0].item_id for n in nominations] == ["launch1", "price1"]
+
+
+def test_third_same_entity_cluster_survives_via_successive_tokens():
+    """Three DISTINCT stories distilling to the same name all survive: when
+    cluster 3's first-choice suffix ("enterprise") collides with cluster 2's
+    already-disambiguated name, the next distinguishing token is tried instead
+    of silently dropping the story."""
+    items = [
+        _item("launch1", "hackernews",
+              "Gemma 4 quietly wrecked every leaderboard chart overnight worldwide",
+              engagement={"points": 300, "comments": 50}),
+        _item("price1", "hackernews",
+              "Gemma 4 pricing revolt stuns skeptical enterprise procurement teams",
+              engagement={"points": 200, "comments": 40}),
+        _item("tier1", "hackernews",
+              "Gemma 4 enterprise tier surcharge negotiations remain unresolved today",
+              engagement={"points": 150, "comments": 30}),
+    ]
+    nominations = pipeline.nominate_topics(
+        _bundle(items), _query_plan("AI agents", ["hackernews"]),
+        _plan("AI agents", ["hackernews"]),
+        to_date="2026-07-10", limit=10,
+    )
+
+    assert len(nominations) == 3
+    names = [n.name for n in nominations]
+    # Cluster 3's strongest non-shared token vs cluster 1 is "enterprise"
+    # (alphabetical among count-1 ties), which is taken by cluster 2; the
+    # second token ("negotiations") rescues it with a unique name.
+    assert names == ["Gemma 4", "Gemma 4 enterprise", "Gemma 4 negotiations"]
+    assert len({name.casefold() for name in names}) == 3
+    assert [n.items[0].item_id for n in nominations] == ["launch1", "price1", "tier1"]
+
+
+def test_indistinguishable_distinct_representative_clusters_still_dedupe():
+    """Two colliding clusters with distinct representatives but NO
+    distinguishing entity token anywhere dedupe to one nomination instead of
+    crashing or emitting duplicate names."""
+    items = [
+        _item("bench1", "hackernews", "Gemma 4 benchmarks",
+              engagement={"points": 300, "comments": 50}),
+        _item("bench2", "reddit", "Gemma 4 benchmarks",
+              engagement={"score": 200, "num_comments": 40}),
+    ]
+
+    def fake_cluster(candidates, plan):
+        by_leader = {
+            item.item_id: candidate
+            for candidate in candidates
+            for item in candidate.source_items
+        }
+        primary, secondary = by_leader["bench1"], by_leader["bench2"]
+        return [
+            schema.Cluster(
+                cluster_id="cluster-1",
+                title=primary.title,
+                candidate_ids=[primary.candidate_id],
+                representative_ids=[primary.candidate_id],
+                sources=["hackernews"],
+                score=primary.final_score,
+            ),
+            schema.Cluster(
+                cluster_id="cluster-2",
+                title=secondary.title,
+                candidate_ids=[secondary.candidate_id],
+                representative_ids=[secondary.candidate_id],
+                sources=["reddit"],
+                score=secondary.final_score,
+            ),
+        ]
+
+    with mock.patch.object(pipeline, "cluster_candidates", side_effect=fake_cluster):
+        nominations = pipeline.nominate_topics(
+            _bundle(items),
+            _query_plan("AI agents", ["hackernews", "reddit"]),
+            _plan("AI agents", ["hackernews", "reddit"]),
+            to_date="2026-07-10", limit=10,
+        )
+
+    assert len(nominations) == 1
+    assert nominations[0].name == "Gemma 4 benchmarks"
+
+
+def test_clusters_sharing_a_representative_dedupe_to_one():
+    """A name collision between clusters that share a representative candidate
+    is the same story twice: the later cluster is dropped, not renamed."""
+    items = [
+        _item("bench1", "hackernews", "Gemma 4 benchmarks",
+              engagement={"points": 300, "comments": 50}),
+        _item("bench2", "reddit", "gemma 4 benchmarks",
+              engagement={"score": 200, "num_comments": 40}),
+    ]
+
+    def fake_cluster(candidates, plan):
+        primary = next(c for c in candidates if c.title == "Gemma 4 benchmarks")
+        secondary = next(c for c in candidates if c.title == "gemma 4 benchmarks")
+        return [
+            schema.Cluster(
+                cluster_id="cluster-1",
+                title=primary.title,
+                candidate_ids=[primary.candidate_id],
+                representative_ids=[primary.candidate_id],
+                sources=["hackernews"],
+                score=primary.final_score,
+            ),
+            schema.Cluster(
+                cluster_id="cluster-2",
+                title=secondary.title,
+                candidate_ids=[secondary.candidate_id, primary.candidate_id],
+                representative_ids=[primary.candidate_id],
+                sources=["hackernews", "reddit"],
+                score=secondary.final_score,
+            ),
+        ]
+
+    with mock.patch.object(pipeline, "cluster_candidates", side_effect=fake_cluster):
+        nominations = pipeline.nominate_topics(
+            _bundle(items),
+            _query_plan("AI agents", ["hackernews", "reddit"]),
+            _plan("AI agents", ["hackernews", "reddit"]),
+            to_date="2026-07-10", limit=10,
+        )
+
+    assert len(nominations) == 1
+    assert nominations[0].name == "Gemma 4 benchmarks"
 
 
 # --- U3 leg 1: nominate-only judge pool ---------------------------------------

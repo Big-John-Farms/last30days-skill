@@ -8,7 +8,7 @@ honest outcome is "nothing-solid" with the strongest weak signal named.
 
 from unittest import mock
 
-from lib import discovery_handoff, pipeline, rerank, schema
+from lib import discovery_handoff, pipeline, render, rerank, schema
 
 
 def _x_item(item_id: str, text: str, likes: int, *, date: str = "2026-07-09") -> dict:
@@ -192,7 +192,7 @@ def test_passes_discovery_floor_policy():
 
 # --- U3 junk-shape gate ------------------------------------------------------
 # Extends the frozen corpus above (existing cases stay byte-identical). A
-# junk-shaped nomination (help-me/beginner/musing, per the stage-1 judge or
+# junk-shaped nomination (help-me/beginner/musing, per the host judge or
 # topic_shape heuristics) loses the single-source engagement bypass, and its
 # corroboration is counted against SEED listing sources - never the enriched
 # corpus, which is multi-source for almost any topic that enriches cleanly.
@@ -320,17 +320,31 @@ def test_weak_signal_named_when_all_failures_junk():
     assert report.weak_signal is not None
 
 
-def test_keyless_live_run_emits_reasoning_fallback_note_once(capsys):
-    """A non-mock run with no reasoning provider configured must say so LOUDLY
-    (exactly once) instead of silently degrading to deterministic names."""
+def test_one_shot_live_run_emits_heuristics_note_once(capsys):
+    """Every non-mock one-shot run must say LOUDLY (exactly once) that names
+    are deterministic heuristics with no angles, pointing at the host-judged
+    SKILL.md protocol - never at provider API keys (the engine-side judge is
+    gone; no key would change this path)."""
     report = _run_discover_with(
         {"hackernews": [_hn_item("big1", "Sixty percent of consumers say AI in sports ads is a turnoff", 1084, 577)]},
     )
 
     assert report.outcome == "ok"
     err = capsys.readouterr().err
-    assert err.count("deterministic fallback") == 1
-    assert "no reasoning provider configured" in err
+    assert err.count("deterministic heuristics") == 1
+    assert "host-judged" in err
+    assert "SKILL.md" in err
+    for key_advice in ("API key", "GEMINI_API_KEY", "XAI_API_KEY",
+                       "OPENROUTER_API_KEY", "OpenAI auth"):
+        assert key_advice not in err
+    # The one-shot path generates no angles at all, so no angle lines render.
+    assert all(
+        topic.podcast_angle is None and topic.x_article_angle is None
+        for topic in report.topics
+    )
+    rendered = render.render_discovery(report)
+    assert "**Podcast angle:**" not in rendered
+    assert "**X article angle:**" not in rendered
 
 
 # --- Same-story fold + velocity rank order -----------------------------------
@@ -395,10 +409,9 @@ def _fake_report(topic: str, items: list[schema.SourceItem]) -> schema.Report:
     )
 
 
-def _run_discover_enriched(reports_by_key: dict[str, list[schema.SourceItem]]):
+def _run_discover_enriched(reports_by_key: dict[str, list[schema.SourceItem]]) -> schema.DiscoveryReport:
     """Two strong seed stories (Kestrel first / higher seed velocity), each
-    enriched via a fake pipeline.run keyed on the topic name. Returns the
-    report plus the angle entries the stage-2 pass was handed."""
+    enriched via a fake pipeline.run keyed on the topic name."""
     seed = {"hackernews": [
         _hn_item("k1", KESTREL_TITLE, 900, 400),
         _hn_item("s1", SOURDOUGH_TITLE, 700, 300),
@@ -410,25 +423,16 @@ def _run_discover_enriched(reports_by_key: dict[str, list[schema.SourceItem]]):
                 return _fake_report(topic, items)
         raise AssertionError(f"unexpected enrichment topic: {topic!r}")
 
-    captured_angle_entries: list[dict[str, str]] = []
-
-    def spy_angles(*, domain, entries, provider, model):
-        captured_angle_entries.extend(entries)
-        return None
-
-    with mock.patch.object(pipeline, "run", side_effect=fake_run), mock.patch.object(
-        pipeline.discovery_judge, "generate_discovery_angles", side_effect=spy_angles,
-    ):
-        report = _run_discover_with(seed, enrich=True)
-    return report, captured_angle_entries
+    with mock.patch.object(pipeline, "run", side_effect=fake_run):
+        return _run_discover_with(seed, enrich=True)
 
 
 def test_same_story_survivors_fold_to_higher_velocity_one(capsys):
     """Two distinct-named survivors quoting the IDENTICAL top comment (and
     sharing 2 evidence URLs) are one story: only the higher-velocity one
     ships, a fold line reaches stderr, ranks are contiguous from 1, and the
-    angle-entry list matches the surviving topics."""
-    report, angle_entries = _run_discover_enriched({
+    surviving topic ships without engine-written angles."""
+    report = _run_discover_enriched({
         "kestrel": [
             _evidence_item("ka", "reddit", KESTREL_TITLE,
                            "https://reddit.com/r/aero/comments/shared1",
@@ -454,14 +458,14 @@ def test_same_story_survivors_fold_to_higher_velocity_one(capsys):
     assert "kestrel" in survivor.name.lower()
     err = capsys.readouterr().err
     assert "folded duplicate story" in err
-    assert [entry["topic_id"] for entry in angle_entries] == ["topic-1"]
-    assert [entry["name"] for entry in angle_entries] == [survivor.name]
+    assert survivor.podcast_angle is None
+    assert survivor.x_article_angle is None
 
 
 def test_distinct_stories_do_not_fold():
     """No shared URLs, different comments: both genuinely distinct stories
     survive with contiguous ranks."""
-    report, angle_entries = _run_discover_enriched({
+    report = _run_discover_enriched({
         "kestrel": [
             _evidence_item("ka", "reddit", KESTREL_TITLE,
                            "https://reddit.com/r/aero/comments/k1",
@@ -482,13 +486,12 @@ def test_distinct_stories_do_not_fold():
 
     assert len(report.topics) == 2
     assert [topic.rank for topic in report.topics] == [1, 2]
-    assert [entry["topic_id"] for entry in angle_entries] == ["topic-1", "topic-2"]
 
 
 def test_rank_order_follows_displayed_velocity():
     """Seed order inverts enriched velocity: rank 1 must be the topic with the
     higher DISPLAYED velocity, and rank values equal list positions."""
-    report, _ = _run_discover_enriched({
+    report = _run_discover_enriched({
         # Kestrel is the stronger SEED story but enriches thin.
         "kestrel": [
             _evidence_item("ka", "reddit", KESTREL_TITLE,
@@ -520,7 +523,7 @@ def test_url_only_overlap_folds_without_shared_comment(capsys):
         "https://reddit.com/r/aero/comments/shared2",
         "https://news.example.com/shared3",
     ]
-    report, _ = _run_discover_enriched({
+    report = _run_discover_enriched({
         "kestrel": [
             _evidence_item("ka", "reddit", KESTREL_TITLE, shared_urls[0], score=900, comments=300),
             _evidence_item("kb", "reddit", KESTREL_TITLE, shared_urls[1], score=400, comments=100),
@@ -542,7 +545,7 @@ def test_url_only_overlap_folds_without_shared_comment(capsys):
 def test_single_shared_url_with_different_comments_does_not_fold():
     """Exactly 1 shared URL and different top comments is corroboration
     overlap, not the same story."""
-    report, _ = _run_discover_enriched({
+    report = _run_discover_enriched({
         "kestrel": [
             _evidence_item("ka", "reddit", KESTREL_TITLE,
                            "https://reddit.com/r/aero/comments/k1",

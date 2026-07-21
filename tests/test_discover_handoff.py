@@ -690,8 +690,9 @@ def test_angles_bundle_id_mismatch_against_pending_report(tmp_path):
 # --- Hygiene ---------------------------------------------------------------------
 
 
-def test_handoff_module_does_not_reference_discovery_judge():
-    """The legacy engine-judge module is scheduled for deletion; the handoff
-    module must port its sanitizers, never import or reference the module."""
+def test_handoff_module_does_not_reference_the_engine_judge():
+    """The legacy engine-judge module is deleted (U6); the handoff module
+    ports its sanitizers and must never reference the module by name."""
     source = inspect.getsource(handoff)
-    assert "discovery_judge" not in source
+    needle = "discovery" + "_judge"  # split so this pin never matches itself
+    assert needle not in source

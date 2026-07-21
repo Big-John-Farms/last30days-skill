@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import inspect
 import json
 import os
 import subprocess
@@ -2129,3 +2131,94 @@ def test_discovery_cli_full_mock_protocol_three_legs_end_to_end(tmp_path):
     assert second.returncode == 0, second.stderr
     assert first.stdout == second.stdout
     assert not (tmp_path / "research.db").exists()
+
+
+# --- U6: engine-side LLM judge removed - discovery is provider-free -----------
+# The stage-1 judge and stage-2 angle pass are deleted: no discovery code path
+# may resolve a provider runtime or construct a provider client, ever.
+
+
+def _provider_tripwires() -> list:
+    """Patches that make ANY provider touch explode: resolve_runtime plus
+    every client class on the providers module surface."""
+    def _forbid(label: str):
+        def _raise(*_args, **_kwargs):
+            raise AssertionError(f"{label} touched from a discovery code path")
+        return _raise
+
+    return [
+        mock.patch.object(pipeline.providers, name, new=_forbid(f"providers.{name}"))
+        for name in (
+            "resolve_runtime",
+            "GeminiClient",
+            "OpenAIClient",
+            "XAIClient",
+            "OpenRouterClient",
+        )
+    ]
+
+
+def test_mock_discovery_constructs_no_provider_client(tmp_path, capsys):
+    """--mock discovery must stay network-clean across the one-shot path AND
+    all three protocol legs: subprocess tests inherit ambient env keys, so a
+    single ungated resolve (or a directly constructed client) could let a
+    --mock run reach the network. It must not emit the loud one-shot
+    heuristics note either - the note is for real runs, not deliberate mock
+    runs."""
+    with contextlib.ExitStack() as stack:
+        for patcher in _provider_tripwires():
+            stack.enter_context(patcher)
+
+        # One-shot sweep.
+        report = pipeline.run_discover(
+            domain="AI agents", config={}, mock=True, as_of_date="2026-07-10",
+        )
+        assert report.topics
+
+        # Leg 1 (nominate-only) -> leg 2 (real mock enrichment sub-runs) ->
+        # leg 3 (finalize, no angles file).
+        bundle_payload = _leg1_bundle_payload(tmp_path)
+        judgments = {"bundle_id": bundle_payload["bundle_id"], "judgments": []}
+        assert _run_leg2(tmp_path, judgments) == 0
+        parser = cli.build_parser()
+        args, _extra = parser.parse_known_args([
+            "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+            "--finalize",
+        ])
+        assert cli._run_discover_protocol_leg(args, {}) == 0
+
+    assert "deterministic heuristics" not in capsys.readouterr().err
+
+
+def test_discovery_paths_are_provider_free_at_the_source_level():
+    """Source-inspection pin (like the enrich ThreadPoolExecutor pin): no
+    provider resolution is reachable from any discovery entry point, and the
+    deleted judge module is never referenced by the pipeline."""
+    for func in (
+        pipeline.run_discover,
+        pipeline.run_discover_nominate,
+        pipeline.run_discover_resume,
+        pipeline.nominate_topic_pool,
+        pipeline.nominate_topics,
+        pipeline.enrich_nominations,
+    ):
+        assert "resolve_runtime" not in inspect.getsource(func), func.__name__
+
+    needle = "discovery" + "_judge"  # split so this pin never matches itself
+    assert needle not in inspect.getsource(pipeline)
+
+
+def test_no_engine_judge_references_remain_anywhere():
+    """Repo-level pin: the engine judge module is deleted and nothing under
+    skills/ or tests/ references it by name."""
+    needle = "discovery" + "_judge"  # split so this pin never matches itself
+    assert not (
+        REPO_ROOT / "skills" / "last30days" / "scripts" / "lib" / f"{needle}.py"
+    ).exists()
+    offenders = [
+        str(path)
+        for root in ("skills", "tests")
+        for path in sorted((REPO_ROOT / root).rglob("*.py"))
+        if needle in path.read_text(encoding="utf-8", errors="ignore")
+    ]
+    assert offenders == []

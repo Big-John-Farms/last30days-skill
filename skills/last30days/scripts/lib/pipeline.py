@@ -26,7 +26,6 @@ from . import (
     dates,
     dedupe,
     digg,
-    discovery_judge,
     dripstack,
     entity_extract,
     env,
@@ -597,13 +596,14 @@ def nominate_candidates(
 class Nomination:
     """A named candidate topic produced by the nominate stage.
 
-    ``seed_score`` is the cheap pre-enrichment rank - velocity, blended with
-    the stage-1 judge's content-worthiness when one ran (see
-    ``rerank.judge_blended_score``). Enough to decide WHICH candidates deserve
-    a full pipeline pass, but not the final ranking signal (that comes from
-    enriched evidence downstream). ``junk_shape`` flags help-me/beginner/
-    musing shapes that should not become content topics; ``worthiness`` is the
-    judge's 0-100 content score, None on the heuristic path.
+    ``seed_score`` is the cheap pre-enrichment rank - seed velocity on the
+    nominate stage, blended with the HOST judge's content-worthiness on the
+    protocol resume leg (see ``rerank.judge_blended_score``). Enough to
+    decide WHICH candidates deserve a full pipeline pass, but not the final
+    ranking signal (that comes from enriched evidence downstream).
+    ``junk_shape`` flags help-me/beginner/musing shapes that should not
+    become content topics; ``worthiness`` is the host judge's 0-100 content
+    score, None on the heuristic path.
     """
 
     name: str
@@ -708,8 +708,6 @@ def nominate_topic_pool(
     *,
     to_date: str,
     limit: int,
-    provider: providers.ReasoningClient | None = None,
-    model: str | None = None,
 ) -> list[tuple[Nomination, str]]:
     """Stage 1b of discovery: cluster nominated items into named candidate
     topics, rank them, and pair each with its source cluster id.
@@ -718,21 +716,18 @@ def nominate_topic_pool(
     which drops the cluster ids) and the leg-1 nominate-only sweep (which
     keys nominations-bundle rows on them, see ``run_discover_nominate``).
 
-    Naming and content judgment run as a stage-1 judge pass BEFORE the limit
-    cut: the top ``rerank.JUDGE_POOL_LIMIT`` clusters by velocity share one
-    batched LLM call returning a short searchable name, a junk-shape flag, and
-    a 0-100 content-worthiness per cluster; worthiness blends into the ranking
-    score (``rerank.judge_blended_score``, velocity-dominant) so a quiet but
-    content-worthy cluster can outrank a viral junk one. Without a provider
-    (keyless/mock), or when the judge call fails, names fall back to the
-    deterministic ``topic_shape`` heuristics and ranking is velocity-only;
-    clusters beyond the judge pool always take the heuristic path.
+    Naming and junk classification are the deterministic ``topic_shape``
+    heuristics and ranking is velocity-only - the engine runs no LLM here.
+    Reasoning-model judgment lives in the host-judged protocol: the host
+    renames, junk-filters, and worthiness-scores this pool from the leg-1
+    bundle, and ``run_discover_resume`` applies those verdicts. The one-shot
+    path ships the heuristic names as-is.
 
     Casefold name collisions are disambiguated (the later cluster's strongest
     non-shared entity token is appended, trying successive tokens when the
     first-choice suffix is itself already taken) rather than blindly dropped:
-    short judged names collide far more often than raw 96-char titles, and a
-    silent drop hides a distinct story. A colliding cluster is dropped only
+    short distilled names collide far more often than raw 96-char titles, and
+    a silent drop hides a distinct story. A colliding cluster is dropped only
     when it shares a representative candidate with the earlier one (the same
     story surfacing twice) or when no distinguishing entity token yields an
     unused name.
@@ -763,51 +758,21 @@ def nominate_topic_pool(
         ranked_clusters.append((score, cluster, cluster_items))
     ranked_clusters.sort(key=lambda entry: (-entry[0], entry[1].title.lower()))
 
-    # Leader text per cluster: what the judge sees and what the heuristics
-    # distill from.
-    leader_text: dict[str, tuple[str, str]] = {}
-    for _, cluster, _ in ranked_clusters:
-        leader = candidate_map.get(cluster.representative_ids[0]) if cluster.representative_ids else None
-        leader_text[cluster.cluster_id] = (
-            (leader.title if leader else cluster.title) or "",
-            (leader.snippet if leader else "") or "",
-        )
-
-    judge_pool = ranked_clusters[:rerank.JUDGE_POOL_LIMIT]
-    verdicts = discovery_judge.judge_discovery_topics(
-        domain=plan.domain,
-        entries=[
-            {
-                "topic_id": cluster.cluster_id,
-                "title": leader_text[cluster.cluster_id][0],
-                "snippet": leader_text[cluster.cluster_id][1],
-            }
-            for _, cluster, _ in judge_pool
-        ],
-        provider=provider,
-        model=model,
-    ) or {}
-
-    judged: list[tuple[float, schema.Cluster, list[schema.SourceItem], str, bool, float | None]] = []
+    # Heuristic naming from each cluster's leader text (title + snippet).
+    named: list[tuple[float, schema.Cluster, list[schema.SourceItem], str, bool]] = []
     for score, cluster, cluster_items in ranked_clusters:
-        title, snip = leader_text[cluster.cluster_id]
-        verdict = verdicts.get(cluster.cluster_id)
-        if verdict is not None:
-            name: str = verdict.short_name
-            junk_shape = verdict.junk_shape
-            worthiness = verdict.worthiness
-        else:
-            name = topic_shape.distill_topic_name(title, snip) or plan.domain or title
-            junk_shape = topic_shape.is_junk_shape(title, snip)
-            worthiness = None
-        blended = rerank.judge_blended_score(score, worthiness)
-        judged.append((blended, cluster, cluster_items, name, junk_shape, worthiness))
-    judged.sort(key=lambda entry: (-entry[0], entry[3].lower()))
+        leader = candidate_map.get(cluster.representative_ids[0]) if cluster.representative_ids else None
+        title = (leader.title if leader else cluster.title) or ""
+        snip = (leader.snippet if leader else "") or ""
+        name = topic_shape.distill_topic_name(title, snip) or plan.domain or title
+        junk_shape = topic_shape.is_junk_shape(title, snip)
+        named.append((score, cluster, cluster_items, name, junk_shape))
+    named.sort(key=lambda entry: (-entry[0], entry[3].lower()))
 
     pool: list[tuple[Nomination, str]] = []
     taken_names: dict[str, schema.Cluster] = {}
     entity_counts_cache: dict[str, Counter] = {}
-    for blended, cluster, cluster_items, name, junk_shape, worthiness in judged:
+    for score, cluster, cluster_items, name, junk_shape in named:
         name_key = name.casefold()
         if name_key in taken_names:
             earlier_cluster = taken_names[name_key]
@@ -826,11 +791,10 @@ def nominate_topic_pool(
         summary = (leader.snippet if leader else "") or (leader.title if leader else name)
         pool.append((Nomination(
             name=name,
-            seed_score=blended,
+            seed_score=score,
             items=cluster_items,
             summary=summary,
             junk_shape=junk_shape,
-            worthiness=worthiness,
         ), cluster.cluster_id))
         if len(pool) >= limit:
             break
@@ -844,16 +808,13 @@ def nominate_topics(
     *,
     to_date: str,
     limit: int,
-    provider: providers.ReasoningClient | None = None,
-    model: str | None = None,
 ) -> list[Nomination]:
     """``nominate_topic_pool`` without the cluster ids: the one-shot
     discovery path's contract (see that function for the full semantics)."""
     return [
         nomination
         for nomination, _cluster_id in nominate_topic_pool(
-            bundle, query_plan, plan,
-            to_date=to_date, limit=limit, provider=provider, model=model,
+            bundle, query_plan, plan, to_date=to_date, limit=limit,
         )
     ]
 
@@ -1181,11 +1142,11 @@ def run_discover_nominate(
     """Protocol leg 1: sweep the listings and build the FULL judge pool.
 
     Same sweep and clustering as ``run_discover``, but the pool is cut at
-    ``rerank.JUDGE_POOL_LIMIT`` (not the enrichment limit) and stays on the
-    deterministic heuristic path: no provider is ever resolved, so names and
-    junk flags are the ``topic_shape`` fallbacks the host judges against.
-    No stage-1 judge, no enrichment, no confidence floor, no queue writes -
-    those belong to legs 2 and 3.
+    ``rerank.JUDGE_POOL_LIMIT`` (not the enrichment limit). Like every
+    discovery path it is deterministic-heuristic: no provider is ever
+    resolved, so names and junk flags are the ``topic_shape`` baselines the
+    host judges against. No enrichment, no confidence floor, no queue
+    writes - those belong to legs 2 and 3.
     """
     sweep = _discovery_sweep(
         domain=domain,
@@ -1201,8 +1162,6 @@ def run_discover_nominate(
         sweep.bundle, sweep.query_plan, sweep.plan,
         to_date=sweep.to_date,
         limit=rerank.JUDGE_POOL_LIMIT,
-        provider=None,
-        model=None,
     )
     return DiscoverNominateResult(
         plan=sweep.plan,
@@ -1448,32 +1407,25 @@ def run_discover(
     from_date, to_date = sweep.from_date, sweep.to_date
     source_status = sweep.source_status
 
-    # Stage-1 judge runtime, resolved ONCE here (mirrors run()'s provider
-    # resolution). In mock runs the judge is skipped outright and
-    # providers.resolve_runtime is NEVER called: subprocess tests inherit the
-    # caller's env, so an ungated resolve could pick up ambient keys and let a
-    # --mock run reach the network.
-    judge_provider: providers.ReasoningClient | None = None
-    judge_model: str | None = None
+    # The engine never names or angles topics with an LLM: the one-shot path
+    # is deterministic-heuristic by design, and reasoning-model judgment
+    # lives in the host-judged SKILL.md protocol. Say so loudly once per live
+    # run; --mock stays silent (a deliberate mock run is not a degraded run).
     if not mock:
-        judge_runtime, judge_provider = providers.resolve_runtime(config, depth)
-        judge_model = judge_runtime.rerank_model if judge_provider else None
-        if judge_provider is None:
-            log.source_log(
-                "Discover",
-                "topic names and angles are using the deterministic fallback - "
-                "no reasoning provider configured (set GEMINI_API_KEY, "
-                "XAI_API_KEY, OPENROUTER_API_KEY, or OpenAI auth)",
-                tty_only=False,
-            )
+        log.source_log(
+            "Discover",
+            "one-shot run: topic names use deterministic heuristics and no "
+            "content angles are generated - a reasoning-model host running "
+            "the SKILL.md discovery protocol gets host-judged names, junk "
+            "filtering, and podcast/X angles",
+            tty_only=False,
+        )
 
     topic_limit = max(5, min(10, limit))
     nominations = nominate_topics(
         sweep.bundle, sweep.query_plan, plan,
         to_date=to_date,
         limit=ENRICH_LIMIT if enrich else topic_limit,
-        provider=judge_provider,
-        model=judge_model,
     )
 
     if enrich and nominations:
@@ -1494,40 +1446,10 @@ def run_discover(
         enriched_entries, to_date=to_date, topic_limit=topic_limit,
     )
     folded = _fold_same_story_records(survivors)
+    # One-shot topics ship without angles (podcast_angle / x_article_angle
+    # stay None and the renderer omits those lines): content angles are a
+    # host-judged protocol deliverable, written on the finalize leg.
     topics = _records_to_discovery_topics(folded)
-    angle_entries = [
-        {
-            "topic_id": f"topic-{position}",
-            "name": record["name"],
-            "titles": record["titles"],
-            "top_comment": record["top_comment"] or "",
-            "engagement": record["engagement_phrase"],
-        }
-        for position, record in enumerate(folded, start=1)
-    ]
-
-    # Stage-2 angle pass: ONE batched call over the floor survivors turns
-    # each surfaced topic into a podcast hook and an X-article hook, reusing
-    # the runtime resolved above. Keyless/mock runs (judge_provider None)
-    # never reach the LLM; a failed or partial response leaves the affected
-    # topics' angles None - the run never crashes on this pass.
-    angle_map = discovery_judge.generate_discovery_angles(
-        domain=plan.domain,
-        entries=angle_entries,
-        provider=judge_provider,
-        model=judge_model,
-    ) or {}
-    if angle_map:
-        topics = [
-            replace(
-                topic,
-                podcast_angle=angles.podcast_angle,
-                x_article_angle=angles.x_article_angle,
-            )
-            if (angles := angle_map.get(f"topic-{topic.rank}")) is not None
-            else topic
-            for topic in topics
-        ]
 
     if weak_signal is None:
         weak_signal = junk_weak_signal
