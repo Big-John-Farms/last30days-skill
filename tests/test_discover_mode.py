@@ -427,10 +427,17 @@ def test_discovery_cli_json_contract_and_mutual_exclusion():
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
-    assert payload["schema_version"] == "1.0"
+    assert payload["schema_version"] == "1.1"
     assert payload["kind"] == "discovery"
     assert 5 <= len(payload["results"]) <= 10
     assert payload["results"][0]["command"].startswith('/last30days "')
+    # 1.1 fields ship in every result, with defaults when nothing set them.
+    for topic in payload["results"]:
+        assert topic["podcast_angle"] is None
+        assert topic["x_article_angle"] is None
+        assert topic["previously_surfaced_count"] == 0
+        assert topic["last_surfaced"] is None
+        assert topic["covered"] is False
 
     invalid = subprocess.run(
         [
@@ -466,6 +473,78 @@ def test_discovery_cli_json_contract_and_mutual_exclusion():
     )
     assert drill_conflict.returncode == 2
     assert "mutually exclusive" in drill_conflict.stderr
+
+
+def _discovery_report(topic: schema.DiscoveryTopic) -> schema.DiscoveryReport:
+    return schema.DiscoveryReport(
+        domain="AI agents",
+        range_from="2026-06-10",
+        range_to="2026-07-10",
+        generated_at="2026-07-10T00:00:00+00:00",
+        plan=schema.DiscoveryPlan(
+            domain="AI agents",
+            category="ai_agent_framework",
+            subreddits=["AI_Agents"],
+            sources=["reddit", "hackernews"],
+        ),
+        topics=[topic],
+    )
+
+
+def test_discovery_export_round_trips_angles_and_queue_annotations():
+    """The 1.1 fields must carry real values through to_discovery_export."""
+    payload = schema.to_discovery_export(_discovery_report(schema.DiscoveryTopic(
+        rank=1,
+        name="Agent memory protocols",
+        why_spiking="Two independent listing items accelerated this week.",
+        momentum="new-this-week",
+        velocity_score=123.45,
+        sources=["hackernews", "reddit"],
+        engagement_by_source={"reddit": {"score": 120, "num_comments": 30}},
+        command='/last30days "Agent memory protocols"',
+        podcast_angle="Why agent memory is the next context-window fight",
+        x_article_angle="Agent memory protocols, explained through this week's launches",
+        previously_surfaced_count=2,
+        last_surfaced="2026-07-03",
+        covered=True,
+    )))
+
+    assert payload["schema_version"] == "1.1"
+    result = payload["results"][0]
+    assert result["podcast_angle"] == "Why agent memory is the next context-window fight"
+    assert result["x_article_angle"] == (
+        "Agent memory protocols, explained through this week's launches"
+    )
+    assert result["previously_surfaced_count"] == 2
+    assert result["last_surfaced"] == "2026-07-03"
+    assert result["covered"] is True
+
+
+def test_discovery_topic_constructs_with_only_pre_existing_fields():
+    """Pre-1.1 constructor calls must keep working; new fields default."""
+    topic = schema.DiscoveryTopic(
+        rank=1,
+        name="Agent memory protocols",
+        why_spiking="Two independent listing items accelerated this week.",
+        momentum="building",
+        velocity_score=10.0,
+        sources=["reddit"],
+        engagement_by_source={"reddit": {"score": 120}},
+        command='/last30days "Agent memory protocols"',
+    )
+
+    assert topic.podcast_angle is None
+    assert topic.x_article_angle is None
+    assert topic.previously_surfaced_count == 0
+    assert topic.last_surfaced is None
+    assert topic.covered is False
+
+    result = schema.to_discovery_export(_discovery_report(topic))["results"][0]
+    assert result["podcast_angle"] is None
+    assert result["x_article_angle"] is None
+    assert result["previously_surfaced_count"] == 0
+    assert result["last_surfaced"] is None
+    assert result["covered"] is False
 
 
 def test_discovery_cli_bare_discover_is_global_trending():

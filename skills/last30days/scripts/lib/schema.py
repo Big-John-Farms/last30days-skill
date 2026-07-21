@@ -284,6 +284,11 @@ class DiscoveryTopic:
     topic's enriched corpus (with attribution), present only on enriched runs.
     ``corroboration_count`` is the number of distinct sources confirming the
     topic - the floor's cross-source signal, surfaced for readers.
+
+    ``podcast_angle`` and ``x_article_angle`` are engine-generated content
+    hooks; ``None`` when no reasoning provider produced them.
+    ``previously_surfaced_count``, ``last_surfaced``, and ``covered`` are
+    topic-queue annotations; they keep their defaults when the queue is off.
     """
 
     rank: int
@@ -297,6 +302,11 @@ class DiscoveryTopic:
     evidence_urls: list[str] = field(default_factory=list)
     top_comment: str | None = None
     corroboration_count: int = 0
+    podcast_angle: str | None = None
+    x_article_angle: str | None = None
+    previously_surfaced_count: int = 0
+    last_surfaced: str | None = None
+    covered: bool = False
 
 
 @dataclass
@@ -673,7 +683,7 @@ def without_sources(report: Report, excluded_sources: set[str]) -> Report:
     return clean
 
 
-DISCOVERY_EXPORT_SCHEMA_VERSION = "1.0"
+DISCOVERY_EXPORT_SCHEMA_VERSION = "1.1"
 
 
 def _agent_summary(candidate: Candidate) -> str:
@@ -860,6 +870,11 @@ def to_discovery_export(report: DiscoveryReport) -> dict[str, Any]:
                 "evidence_urls": list(topic.evidence_urls),
                 "top_comment": topic.top_comment,
                 "corroboration_count": topic.corroboration_count,
+                "podcast_angle": topic.podcast_angle,
+                "x_article_angle": topic.x_article_angle,
+                "previously_surfaced_count": topic.previously_surfaced_count,
+                "last_surfaced": topic.last_surfaced,
+                "covered": topic.covered,
             }
             for topic in report.topics
         ],
