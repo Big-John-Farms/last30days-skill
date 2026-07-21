@@ -48,7 +48,7 @@ The topic-less research mode: instead of researching a named topic, it finds wha
 
 ### Nomination
 
-A named candidate topic produced by Discovery's listing sweep: clustered items from the river feeds, given a concise name and a cheap seed-velocity rank. A Nomination is only a candidate - its seed rank decides which topics deserve an Enrichment pass and the display order of survivors; the Confidence floor judgment and the displayed velocity score are computed from the enriched evidence, never the seed score.
+A named candidate topic produced by Discovery's listing sweep: clustered items from the river feeds, given a short searchable name (by an LLM judge when a reasoning provider is available, by deterministic distillation otherwise) plus a Junk shape flag and a content-worthiness score that blends into its seed rank. A Nomination is only a candidate - its blended seed rank decides which topics deserve an Enrichment pass and the display order of survivors; the Confidence floor judgment and the displayed velocity score are computed from the enriched evidence, never the seed score. The Nomination's name doubles as its Enrichment pass search query and its research handoff, so naming happens before enrichment, never at render time.
 
 ### Enrichment pass
 
@@ -56,11 +56,25 @@ A full research-pipeline run executed on one Nomination's topic name during Disc
 
 ### Confidence floor
 
-The absolute evidence bar every Discovery topic must clear before it may rank: an engagement junk-gate first, then either independent cross-source corroboration or a genuinely strong single-source spike. The floor is absolute, not relative to the current pool - a relative bar would degrade with the pool, which is the failure it exists to prevent. Its thresholds are deliberately tunable; the behavior contract is only that sub-floor evidence never ranks.
+The absolute evidence bar every Discovery topic must clear before it may rank: an engagement junk-gate first, then either independent cross-source corroboration or a genuinely strong single-source spike. Topics with a Junk shape get a stricter read: the single-source spike bypass is off, and their corroboration is counted against the seed listing sources the sweep actually found - never the enriched corpus, because an Enrichment pass makes almost any topic look multi-source. The floor is absolute, not relative to the current pool - a relative bar would degrade with the pool, which is the failure it exists to prevent. Its thresholds are deliberately tunable; the behavior contract is only that sub-floor evidence never ranks.
 
 ### Nothing-solid
 
-The honest empty outcome of a Discovery run in which zero topics cleared the Confidence floor. A first-class result, not an error: the run reports that nothing in the window was strong enough to call a trend, and names the closest sub-floor candidate (the weak signal) so the user knows where the signal petered out. Rendering junk instead of Nothing-solid is the named failure this outcome replaced.
+The honest empty outcome of a Discovery run in which zero topics cleared the Confidence floor. A first-class result, not an error: the run reports that nothing in the window was strong enough to call a trend, and names the closest sub-floor candidate (the weak signal, preferring a non-junk-shaped one) so the user knows where the signal petered out. Rendering junk instead of Nothing-solid is the named failure this outcome replaced.
+
+### Junk shape
+
+A classification applied to a Nomination whose leading item reads as a help-me question, beginner ask, or personal musing rather than a story - the post shapes that engagement alone cannot distinguish from news. Junk shape does not exclude a topic outright; it removes the Confidence floor's single-source bypass so the topic surfaces only with independent seed-source corroboration.
+
+### Topic queue
+
+The persistent memory of what Discovery has surfaced: each surfaced topic is recorded per research store, so later runs can annotate repeats ("surfaced Nth time") and the user can mark stories Covered. On by default for every real Discovery run, with an engine toggle to disable; mock runs never write it.
+
+Identity in the queue is annotate-only: a new topic name that closely matches an earlier row (exact normalized match, else entity overlap) annotates the rendered card but never merges or rewrites rows - a false match costs one noisy line, never a hidden story. Queue annotations always describe the state before the current run, and a failed queue write degrades to a warning; it must never destroy a finished run's output.
+
+### Covered
+
+The user-set status on a Topic queue row meaning "I already produced content for this story." Set by marking a topic covered by its exact name; surfaced is the only other status. A resurfacing never un-covers a row, and a new name that fuzzily matches a Covered row is born Covered - so the mark survives the LLM judge renaming the same story across runs instead of silently re-pitching it.
 
 ## Flagged ambiguities
 

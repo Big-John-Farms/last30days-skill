@@ -1,6 +1,7 @@
 ---
 title: "Ranked-output features need an explicit confidence floor with an honest empty state"
 date: 2026-07-12
+last_updated: 2026-07-20
 category: design-patterns
 module: discover-trending
 problem_type: design_pattern
@@ -9,6 +10,7 @@ severity: medium
 applies_when:
   - "Any feature that ranks and displays top-N results from variable-quality inputs (search, trending, recommendations, discovery)"
   - "Quiet or over-broad query domains where feeds return thin or noisy data"
+  - "A gate measures corroboration or independence downstream of a stage of the same pipeline that amplifies that signal (enrichment, fan-out, retrieval expansion)"
 symptoms:
   - "Top-N ranker emits near-zero-engagement items (e.g., five 1-like tweets) as a trend list because top-N has no notion of 'none of this is good enough'"
 resolution_type: code_fix
@@ -21,8 +23,13 @@ tags:
   - trending
   - signal-quality
   - corroboration
+  - "seed-sources"
+  - "junk-shape"
+  - "source-independence"
 related_components:
   - "skills/last30days/scripts/lib/rerank.py"
+  - "skills/last30days/scripts/lib/pipeline.py"
+  - "tests/test_discover_floor.py"
 ---
 
 # Ranked-output features need an explicit confidence floor with an honest empty state
@@ -52,6 +59,8 @@ def passes_discovery_floor(
     source_count: int,
     engagement_total: float,
     item_count: int,
+    junk_shape: bool = False,
+    seed_source_count: int | None = None,
 ) -> bool:
     """Whether a discovery topic's evidence is strong enough to show a user.
 
@@ -60,12 +69,15 @@ def passes_discovery_floor(
     """
     if item_count <= 0 or engagement_total < FLOOR_MIN_ENGAGEMENT:
         return False
+    if junk_shape:
+        corroboration = seed_source_count if seed_source_count is not None else source_count
+        return corroboration >= FLOOR_MIN_SOURCES
     if source_count >= FLOOR_MIN_SOURCES:
         return True
     return engagement_total >= FLOOR_SINGLE_SOURCE_ENGAGEMENT
 ```
 
-The first check is the junk gate: `FLOOR_MIN_ENGAGEMENT = 25.0` means a 1-like tweet can never rank, no matter how empty the field is. The floor is judged per topic inside `run_discover()` (`skills/last30days/scripts/lib/pipeline.py`), before the topic is appended and before `topic_limit` is consulted - sub-floor evidence never enters the ranked list at all.
+(The `junk_shape` / `seed_source_count` branch landed in PR #852 - see section 2b.) The first check is the junk gate: `FLOOR_MIN_ENGAGEMENT = 25.0` means a 1-like tweet can never rank, no matter how empty the field is. The floor is judged per topic inside `run_discover()` (`skills/last30days/scripts/lib/pipeline.py`), before the topic is appended and before `topic_limit` is consulted - sub-floor evidence never enters the ranked list at all.
 
 ### 2. Make the clearing criteria composite: corroboration OR a genuinely strong spike
 
@@ -76,6 +88,31 @@ A single threshold is either too strict (kills real single-source stories) or to
 
 The regression tests in `tests/test_discover_floor.py` pin both edges of this policy directly (`test_passes_discovery_floor_policy`): `floor(source_count=2, engagement_total=30, item_count=2)` clears, `floor(source_count=1, engagement_total=100, item_count=3)` does not, `floor(source_count=1, engagement_total=1600, item_count=1)` does.
 
+### 2b. Count corroboration on the layer your own pipeline does not amplify
+
+PR #852 added a stricter path for junk-shaped topics (help-me posts, beginner asks, musings - flagged by the stage-1 judge or the `topic_shape` heuristics): they lose the single-source engagement bypass entirely (a 226-comment "help me choose" thread is a busy support thread, not a story) and must clear `FLOOR_MIN_SOURCES` via corroboration alone.
+
+The subtle half of that change is WHICH source count the corroboration check reads. The original design counted sources in the topic's enriched corpus - and the adversarial code review proved that check would never bind: the enrichment stage deliberately fans every nominated topic out to Reddit, X, YouTube, and the web, so a single-subreddit junk thread enriches into 4-6 "sources" of mentions of itself. A gate reading the post-fan-out count is checking that enrichment works, not that the topic is corroborated. The shipped gate counts distinct sources among the nomination's own seed listing items - what the river sweep actually found - which enrichment cannot inflate (`skills/last30days/scripts/lib/pipeline.py`, floor call site):
+
+```python
+junk_shape=nomination.junk_shape,
+# Junk corroboration counts distinct SEED listing sources, never
+# the enriched corpus - a successful enrichment pass is
+# multi-source for almost any topic, so it would never bind.
+seed_source_count=len({item.source for item in nomination.items}),
+```
+
+The two archetypes, side by side:
+
+| Topic | Seed listing sources | Enriched corpus sources | Enriched-count gate (never binds) | Seed-count gate (shipped) |
+|---|---|---|---|---|
+| Single-subreddit help-me thread (junk shape) | 1 | 4-6 | passes | fails |
+| Real story swept from Reddit AND Hacker News | 2 | 4-6 | passes | passes |
+
+Generalized rule: when a gate requires corroboration or independence, measure it on the signal layer your own system does not amplify - corroboration is evidence only when the corroborating signals could have failed to appear. This applies to any "N independent confirmations" threshold downstream of your own search fan-out, enrichment, crawling, or retrieval expansion. It does NOT apply when the downstream layer is genuinely independent evidence your pipeline cannot manufacture (human review verdicts, third-party confirmations) - there, the enriched layer is exactly what to count.
+
+Testing note: a unit test that feeds the gate's parameters directly cannot catch a never-binds design. At least one test must drive the full production path with the amplifier running and assert the gate still fires - `test_junk_corroboration_counts_seed_sources_not_enriched_corpus` in `tests/test_discover_floor.py` mocks enrichment to return a rich multi-source corpus and asserts the single-seed-source junk topic still fails, with the unit-level matrix in `test_passes_discovery_floor_junk_params` pinning that a high enriched `source_count` cannot rescue `seed_source_count=1`.
+
 ### 3. Make honest emptiness a first-class outcome, and name the nearest miss
 
 When zero topics survive the floor, the pipeline does not error, does not pad, and does not lower the bar. `run_discover()` sets `outcome = "ok" if topics else "nothing-solid"` on the `DiscoveryReport`, and while filtering it remembers the highest-scoring sub-floor candidate as `weak_signal` so the empty result can still say what came closest:
@@ -85,11 +122,22 @@ if not rerank.passes_discovery_floor(
     source_count=len(sources),
     engagement_total=native_total,
     item_count=len(evidence_items),
+    junk_shape=nomination.junk_shape,
+    # Junk corroboration counts distinct SEED listing sources, never
+    # the enriched corpus - a successful enrichment pass is
+    # multi-source for almost any topic, so it would never bind.
+    seed_source_count=len({item.source for item in nomination.items}),
 ):
     # Sub-floor evidence never ranks; remember what came closest so a
     # nothing-solid brief can still name the strongest weak signal.
-    if weak_signal is None or score > weak_signal[0]:
-        weak_signal = (score, entry.nomination.name)
+    # Junk-shaped failures are tracked separately: the brief prefers
+    # the strongest NON-junk failure and names a junk one only when
+    # every failure is junk-shaped (never empty when failures exist).
+    if nomination.junk_shape:
+        if junk_weak_signal is None or score > junk_weak_signal[0]:
+            junk_weak_signal = (score, nomination.name)
+    elif weak_signal is None or score > weak_signal[0]:
+        weak_signal = (score, nomination.name)
     continue
 ```
 
@@ -163,12 +211,15 @@ The strong-corpus side, from `tests/test_discover_floor.py`: a single 1,084-poin
 ```python
 if item_count <= 0 or engagement_total < FLOOR_MIN_ENGAGEMENT:
     return False
+if junk_shape:
+    corroboration = seed_source_count if seed_source_count is not None else source_count
+    return corroboration >= FLOOR_MIN_SOURCES
 if source_count >= FLOOR_MIN_SOURCES:
     return True
 return engagement_total >= FLOOR_SINGLE_SOURCE_ENGAGEMENT
 ```
 
-Three lines of gate, placed before the ranker, are the difference between a feature that fills five slots no matter what and one whose non-empty answers can be believed.
+A handful of lines of gate, placed before the ranker, are the difference between a feature that fills five slots no matter what and one whose non-empty answers can be believed.
 
 ## Related
 
@@ -177,3 +228,4 @@ Three lines of gate, placed before the ranker, are the difference between a feat
 - [Non-daemon executor threads defeat wall-clock budgets](../logic-errors/non-daemon-executor-threads-defeat-wall-clock-budget.md) - sibling learning from the same PR #816 rebuild: the process-lifetime half (enrichment budget enforcement) vs this doc's ranking-quality half.
 - [argparse optional-value flag dispatch](../conventions/argparse-optional-value-flag-dispatch-truthiness.md) - third lesson from the same PR #816: the CLI flag semantics that route into this feature.
 - [PR #816](https://github.com/mvanhorn/last30days-skill/pull/816) - the discovery rebuild that introduced `passes_discovery_floor()` and the nothing-solid empty state (released v3.14.0).
+- [PR #852](https://github.com/mvanhorn/last30days-skill/pull/852) - the discovery content pipeline that added the junk-shape branch and seed-source corroboration (section 2b).
