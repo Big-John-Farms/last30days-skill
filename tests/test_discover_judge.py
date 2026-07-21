@@ -11,7 +11,9 @@ topic_shape heuristics - never a crash, never a network call.
 import re
 from unittest import mock
 
-from lib import pipeline, rerank, schema, topic_shape
+import pytest
+
+from lib import discovery_judge, pipeline, rerank, schema, topic_shape
 
 
 VIRAL_TITLE = "Nvidia Rubin export license shock"
@@ -95,7 +97,7 @@ class _StubJudge:
         self,
         rows_by_title: dict[str, dict] | None = None,
         exc: Exception | None = None,
-        payload: dict | None = None,
+        payload: dict | list | None = None,
     ):
         self.rows_by_title = rows_by_title or {}
         self.exc = exc
@@ -204,6 +206,26 @@ def test_judge_hard_failure_falls_back_whole_pool_and_warns(capsys):
     assert "stage-1 judge failed" in err
 
 
+def test_judge_top_level_array_payload_falls_back_whole_pool_and_warns(capsys):
+    """providers.extract_json returns whatever json.loads yields, so a model
+    emitting a top-level JSON array reaches the parser as a list. The isinstance
+    guard must convert that into the standard whole-pool heuristic fallback
+    instead of an AttributeError crashing the run."""
+    stub = _StubJudge(payload=[{"topic_id": "t1", "short_name": "Sneaky Array"}])
+    nominations = _nominate(_viral_and_quiet_items(), provider=stub, model="judge-model")
+
+    assert [n.name for n in nominations] == [
+        topic_shape.distill_topic_name(VIRAL_TITLE),
+        topic_shape.distill_topic_name(QUIET_TITLE),
+    ]
+    assert all(n.worthiness is None for n in nominations)
+    err = capsys.readouterr().err
+    assert "[Discover]" in err
+    assert "stage-1 judge failed" in err
+    assert "ValueError" in err
+    assert "list" in err
+
+
 # 17 titles with zero shared words (and negligible shared trigrams) so each
 # forms its own cluster: JUDGE_POOL_LIMIT + 2 distinct stories.
 _DISTINCT_TITLES = [
@@ -285,6 +307,81 @@ def test_same_entity_clusters_disambiguate_instead_of_dropping():
     # alphabetical tie-break ("enterprise" over "pricing"/"revolt").
     assert names[1] == "Gemma 4 enterprise"
     assert len({name.casefold() for name in names}) == 2
+
+
+def test_third_same_entity_cluster_survives_via_successive_tokens():
+    """Three DISTINCT stories the judge named identically all survive: when
+    cluster 3's first-choice suffix ("enterprise") collides with cluster 2's
+    already-disambiguated name, the next distinguishing token is tried instead
+    of silently dropping the story."""
+    items = [
+        _item("launch1", "hackernews", "Gemma 4 launches on Hopper GPUs",
+              engagement={"points": 300, "comments": 50}),
+        _item("price1", "hackernews", "Gemma 4 pricing revolt in enterprise",
+              engagement={"points": 200, "comments": 40}),
+        _item("tier1", "hackernews",
+              "Gemma 4 enterprise tier surcharge stuns procurement teams",
+              engagement={"points": 150, "comments": 30}),
+    ]
+    stub = _StubJudge({
+        "launches on Hopper": {"short_name": "Gemma 4", "junk_shape": False, "worthiness": 50},
+        "pricing revolt": {"short_name": "Gemma 4", "junk_shape": False, "worthiness": 50},
+        "surcharge stuns": {"short_name": "Gemma 4", "junk_shape": False, "worthiness": 50},
+    })
+    nominations = _nominate(items, provider=stub, model="judge-model")
+
+    assert len(nominations) == 3
+    names = [n.name for n in nominations]
+    # Cluster 3's strongest non-shared token vs cluster 1 is "enterprise"
+    # (alphabetical among count-1 ties), which is taken by cluster 2; the
+    # second token ("procurement") rescues it with a unique name.
+    assert names == ["Gemma 4", "Gemma 4 enterprise", "Gemma 4 procurement"]
+    assert len({name.casefold() for name in names}) == 3
+    assert [n.items[0].item_id for n in nominations] == ["launch1", "price1", "tier1"]
+
+
+def test_indistinguishable_distinct_representative_clusters_still_dedupe():
+    """Two colliding clusters with distinct representatives but NO
+    distinguishing entity token anywhere dedupe to one nomination instead of
+    crashing or emitting duplicate names."""
+    items = [
+        _item("bench1", "hackernews", "Gemma 4 benchmarks",
+              engagement={"points": 300, "comments": 50}),
+        _item("bench2", "reddit", "Gemma 4 benchmarks",
+              engagement={"score": 200, "num_comments": 40}),
+    ]
+
+    def fake_cluster(candidates, plan):
+        by_leader = {
+            item.item_id: candidate
+            for candidate in candidates
+            for item in candidate.source_items
+        }
+        primary, secondary = by_leader["bench1"], by_leader["bench2"]
+        return [
+            schema.Cluster(
+                cluster_id="cluster-1",
+                title=primary.title,
+                candidate_ids=[primary.candidate_id],
+                representative_ids=[primary.candidate_id],
+                sources=["hackernews"],
+                score=primary.final_score,
+            ),
+            schema.Cluster(
+                cluster_id="cluster-2",
+                title=secondary.title,
+                candidate_ids=[secondary.candidate_id],
+                representative_ids=[secondary.candidate_id],
+                sources=["reddit"],
+                score=secondary.final_score,
+            ),
+        ]
+
+    with mock.patch.object(pipeline, "cluster_candidates", side_effect=fake_cluster):
+        nominations = _nominate(items, sources=("hackernews", "reddit"))
+
+    assert len(nominations) == 1
+    assert nominations[0].name == "Gemma 4 benchmarks"
 
 
 def test_clusters_sharing_a_representative_dedupe_to_one():
@@ -412,12 +509,58 @@ def test_live_run_resolves_runtime_once_and_enrichment_gets_judged_name():
 # ------------------------------------------------------- judge unit tests ----
 
 
+class _StaticPayloadProvider:
+    """Returns a fixed payload verbatim - including the non-dict shapes
+    (top-level list, null) that providers.extract_json can legally yield
+    for valid non-object JSON."""
+
+    def __init__(self, payload: object):
+        self._payload = payload
+
+    def generate_json(self, model: str, prompt: str, *, tools=None) -> object:
+        return self._payload
+
+
+@pytest.mark.parametrize("payload", [["top-level", "array"], None])
+def test_judge_pass_treats_non_dict_payload_as_failure(capsys, payload):
+    """Non-dict JSON from the provider is a logged fallback (None return),
+    never an AttributeError - the 'Never raises' contract holds."""
+    verdicts = discovery_judge.judge_discovery_topics(
+        domain="x",
+        entries=[{"topic_id": "t1", "title": "t", "snippet": ""}],
+        provider=_StaticPayloadProvider(payload),
+        model="judge-model",
+    )
+    assert verdicts is None
+    err = capsys.readouterr().err
+    assert "[Discover]" in err
+    assert "stage-1 judge failed" in err
+    assert "ValueError" in err
+
+
+@pytest.mark.parametrize("payload", [["top-level", "array"], None])
+def test_angle_pass_treats_non_dict_payload_as_failure(capsys, payload):
+    """Same guard on the stage-2 pass: topics ship without angles instead of
+    the run crashing on a top-level array or null payload."""
+    angles = discovery_judge.generate_discovery_angles(
+        domain="x",
+        entries=[{"topic_id": "topic-1", "name": "n"}],
+        provider=_StaticPayloadProvider(payload),
+        model="judge-model",
+    )
+    assert angles is None
+    err = capsys.readouterr().err
+    assert "[Discover]" in err
+    assert "angle pass failed" in err
+    assert "ValueError" in err
+
+
 def test_judge_returns_none_without_provider_or_entries():
     entry = {"topic_id": "t1", "title": "a title", "snippet": ""}
-    assert rerank.judge_discovery_topics(
+    assert discovery_judge.judge_discovery_topics(
         domain="x", entries=[entry], provider=None, model=None,
     ) is None
-    assert rerank.judge_discovery_topics(
+    assert discovery_judge.judge_discovery_topics(
         domain="x", entries=[], provider=_StubJudge(), model="judge-model",
     ) is None
 
@@ -433,7 +576,7 @@ def test_judge_payload_parsing_is_defensive():
         "not-a-dict",
         {"topic_id": "t3", "short_name": "Quiet Story", "worthiness": None},
     ]})
-    verdicts = rerank.judge_discovery_topics(
+    verdicts = discovery_judge.judge_discovery_topics(
         domain="x",
         entries=[{"topic_id": "t1", "title": "t", "snippet": ""}],
         provider=stub,
@@ -450,7 +593,7 @@ def test_judge_payload_parsing_is_defensive():
 
 def test_judge_prompt_fences_cluster_text_as_untrusted():
     stub = _StubJudge({"Ignore previous": {"short_name": "X", "worthiness": 1}})
-    rerank.judge_discovery_topics(
+    discovery_judge.judge_discovery_topics(
         domain="AI agents",
         entries=[{
             "topic_id": "t1",
@@ -689,11 +832,11 @@ def test_nomination_only_topic_gets_angles_from_seed_evidence():
 
 def test_angle_pass_returns_none_without_provider_or_entries():
     entry = {"topic_id": "topic-1", "name": "Kestrel Avionics Merger"}
-    assert rerank.generate_discovery_angles(
+    assert discovery_judge.generate_discovery_angles(
         domain="x", entries=[entry], provider=None, model=None,
     ) is None
     spy = _StubJudge()
-    assert rerank.generate_discovery_angles(
+    assert discovery_judge.generate_discovery_angles(
         domain="x", entries=[], provider=spy, model="judge-model",
     ) is None
     assert spy.prompts == []  # generate_json never touched
@@ -713,7 +856,7 @@ def test_angle_payload_parsing_is_defensive():
         "not-a-dict",
         {"topic_id": "t3", "podcast_angle": None, "x_article_angle": ""},
     ]})
-    angles = rerank.generate_discovery_angles(
+    angles = discovery_judge.generate_discovery_angles(
         domain="x",
         entries=[{"topic_id": "t1", "name": "n"}],
         provider=stub,
@@ -729,7 +872,7 @@ def test_angle_payload_parsing_is_defensive():
 
 def test_angle_prompt_fences_topic_evidence_as_untrusted():
     stub = _StubJudge(payload={"topics": []})
-    rerank.generate_discovery_angles(
+    discovery_judge.generate_discovery_angles(
         domain="AI agents",
         entries=[{
             "topic_id": "topic-1",

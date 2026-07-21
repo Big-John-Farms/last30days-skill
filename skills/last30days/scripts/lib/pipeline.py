@@ -26,6 +26,7 @@ from . import (
     dates,
     dedupe,
     digg,
+    discovery_judge,
     dripstack,
     entity_extract,
     env,
@@ -627,22 +628,37 @@ def _cluster_entity_counts(
     return counts
 
 
+# Bound on how many distinguishing entity tokens a colliding cluster may try
+# before it is treated as indistinguishable from the earlier story. Keeps a
+# pathological cluster (dozens of unique tokens, every resulting name already
+# taken) from scanning its whole vocabulary.
+_DISAMBIGUATION_TOKEN_LIMIT = 5
+
+
 def _disambiguated_topic_name(
     name: str,
     cluster: schema.Cluster,
     earlier_cluster: schema.Cluster,
     candidate_map: dict[str, schema.Candidate],
     entity_counts_cache: dict[str, Counter],
+    taken_names: dict[str, schema.Cluster],
 ) -> str | None:
     """Disambiguate a colliding topic name by appending the later cluster's
     strongest entity token that the earlier cluster does not share.
+
+    Distinguishing tokens are tried in descending strength order (bounded at
+    ``_DISAMBIGUATION_TOKEN_LIMIT``) and the first resulting name not already
+    present in ``taken_names`` (casefolded keys) wins: a first-choice suffix
+    colliding with an already-taken name must not drop a distinct story while
+    another distinguishing token remains.
 
     ``entity_counts_cache`` (keyed by cluster id, owned by the caller) memoizes
     per-cluster entity counts so repeated collisions against the same cluster
     never recompute them.
 
-    Returns None when no distinguishing entity exists - the clusters cannot be
-    told apart by content, so the caller treats them as the same story.
+    Returns None when no distinguishing entity yields an unused name - the
+    clusters cannot be told apart by content, so the caller treats them as the
+    same story.
     """
     def cached_counts(target: schema.Cluster) -> Counter:
         counts = entity_counts_cache.get(target.cluster_id)
@@ -658,28 +674,30 @@ def _disambiguated_topic_name(
         (count, token) for token, count in later_counts.items()
         if token not in earlier_entities and token.casefold() not in name_tokens
     ]
-    if not choices:
-        return None
-    # Strongest = most frequent across the cluster; alphabetical tie-break
-    # keeps the result deterministic.
-    _, token = sorted(choices, key=lambda entry: (-entry[0], entry[1]))[0]
-    display = token
-    for candidate_id in cluster.candidate_ids:
-        candidate = candidate_map.get(candidate_id)
-        if candidate is None:
-            continue
-        match = next(
-            (
-                word.strip("\"'`()[]{}.,:;!?")
-                for word in f"{candidate.title} {candidate.snippet}".split()
-                if word.strip("\"'`()[]{}.,:;!?").lower() == token
-            ),
-            None,
-        )
-        if match:
-            display = match
-            break
-    return f"{name} {display}"
+    # Strongest first = most frequent across the cluster; alphabetical
+    # tie-break keeps the result deterministic.
+    ranked = sorted(choices, key=lambda entry: (-entry[0], entry[1]))
+    for _, token in ranked[:_DISAMBIGUATION_TOKEN_LIMIT]:
+        display = token
+        for candidate_id in cluster.candidate_ids:
+            candidate = candidate_map.get(candidate_id)
+            if candidate is None:
+                continue
+            match = next(
+                (
+                    word.strip("\"'`()[]{}.,:;!?")
+                    for word in f"{candidate.title} {candidate.snippet}".split()
+                    if word.strip("\"'`()[]{}.,:;!?").lower() == token
+                ),
+                None,
+            )
+            if match:
+                display = match
+                break
+        resolved = f"{name} {display}"
+        if resolved.casefold() not in taken_names:
+            return resolved
+    return None
 
 
 def nominate_topics(
@@ -706,11 +724,13 @@ def nominate_topics(
     clusters beyond the judge pool always take the heuristic path.
 
     Casefold name collisions are disambiguated (the later cluster's strongest
-    non-shared entity token is appended) rather than blindly dropped: short
-    judged names collide far more often than raw 96-char titles, and a silent
-    drop hides a distinct story. A colliding cluster is dropped only when it
-    shares a representative candidate with the earlier one (the same story
-    surfacing twice) or when no distinguishing entity exists.
+    non-shared entity token is appended, trying successive tokens when the
+    first-choice suffix is itself already taken) rather than blindly dropped:
+    short judged names collide far more often than raw 96-char titles, and a
+    silent drop hides a distinct story. A colliding cluster is dropped only
+    when it shares a representative candidate with the earlier one (the same
+    story surfacing twice) or when no distinguishing entity token yields an
+    unused name.
 
     Returns at most ``limit`` nominations, never padded - fewer clusters than
     ``limit`` means a shorter list, and the confidence floor downstream
@@ -748,7 +768,7 @@ def nominate_topics(
         )
 
     judge_pool = ranked_clusters[:rerank.JUDGE_POOL_LIMIT]
-    verdicts = rerank.judge_discovery_topics(
+    verdicts = discovery_judge.judge_discovery_topics(
         domain=plan.domain,
         entries=[
             {
@@ -789,8 +809,9 @@ def nominate_topics(
                 continue  # same story surfacing twice
             resolved = _disambiguated_topic_name(
                 name, cluster, earlier_cluster, candidate_map, entity_counts_cache,
+                taken_names,
             )
-            if resolved is None or resolved.casefold() in taken_names:
+            if resolved is None:
                 continue  # indistinguishable by content: treat as the same story
             name = resolved
             name_key = name.casefold()
@@ -1194,7 +1215,7 @@ def run_discover(
     # the runtime resolved above. Keyless/mock runs (judge_provider None)
     # never reach the LLM; a failed or partial response leaves the affected
     # topics' angles None - the run never crashes on this pass.
-    angle_map = rerank.generate_discovery_angles(
+    angle_map = discovery_judge.generate_discovery_angles(
         domain=plan.domain,
         entries=angle_entries,
         provider=judge_provider,
