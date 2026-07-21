@@ -8,8 +8,9 @@ reads host judgments (names/junk/worthiness) bound to the bundle by
 bundle_id. Leg 3 (``--discover --finalize [--angles <file>]``) applies
 host-written content angles.
 
-This module owns the three contracts - bundle writer/reader, judgments
-reader, angles reader - plus the host-facing digest and the post-judgment
+This module owns the handoff contracts - bundle writer/reader, judgments
+reader, pending-report reader (the leg-2 output leg 3 finalizes from),
+angles reader - plus the host-facing digest and the post-judgment
 name-collision resolver. Readers are strict at the top level (typed
 ``HandoffContractError``, mapped to exit 2 by the CLI layer) and lenient per
 row: a malformed or omitted row falls back to the bundle's heuristics rather
@@ -41,6 +42,14 @@ PENDING_REPORT_FILENAME = "discover-pending.json"
 _VALID_TIERS = ("deep", "shallow")
 
 _RESWEEP_REMEDY = "Run a fresh `--discover --nominate-only` re-sweep."
+
+# Leg-3 remedy: the pending report is leg-2 output, so the first fix is to
+# re-run the resume leg; only when the bundle itself has also gone stale does
+# the whole protocol restart.
+_RESUME_REMEDY = (
+    "Re-run the resume leg (`--discover --judgments <file>`), or the full "
+    "protocol from `--discover --nominate-only` if the bundle is stale too."
+)
 
 # Defensive caps on host-supplied text, ported from the retired engine-judge
 # pass: names become search queries and the /last30days handoff, angles
@@ -140,6 +149,23 @@ class HostAngles:
 
     podcast: str | None
     x_article: str | None
+
+
+@dataclass(frozen=True)
+class PendingReport:
+    """A parsed leg-2 pending report: the floored/folded/ranked discovery
+    report (as its raw ``schema.to_dict`` payload - leg 3 rebuilds it via
+    ``schema.discovery_report_from_dict``) plus the angle inputs keyed by
+    surviving nomination id. ``run_ref`` is the leg-2 run identity the
+    finalize leg replays into the topic queue so retries stay idempotent."""
+
+    schema_version: str
+    bundle_id: str
+    generated_at: str
+    run_ref: str
+    report: dict[str, Any]
+    angle_inputs: dict[str, dict[str, str]]
+    path: Path | None = None
 
 
 def _utc_now() -> str:
@@ -434,6 +460,119 @@ def _parse_bundle_file(path: Path) -> NominationsBundle:
     )
 
 
+def _pending_search_paths(
+    save_dir: str | Path | None,
+    config_dir: Path | None,
+) -> list[Path]:
+    """Candidate pending-report locations in lookup order: save-dir, then
+    config dir (the same order the bundle reader uses)."""
+    paths: list[Path] = []
+    if save_dir:
+        paths.append(pending_report_path(Path(save_dir).expanduser().resolve()))
+    if config_dir is not None:
+        candidate = pending_report_path(Path(config_dir))
+        if candidate not in paths:
+            paths.append(candidate)
+    return paths
+
+
+def read_pending_report(
+    *,
+    save_dir: str | Path | None = None,
+    config_dir: Path | None = None,
+) -> PendingReport:
+    """Locate and parse the leg-2 pending report for the finalize leg.
+
+    Same strictness family as the bundle reader: missing file (every searched
+    location named), unreadable, invalid JSON, wrong kind or schema version,
+    missing bundle_id, or stale TTL all raise HandoffContractError (mapped to
+    exit 2 by the CLI layer). Staleness is measured from the PENDING report's
+    own generated_at - the leg-2 write started a fresh authoring window - and
+    the remedy is the resume leg, not a full re-sweep.
+    """
+    searched = _pending_search_paths(save_dir, config_dir)
+    path = next((candidate for candidate in searched if candidate.exists()), None)
+    if path is None:
+        raise HandoffContractError(
+            "No pending discovery report found. Searched:\n"
+            f"{_searched_lines(searched)}\n{_RESUME_REMEDY}"
+        )
+    return _parse_pending_file(path)
+
+
+def _parse_pending_file(path: Path) -> PendingReport:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HandoffContractError(
+            f"Could not read pending discovery report {path}: {exc}"
+        ) from exc
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HandoffContractError(
+            f"Pending discovery report {path} is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HandoffContractError(
+            f"Pending discovery report {path} must be a top-level JSON "
+            f"object, got {type(payload).__name__}."
+        )
+    version = payload.get("schema_version")
+    if version != schema.DISCOVERY_PENDING_SCHEMA_VERSION:
+        raise HandoffContractError(
+            f"Pending discovery report {path} has schema version {version!r}; "
+            f"this build reads {schema.DISCOVERY_PENDING_SCHEMA_VERSION!r}. "
+            f"{_RESUME_REMEDY}"
+        )
+    kind = payload.get("kind")
+    if kind != schema.DISCOVERY_PENDING_KIND:
+        raise HandoffContractError(
+            f"Pending discovery report {path} has kind {kind!r}; expected "
+            f"{schema.DISCOVERY_PENDING_KIND!r}. {_RESUME_REMEDY}"
+        )
+    bundle_id = str(payload.get("bundle_id") or "")
+    if not bundle_id:
+        raise HandoffContractError(
+            f"Pending discovery report {path} is missing its bundle_id; "
+            f"angles cannot bind to it. {_RESUME_REMEDY}"
+        )
+    generated_at = payload.get("generated_at")
+    if not env.is_timestamp_fresh(generated_at, DISCOVERY_HANDOFF_TTL_SECONDS):
+        raise HandoffContractError(
+            f"Pending discovery report {path} is stale (generated_at="
+            f"{generated_at!r}, TTL {int(DISCOVERY_HANDOFF_TTL_SECONDS)}s): "
+            f"the judged window it captured has moved on. {_RESUME_REMEDY}"
+        )
+    report = payload.get("report")
+    if not isinstance(report, dict):
+        raise HandoffContractError(
+            f"Pending discovery report {path} must carry a top-level "
+            f"\"report\" object. {_RESUME_REMEDY}"
+        )
+    # Lenient per row (engine-written, but one corrupt row must not discard
+    # the rest): keep only well-shaped angle-input entries.
+    angle_inputs_raw = payload.get("angle_inputs")
+    angle_inputs = {
+        str(nomination_id): {
+            str(key): str(value) for key, value in info.items()
+        }
+        for nomination_id, info in (
+            angle_inputs_raw.items() if isinstance(angle_inputs_raw, dict) else ()
+        )
+        if isinstance(info, dict)
+    }
+    return PendingReport(
+        schema_version=str(version),
+        bundle_id=bundle_id,
+        generated_at=str(generated_at or ""),
+        run_ref=str(payload.get("run_ref") or ""),
+        report=report,
+        angle_inputs=angle_inputs,
+        path=path,
+    )
+
+
 def _load_host_file(path: str | Path, label: str) -> dict[str, Any]:
     """Load a host-authored handoff file with strict top-level checks."""
     file_path = Path(path).expanduser()
@@ -459,13 +598,14 @@ def _load_host_file(path: str | Path, label: str) -> dict[str, Any]:
 
 def _require_bundle_binding(
     payload: dict[str, Any],
-    bundle: NominationsBundle,
+    bundle: NominationsBundle | PendingReport,
     *,
     label: str,
     save_dir: str | Path | None,
     config_dir: Path | None,
 ) -> None:
-    """Enforce bundle-id binding between a host file and the current bundle."""
+    """Enforce bundle-id binding between a host file and the current bundle
+    (or, on the finalize leg, the pending report that inherited its id)."""
     file_bundle_id = str(payload.get("bundle_id") or "")
     if file_bundle_id == bundle.bundle_id:
         return
@@ -579,17 +719,20 @@ def judgment_for(
 
 def read_angles(
     path: str | Path | None,
-    bundle: NominationsBundle,
+    bundle: NominationsBundle | PendingReport,
     *,
     save_dir: str | Path | None = None,
     config_dir: Path | None = None,
 ) -> dict[str, HostAngles]:
     """Read the host angles file for leg 3, keyed by nomination id.
 
-    A missing angles file is legal: ``path=None`` returns an empty mapping
-    and every topic ships without angles. When a path is given the same
-    strict-top-level / lenient-per-row rules as judgments apply; angle
-    sentences are word-boundary capped at 200 chars.
+    ``bundle`` is the binding target: the finalize leg passes the pending
+    report (the bundle_id echo validates against it, and the known ids are
+    its surviving ``angle_inputs`` ids), while a NominationsBundle binds
+    against the full pool. A missing angles file is legal: ``path=None``
+    returns an empty mapping and every topic ships without angles. When a
+    path is given the same strict-top-level / lenient-per-row rules as
+    judgments apply; angle sentences are word-boundary capped at 200 chars.
     """
     if path is None:
         return {}
@@ -602,7 +745,11 @@ def read_angles(
         raise HandoffContractError(
             f"Angles file {path} must carry a top-level \"angles\" list."
         )
-    known = {entry.nomination_id for entry in bundle.nominations}
+    known = (
+        set(bundle.angle_inputs)
+        if isinstance(bundle, PendingReport)
+        else {entry.nomination_id for entry in bundle.nominations}
+    )
     angles: dict[str, HostAngles] = {}
     for row in rows:
         if not isinstance(row, dict):

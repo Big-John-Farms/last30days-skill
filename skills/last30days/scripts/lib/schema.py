@@ -846,6 +846,77 @@ def to_agent_export(
 DISCOVERY_NOMINATIONS_SCHEMA_VERSION = "1.0"
 DISCOVERY_NOMINATIONS_KIND = "discovery-nominations"
 
+# Pending-report contract (leg 2 -> leg 3 of the host-judged protocol). Leg 2
+# persists the floored/folded/ranked report plus the per-topic angle inputs;
+# leg 3 rebuilds the report from it and never re-runs anything. Bump the
+# version on any incompatible change; the handoff reader rejects others.
+DISCOVERY_PENDING_SCHEMA_VERSION = "1.0"
+DISCOVERY_PENDING_KIND = "discovery-pending"
+
+
+def discovery_topic_from_dict(payload: dict[str, Any]) -> DiscoveryTopic:
+    """Parse one serialized DiscoveryTopic back (to_dict drops None fields,
+    so every optional field restores through its dataclass default)."""
+    return DiscoveryTopic(
+        rank=int(payload["rank"]),
+        name=payload["name"],
+        why_spiking=payload.get("why_spiking") or "",
+        momentum=payload.get("momentum") or "building",
+        velocity_score=float(_first_non_none(payload.get("velocity_score"), 0.0)),
+        sources=list(payload.get("sources") or []),
+        engagement_by_source={
+            str(source): dict(metrics)
+            for source, metrics in (payload.get("engagement_by_source") or {}).items()
+            if isinstance(metrics, dict)
+        },
+        command=payload.get("command") or "",
+        evidence_urls=list(payload.get("evidence_urls") or []),
+        top_comment=payload.get("top_comment"),
+        corroboration_count=int(payload.get("corroboration_count") or 0),
+        podcast_angle=payload.get("podcast_angle"),
+        x_article_angle=payload.get("x_article_angle"),
+        previously_surfaced_count=int(payload.get("previously_surfaced_count") or 0),
+        last_surfaced=payload.get("last_surfaced"),
+        covered=bool(payload.get("covered")),
+    )
+
+
+def discovery_report_from_dict(payload: dict[str, Any]) -> DiscoveryReport:
+    """Rebuild a DiscoveryReport from its ``to_dict`` form (the pending-report
+    round trip the finalize leg performs; mirrors ``report_from_dict``)."""
+    plan = payload.get("plan") or {}
+    return DiscoveryReport(
+        domain=payload.get("domain") or "",
+        range_from=payload["range_from"],
+        range_to=payload["range_to"],
+        generated_at=payload["generated_at"],
+        plan=DiscoveryPlan(
+            domain=plan.get("domain") or "",
+            category=plan.get("category"),
+            subreddits=list(plan.get("subreddits") or []),
+            sources=list(plan.get("sources") or []),
+        ),
+        topics=[
+            discovery_topic_from_dict(topic)
+            for topic in payload.get("topics") or []
+        ],
+        source_status={
+            source: SourceOutcome(
+                source=outcome.get("source") or source,
+                state=outcome["state"],
+                items_returned=int(outcome.get("items_returned") or 0),
+                attempted=bool(outcome.get("attempted", True)),
+                detail=outcome.get("detail"),
+                at=outcome.get("at") or _utc_now(),
+                fix_hint=outcome.get("fix_hint"),
+            )
+            for source, outcome in (payload.get("source_status") or {}).items()
+        },
+        warnings=list(payload.get("warnings") or []),
+        outcome=payload.get("outcome") or "ok",
+        weak_signal=payload.get("weak_signal"),
+    )
+
 
 def nomination_to_dict(nomination: Any) -> dict[str, Any]:
     """Serialize a nominate-stage Nomination to a plain dict.

@@ -865,6 +865,13 @@ def record_discovery_surfacing(
     mark survives judge naming drift instead of forking into a fresh
     uncovered row. An existing row's status/covered_at are never modified
     by this function - the ON CONFLICT path deliberately ignores it.
+
+    Idempotency guard: when the existing row's last_run_ref already equals
+    this call's (non-blank) run_ref, the surfacing was ALREADY counted by
+    this run identity - a retry (e.g. a --finalize re-run with a corrected
+    angles file) returns the row unchanged instead of double-counting.
+    Blank run_refs never guard, so callers without a run identity keep the
+    every-call-increments behavior.
     """
     init_db()
     domain = domain or ""
@@ -873,6 +880,13 @@ def record_discovery_surfacing(
     status = "covered" if inherit_covered_at else "surfaced"
     conn = _connect()
     try:
+        if run_ref:
+            existing = conn.execute(
+                "SELECT * FROM discovery_topics WHERE normalized_name = ?",
+                (normalized,),
+            ).fetchone()
+            if existing is not None and existing["last_run_ref"] == run_ref:
+                return dict(existing)
         conn.execute(
             """INSERT INTO discovery_topics
                (name, normalized_name, entity_key, domain, first_surfaced,

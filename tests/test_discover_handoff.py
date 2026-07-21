@@ -528,6 +528,165 @@ def test_digest_names_bundle_path_instruction_and_capped_evidence(tmp_path):
     assert not any(line.lstrip().startswith("|") for line in lines)
 
 
+# --- U5: pending-report reader (leg 3) ----------------------------------------
+
+
+def _pending_payload(**overrides) -> dict:
+    payload = {
+        "kind": schema.DISCOVERY_PENDING_KIND,
+        "schema_version": schema.DISCOVERY_PENDING_SCHEMA_VERSION,
+        "bundle_id": "cafe1234cafe1234",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "run_ref": "discover:AI agents:2026-07-21T00:00:00+00:00",
+        "report": {"domain": "AI agents", "topics": []},
+        "angle_inputs": {
+            "n1": {
+                "name": "Agent SDK Wars",
+                "titles": "t1; t2",
+                "top_comment": "",
+                "engagement": "1,500 native interactions across hackernews",
+            },
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _write_pending(state_dir, **overrides) -> dict:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    payload = _pending_payload(**overrides)
+    (state_dir / handoff.PENDING_REPORT_FILENAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    return payload
+
+
+def test_pending_report_round_trip(tmp_path):
+    payload = _write_pending(tmp_path)
+    pending = handoff.read_pending_report(save_dir=None, config_dir=tmp_path)
+    assert pending.bundle_id == payload["bundle_id"]
+    assert pending.schema_version == schema.DISCOVERY_PENDING_SCHEMA_VERSION
+    assert pending.generated_at == payload["generated_at"]
+    assert pending.run_ref == payload["run_ref"]
+    assert pending.report == payload["report"]
+    assert pending.angle_inputs == payload["angle_inputs"]
+    assert pending.path == tmp_path / handoff.PENDING_REPORT_FILENAME
+
+
+def test_pending_report_save_dir_takes_precedence(tmp_path):
+    save_dir = tmp_path / "saves"
+    config_dir = tmp_path / "config"
+    _write_pending(save_dir, bundle_id="fromsavedir00001")
+    _write_pending(config_dir, bundle_id="fromconfigdir001")
+    pending = handoff.read_pending_report(save_dir=save_dir, config_dir=config_dir)
+    assert pending.bundle_id == "fromsavedir00001"
+
+
+def test_pending_report_not_found_names_both_locations_and_remedy(tmp_path):
+    save_dir = tmp_path / "saves"
+    config_dir = tmp_path / "config"
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_pending_report(save_dir=save_dir, config_dir=config_dir)
+    message = excinfo.value.message
+    assert str(save_dir / handoff.PENDING_REPORT_FILENAME) in message
+    assert str(config_dir / handoff.PENDING_REPORT_FILENAME) in message
+    # Remedy: re-run the resume leg, or the full protocol when the bundle is
+    # stale too.
+    assert "--discover --judgments" in message
+    assert "--discover --nominate-only" in message
+
+
+def test_pending_report_invalid_json(tmp_path):
+    (tmp_path / handoff.PENDING_REPORT_FILENAME).write_text(
+        "{not json", encoding="utf-8"
+    )
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_pending_report(config_dir=tmp_path)
+    assert "JSON" in excinfo.value.message
+
+
+def test_pending_report_top_level_non_dict(tmp_path):
+    (tmp_path / handoff.PENDING_REPORT_FILENAME).write_text("[]", encoding="utf-8")
+    with pytest.raises(handoff.HandoffContractError):
+        handoff.read_pending_report(config_dir=tmp_path)
+
+
+def test_pending_report_wrong_kind(tmp_path):
+    _write_pending(tmp_path, kind="discovery-nominations")
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_pending_report(config_dir=tmp_path)
+    assert "discovery-nominations" in excinfo.value.message
+
+
+def test_pending_report_wrong_schema_version(tmp_path):
+    _write_pending(tmp_path, schema_version="99.0")
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_pending_report(config_dir=tmp_path)
+    assert "99.0" in excinfo.value.message
+
+
+def test_pending_report_missing_bundle_id(tmp_path):
+    _write_pending(tmp_path, bundle_id="")
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_pending_report(config_dir=tmp_path)
+    assert "bundle_id" in excinfo.value.message
+
+
+def test_pending_report_stale_ttl_measured_from_resume_write(tmp_path):
+    """The leg-2 write started a FRESH TTL window: staleness is measured from
+    the pending report's own generated_at, never the leg-1 sweep's."""
+    stale = datetime.now(timezone.utc) - timedelta(
+        seconds=handoff.DISCOVERY_HANDOFF_TTL_SECONDS + 60
+    )
+    _write_pending(tmp_path, generated_at=stale.isoformat())
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_pending_report(config_dir=tmp_path)
+    message = excinfo.value.message
+    assert "stale" in message
+    assert "--discover --judgments" in message
+
+
+def test_pending_report_non_dict_report_rejected(tmp_path):
+    _write_pending(tmp_path, report=["not", "a", "dict"])
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_pending_report(config_dir=tmp_path)
+    assert "report" in excinfo.value.message
+
+
+def test_angles_bind_against_pending_report(tmp_path):
+    """Leg 3 reads angles against the PENDING report: the bundle_id echo
+    validates against it, and known ids are the surviving angle_inputs ids."""
+    _write_pending(tmp_path)
+    pending = handoff.read_pending_report(config_dir=tmp_path)
+    path = tmp_path / "angles.json"
+    path.write_text(json.dumps({
+        "bundle_id": pending.bundle_id,
+        "angles": [
+            {"id": "n1", "podcast": "Why the SDK churn taxes small teams"},
+            {"id": "n2", "podcast": "Ghost angle for a floored nomination"},
+        ],
+    }), encoding="utf-8")
+    angles = handoff.read_angles(path, pending)
+    assert angles["n1"].podcast == "Why the SDK churn taxes small teams"
+    # n2 did not survive the floor (absent from angle_inputs): ignored.
+    assert "n2" not in angles
+
+
+def test_angles_bundle_id_mismatch_against_pending_report(tmp_path):
+    _write_pending(tmp_path)
+    pending = handoff.read_pending_report(config_dir=tmp_path)
+    path = tmp_path / "angles.json"
+    path.write_text(json.dumps({
+        "bundle_id": "deadbeefdeadbeef",
+        "angles": [{"id": "n1", "podcast": "Bound to the wrong bundle"}],
+    }), encoding="utf-8")
+    with pytest.raises(handoff.HandoffContractError) as excinfo:
+        handoff.read_angles(path, pending, save_dir=None, config_dir=tmp_path)
+    message = excinfo.value.message
+    assert "deadbeefdeadbeef" in message
+    assert pending.bundle_id in message
+
+
 # --- Hygiene ---------------------------------------------------------------------
 
 

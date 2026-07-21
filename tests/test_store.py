@@ -1101,6 +1101,71 @@ def test_covered_status_survives_judge_rename_across_runs(temp_db):
     assert exact["covered_at"] == "2026-07-14"
 
 
+def test_record_discovery_surfacing_same_run_ref_is_idempotent(temp_db):
+    """AE6: a retry within the same run identity (e.g. --finalize re-run with
+    a corrected angles file) never double-counts - the guarded call returns
+    the row unchanged."""
+    first = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    retry = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-20",
+    )
+
+    assert retry["surface_count"] == 1
+    assert retry["last_surfaced"] == "2026-07-13"
+    assert retry == first
+
+
+def test_record_discovery_surfacing_guard_is_per_run_not_global(temp_db):
+    """A later run with a DIFFERENT run_ref still increments: the idempotency
+    guard binds to one run identity, never to the row."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["surface_count"] == 2
+    assert row["last_surfaced"] == "2026-07-20"
+    assert row["last_run_ref"] == "run-2"
+
+
+def test_record_discovery_surfacing_same_run_ref_never_touches_covered(temp_db):
+    """The guard obeys the existing never-mutate rule: a retry against a
+    covered row leaves status/covered_at exactly as the user set them."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-14")
+
+    retry = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-20",
+        inherit_covered_at="2026-07-19",
+    )
+
+    assert retry["surface_count"] == 1
+    assert retry["status"] == "covered"
+    assert retry["covered_at"] == "2026-07-14"
+
+
+def test_record_discovery_surfacing_blank_run_ref_keeps_legacy_increment(temp_db):
+    """Callers that pass no run_ref (blank) keep the pre-guard behavior:
+    every surfacing increments. The guard only binds real run identities."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", as_of="2026-07-13",
+    )
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", as_of="2026-07-20",
+    )
+
+    assert row["surface_count"] == 2
+
+
 def test_mark_discovery_covered_by_exact_name(temp_db):
     store.record_discovery_surfacing(
         "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",

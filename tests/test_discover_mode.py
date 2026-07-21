@@ -868,11 +868,18 @@ def _queue_report(names: list[str]) -> schema.DiscoveryReport:
 
 
 def _run_scoped_discover(save_dir, config=None, names=("Gemma 4 chat templates",)):
+    import datetime as _datetime
+
     parser = cli.build_parser()
     args, _extra = parser.parse_known_args(
         ["--discover", "AI agents", "--save-dir", str(save_dir), "--save-suffix", os.urandom(4).hex()]
     )
-    with mock.patch.object(pipeline, "run_discover", return_value=_queue_report(list(names))):
+    report = _queue_report(list(names))
+    # Stamp a real, distinct run identity per mocked run: generated_at is
+    # runtime-stamped in reality, and a fixed fixture timestamp would make two
+    # "separate" runs share a run_ref and trip the retry idempotency guard.
+    report.generated_at = _datetime.datetime.now(_datetime.timezone.utc).isoformat()
+    with mock.patch.object(pipeline, "run_discover", return_value=report):
         return cli._run_discover(args, dict(config or {}))
 
 
@@ -1264,23 +1271,17 @@ def test_discovery_cli_mock_protocol_leg_requires_save_dir(leg_argv):
     assert "mock protocol legs require --save-dir to stay side-effect-free" in result.stderr
 
 
-@pytest.mark.parametrize(
-    ("leg_argv", "marker"),
-    [
-        (["--finalize"], "finalize leg"),
-    ],
-)
-def test_discovery_cli_protocol_flags_reach_their_leg_stub(tmp_path, leg_argv, marker):
-    """With --save-dir, each protocol flag routes to its own leg. Leg 3 is a
-    U5 stub for now, so the distinct NotImplementedError message is the
-    dispatch evidence (U5 will retarget this pin to real behavior); legs 1
-    and 2 have their real behavior pinned below."""
+def test_discovery_cli_finalize_flag_reaches_leg_3(tmp_path):
+    """With --save-dir, --finalize routes to the real leg 3 (formerly the U5
+    stub): an empty state dir is a contract failure naming the pending report
+    and the resume-leg remedy - proof the dispatch reached the finalize body."""
     result = _run_protocol_cli(
-        ["--discover", "AI agents", "--mock", "--save-dir", str(tmp_path), *leg_argv],
+        ["--discover", "AI agents", "--mock", "--save-dir", str(tmp_path), "--finalize"],
     )
-    assert result.returncode == 1, result.stderr
-    assert "NotImplementedError" in result.stderr
-    assert marker in result.stderr
+    assert result.returncode == 2, result.stderr
+    assert "No pending discovery report found" in result.stderr
+    assert str(tmp_path / discovery_handoff.PENDING_REPORT_FILENAME) in result.stderr
+    assert "--discover --judgments" in result.stderr
 
 
 # --- U3 leg 1: --discover --nominate-only (sweep, bundle, digest) -------------
@@ -1705,4 +1706,426 @@ def test_discovery_cli_resume_full_mock_offline_is_deterministic(tmp_path):
     assert "Renamed Mock Topic" in first.stdout
     assert bundle_payload["bundle_id"] in first.stdout
     assert "--discover --finalize" in first.stdout
+    assert not (tmp_path / "research.db").exists()
+
+
+# --- U5 leg 3: --discover --finalize (angles, render, artifacts, queue) --------
+
+
+def _fresh_generated_at() -> str:
+    import datetime as _datetime
+
+    return _datetime.datetime.now(_datetime.timezone.utc).isoformat()
+
+
+def _write_pending_report(
+    save_dir,
+    names=("Gemma 4 chat templates",),
+    bundle_id="cafe1234cafe1234",
+) -> dict:
+    """Write a synthetic (schema-true) leg-2 pending report into save_dir and
+    return its payload. Mirrors the exact U4 writer shape: full schema round
+    trip of the report plus angle_inputs keyed by surviving nomination id."""
+    generated_at = _fresh_generated_at()
+    report = _queue_report(list(names))
+    report.generated_at = generated_at
+    payload = {
+        "kind": schema.DISCOVERY_PENDING_KIND,
+        "schema_version": schema.DISCOVERY_PENDING_SCHEMA_VERSION,
+        "bundle_id": bundle_id,
+        "generated_at": generated_at,
+        "run_ref": f"discover:{report.domain or 'trending'}:{generated_at}",
+        "report": schema.to_dict(report),
+        "angle_inputs": {
+            f"n{position}": {
+                "name": name,
+                "titles": f"Listing title about {name}",
+                "top_comment": "",
+                "engagement": "120 native interactions across reddit",
+            }
+            for position, name in enumerate(names, start=1)
+        },
+    }
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    (save_dir / discovery_handoff.PENDING_REPORT_FILENAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    return payload
+
+
+def _write_angles_file(save_dir, bundle_id, rows) -> Path:
+    path = Path(save_dir) / "angles.json"
+    path.write_text(
+        json.dumps({"bundle_id": bundle_id, "angles": rows}), encoding="utf-8"
+    )
+    return path
+
+
+def _run_leg3(save_dir, config=None, *extra_argv) -> int:
+    """Run leg 3 in-process, non-mock (finalize is offline by design)."""
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--save-dir", str(save_dir),
+        "--save-suffix", os.urandom(4).hex(), "--finalize", *extra_argv,
+    ])
+    return cli._run_discover_protocol_leg(args, dict(config or {}))
+
+
+def test_discovery_report_round_trips_through_schema_dicts():
+    """to_dict -> JSON -> discovery_report_from_dict is lossless: the exact
+    round trip leg 3 performs on the pending report."""
+    import dataclasses
+
+    original = _queue_report(["Gemma 4 chat templates"])
+    original.topics[0] = dataclasses.replace(
+        original.topics[0],
+        top_comment='"Sharp take" - u/dev (1,200 votes)',
+        corroboration_count=2,
+        evidence_urls=["https://reddit.com/r/x/1"],
+    )
+    payload = json.loads(json.dumps(schema.to_dict(original)))
+    assert schema.discovery_report_from_dict(payload) == original
+
+
+def test_discovery_cli_finalize_applies_host_angles_and_records_queue(tmp_path, capsys):
+    """Scenario: finalize with an angles file renders host angle lines
+    verbatim, saves the discovery artifact, and records the queue under the
+    LEG-2 run identity (the pending report's run_ref)."""
+    import sqlite3 as _sqlite3
+
+    pending = _write_pending_report(tmp_path)
+    angles_path = _write_angles_file(tmp_path, pending["bundle_id"], [
+        {"id": "n1",
+         "podcast": "Is Gemma 4 chat templating a lock-in play?",
+         "x_article": "Five Gemma 4 template changes worth writing about."},
+    ])
+
+    assert _run_leg3(tmp_path, None, "--angles", str(angles_path)) == 0
+    out = capsys.readouterr().out
+    assert "## 1. Gemma 4 chat templates" in out
+    assert (
+        "**Podcast angle:** Is Gemma 4 chat templating a lock-in play?" in out
+    )
+    assert (
+        "**X article angle:** Five Gemma 4 template changes worth writing about."
+        in out
+    )
+    # First-ever topic: nothing prior to annotate from.
+    assert "**Pipeline:**" not in out
+    # Artifact saved via the existing O_EXCL discovery path.
+    assert list(tmp_path.glob("*discover-raw*"))
+    # Queue row recorded under the pending report's run_ref.
+    conn = _sqlite3.connect(tmp_path / "research.db")
+    conn.row_factory = _sqlite3.Row
+    row = dict(conn.execute("SELECT * FROM discovery_topics").fetchone())
+    conn.close()
+    assert row["name"] == "Gemma 4 chat templates"
+    assert row["surface_count"] == 1
+    assert row["last_run_ref"] == pending["run_ref"]
+    # Pending file left in place: idempotent retries are a design requirement.
+    assert (tmp_path / discovery_handoff.PENDING_REPORT_FILENAME).is_file()
+
+
+def test_discovery_cli_finalize_without_angles_renders_angle_less_brief(tmp_path, capsys):
+    """Omitting --angles is legal: the brief ships without angle lines and the
+    queue still records the surfacing."""
+    _write_pending_report(tmp_path)
+
+    assert _run_leg3(tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "## 1. Gemma 4 chat templates" in out
+    assert "**Podcast angle:**" not in out
+    assert "**X article angle:**" not in out
+
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(tmp_path / "research.db")
+    rows = conn.execute(
+        "SELECT name, surface_count FROM discovery_topics"
+    ).fetchall()
+    conn.close()
+    assert rows == [("Gemma 4 chat templates", 1)]
+
+
+def test_discovery_cli_double_finalize_same_run_ref_counts_once(tmp_path, capsys):
+    """AE6: a finalize retry (same pending report, same run_ref) neither
+    double-counts the surfacing nor annotates the retry as a resurfacing -
+    the rendered brief is stable across retries."""
+    import sqlite3 as _sqlite3
+
+    _write_pending_report(tmp_path)
+
+    assert _run_leg3(tmp_path) == 0
+    first = capsys.readouterr().out
+    assert _run_leg3(tmp_path) == 0
+    second = capsys.readouterr().out
+
+    assert "## 1. Gemma 4 chat templates" in second
+    # The retry must not describe itself as a 2nd surfacing.
+    assert "**Pipeline:**" not in second
+    assert first == second
+
+    conn = _sqlite3.connect(tmp_path / "research.db")
+    row = conn.execute(
+        "SELECT surface_count, covered_at FROM discovery_topics"
+    ).fetchone()
+    conn.close()
+    assert row == (1, None)
+
+
+def test_discovery_cli_finalize_new_run_ref_still_increments(tmp_path, capsys):
+    """Scenario 8: the guard is per-run. A LATER protocol round (fresh pending
+    report, fresh run_ref) increments and annotates normally."""
+    import sqlite3 as _sqlite3
+
+    _write_pending_report(tmp_path)
+    assert _run_leg3(tmp_path) == 0
+    capsys.readouterr()
+
+    # A new leg-2 round over the same story: new generated_at -> new run_ref.
+    _write_pending_report(tmp_path)
+    assert _run_leg3(tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "**Pipeline:** surfaced 2nd time" in out
+
+    conn = _sqlite3.connect(tmp_path / "research.db")
+    count = conn.execute(
+        "SELECT surface_count FROM discovery_topics"
+    ).fetchone()[0]
+    conn.close()
+    assert count == 2
+
+
+def test_discovery_cli_finalize_queue_failure_degrades_to_warning(tmp_path, monkeypatch, capsys):
+    """The finalize queue call sits behind the same guarded hook as the
+    one-shot: a broken research.db degrades to a stderr warning and the brief
+    still prints (exit 0)."""
+    import sqlite3 as _sqlite3
+
+    import store
+
+    def _locked(*_args, **_kwargs):
+        raise _sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "record_discovery_surfacing", _locked)
+    _write_pending_report(tmp_path)
+
+    assert _run_leg3(tmp_path) == 0
+    captured = capsys.readouterr()
+    assert "## 1. Gemma 4 chat templates" in captured.out
+    assert "**Pipeline:**" not in captured.out
+    assert "[last30days] Warning:" in captured.err
+    assert "database is locked" in captured.err
+
+
+def test_discovery_cli_finalize_covered_inheritance_on_rename_drift(tmp_path, capsys):
+    """A host-authored name that fuzzy-matches a covered prior inherits the
+    covered mark (rename-drift scenario) - same convention as the one-shot."""
+    import store
+
+    with store.scoped_db(tmp_path / "research.db"):
+        store.record_discovery_surfacing(
+            "Gemma 4 chat templates", domain="AI agents", run_ref="run-old",
+            as_of="2026-07-13",
+        )
+        store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-14")
+
+    _write_pending_report(tmp_path, names=("Gemma 4 template fixes",))
+    assert _run_leg3(tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "marked covered" in out
+
+    with store.scoped_db(tmp_path / "research.db"):
+        fresh = store.match_discovery_topic("Gemma 4 template fixes")
+    assert fresh is not None
+    assert fresh["status"] == "covered"
+    assert fresh["covered_at"] == "2026-07-14"
+
+
+def test_discovery_cli_finalize_is_offline(tmp_path, capsys):
+    """Leg 3 is the cheap leg: no sweep, no enrichment, no provider
+    resolution - only the pending report, the angles file, and the queue."""
+    _write_pending_report(tmp_path)
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--save-dir", str(tmp_path), "--finalize",
+    ])
+    with mock.patch.object(pipeline, "run_discover") as sweep, \
+         mock.patch.object(pipeline, "run") as research, \
+         mock.patch.object(pipeline, "enrich_nominations") as enrich, \
+         mock.patch.object(pipeline.providers, "resolve_runtime") as resolve:
+        assert cli._run_discover_protocol_leg(args, {}) == 0
+    sweep.assert_not_called()
+    research.assert_not_called()
+    enrich.assert_not_called()
+    resolve.assert_not_called()
+
+
+def test_discovery_cli_finalize_emit_json_carries_host_angles(tmp_path, capsys):
+    """--emit json respects the same export contract as the one-shot; host
+    angles ride in the discovery export fields."""
+    pending = _write_pending_report(tmp_path)
+    angles_path = _write_angles_file(tmp_path, pending["bundle_id"], [
+        {"id": "n1", "podcast": "A hook worth exporting"},
+    ])
+    assert _run_leg3(
+        tmp_path, None, "--angles", str(angles_path), "--emit", "json",
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == "discovery"
+    assert payload["results"][0]["podcast_angle"] == "A hook worth exporting"
+    assert payload["results"][0]["x_article_angle"] is None
+
+
+def test_discovery_cli_finalize_rejects_html_like_the_one_shot(tmp_path, capsys):
+    _write_pending_report(tmp_path)
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--save-dir", str(tmp_path), "--finalize",
+        "--emit", "html",
+    ])
+    assert cli._run_discover_protocol_leg(args, {}) == 2
+    assert "does not support HTML publishing" in capsys.readouterr().err
+
+
+def test_discovery_cli_finalize_stale_pending_exits_2(tmp_path, capsys):
+    """TTL is measured from the PENDING report's generated_at (the leg-2
+    write started a fresh window); a stale one names the resume remedy."""
+    import datetime as _datetime
+
+    stale = (
+        _datetime.datetime.now(_datetime.timezone.utc)
+        - _datetime.timedelta(
+            seconds=discovery_handoff.DISCOVERY_HANDOFF_TTL_SECONDS + 60
+        )
+    ).isoformat()
+    payload = _write_pending_report(tmp_path)
+    pending_path = tmp_path / discovery_handoff.PENDING_REPORT_FILENAME
+    payload["generated_at"] = stale
+    pending_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert _run_leg3(tmp_path) == 2
+    err = capsys.readouterr().err
+    assert "stale" in err
+    assert "--discover --judgments" in err
+
+
+def test_discovery_cli_finalize_missing_pending_names_both_locations(tmp_path, monkeypatch, capsys):
+    """The not-found message names BOTH searched locations (save dir and
+    config dir) and the resume-leg remedy."""
+    config_dir = tmp_path / "config"
+    monkeypatch.setattr(cli.env, "CONFIG_DIR", config_dir)
+    save_dir = tmp_path / "client"
+    assert _run_leg3(save_dir) == 2
+    err = capsys.readouterr().err
+    assert str(save_dir.resolve() / discovery_handoff.PENDING_REPORT_FILENAME) in err
+    assert str(config_dir / discovery_handoff.PENDING_REPORT_FILENAME) in err
+    assert "--discover --judgments" in err
+    assert "--discover --nominate-only" in err
+
+
+def test_discovery_cli_finalize_angles_bundle_mismatch_exits_2(tmp_path, capsys):
+    pending = _write_pending_report(tmp_path)
+    angles_path = _write_angles_file(tmp_path, "deadbeefdeadbeef", [
+        {"id": "n1", "podcast": "Bound to the wrong bundle"},
+    ])
+    assert _run_leg3(tmp_path, None, "--angles", str(angles_path)) == 2
+    err = capsys.readouterr().err
+    assert "deadbeefdeadbeef" in err
+    assert pending["bundle_id"] in err
+
+
+def test_discovery_cli_finalize_invalid_pending_json_exits_2(tmp_path, capsys):
+    (tmp_path / discovery_handoff.PENDING_REPORT_FILENAME).write_text(
+        "{not json", encoding="utf-8"
+    )
+    assert _run_leg3(tmp_path) == 2
+    assert "JSON" in capsys.readouterr().err
+
+
+def test_discovery_cli_finalize_wrong_kind_or_version_exits_2(tmp_path, capsys):
+    payload = _write_pending_report(tmp_path)
+    pending_path = tmp_path / discovery_handoff.PENDING_REPORT_FILENAME
+
+    payload["kind"] = "discovery-nominations"
+    pending_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _run_leg3(tmp_path) == 2
+    assert "discovery-nominations" in capsys.readouterr().err
+
+    payload["kind"] = schema.DISCOVERY_PENDING_KIND
+    payload["schema_version"] = "99.0"
+    pending_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _run_leg3(tmp_path) == 2
+    assert "99.0" in capsys.readouterr().err
+
+
+def test_discovery_cli_full_mock_protocol_three_legs_end_to_end(tmp_path):
+    """The whole protocol offline: nominate -> judgments -> finalize (with
+    angles) produces a complete brief. Mock finalize writes NO queue rows and
+    renders deterministically across two runs."""
+    leg1 = _run_nominate_only(tmp_path)
+    assert leg1.returncode == 0, leg1.stderr
+    bundle_payload = json.loads(
+        (tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    rows = bundle_payload["nominations"]
+    keep = [row["id"] for row in rows if not row["heuristic_junk"]][:1]
+    assert keep, "mock sweep should nominate at least one non-junk topic"
+    judgments_path = tmp_path / "judgments.json"
+    judgments_path.write_text(json.dumps({
+        "bundle_id": bundle_payload["bundle_id"],
+        "judgments": [
+            {"id": keep[0], "name": "Renamed Mock Topic", "junk": False,
+             "worthiness": 90},
+            *[
+                {"id": row["id"], "junk": True}
+                for row in rows if row["id"] not in keep
+            ],
+        ],
+    }), encoding="utf-8")
+    leg2 = _run_protocol_cli(
+        [
+            "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+            "--judgments", str(judgments_path),
+        ],
+        env_overrides={"LAST30DAYS_DEFAULT_SEARCH": ""},
+    )
+    assert leg2.returncode == 0, leg2.stderr
+    pending_payload = json.loads(
+        (tmp_path / discovery_handoff.PENDING_REPORT_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    angles_path = _write_angles_file(tmp_path, pending_payload["bundle_id"], [
+        {"id": keep[0],
+         "podcast": "A mock podcast hook for the renamed topic",
+         "x_article": "A mock X-article hook for the renamed topic"},
+    ])
+
+    def run_leg3():
+        return _run_protocol_cli([
+            "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+            "--finalize", "--angles", str(angles_path),
+        ])
+
+    first = run_leg3()
+    assert first.returncode == 0, first.stderr
+    # A complete brief: topic card, host angle lines, research handoff.
+    assert "## 1. Renamed Mock Topic" in first.stdout
+    assert (
+        "**Podcast angle:** A mock podcast hook for the renamed topic"
+        in first.stdout
+    )
+    assert (
+        "**X article angle:** A mock X-article hook for the renamed topic"
+        in first.stdout
+    )
+    assert '**Research next:** `/last30days "Renamed Mock Topic"`' in first.stdout
+    # Mock stays queue-free and deterministic.
+    assert not (tmp_path / "research.db").exists()
+    second = run_leg3()
+    assert second.returncode == 0, second.stderr
+    assert first.stdout == second.stdout
     assert not (tmp_path / "research.db").exists()

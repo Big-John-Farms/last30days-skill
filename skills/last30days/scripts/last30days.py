@@ -1333,6 +1333,7 @@ def _annotate_and_record_discovery_queue(
     report: schema.DiscoveryReport,
     args: argparse.Namespace,
     config: dict[str, object],
+    run_ref: str | None = None,
 ) -> schema.DiscoveryReport:
     """Stamp queue annotations onto report topics, then record this surfacing.
 
@@ -1343,6 +1344,12 @@ def _annotate_and_record_discovery_queue(
     (--save-dir) write the scoped research.db, never the global one. Runs
     synchronously after the pipeline returns - this writes disk, so the
     abandon-on-timeout daemon-thread pattern is forbidden here.
+
+    ``run_ref`` overrides the run identity: the finalize leg passes the
+    pending report's leg-2 run_ref through so a finalize retry records (and
+    annotates) as the SAME run - store.record_discovery_surfacing skips the
+    double-count, and rows this very run identity stamped are not "prior"
+    state, so retries render identically instead of claiming a resurfacing.
     """
     queue_setting = str(config.get("LAST30DAYS_DISCOVERY_QUEUE") or "").strip().lower()
     if queue_setting == "off" or not report.topics:
@@ -1352,7 +1359,7 @@ def _annotate_and_record_discovery_queue(
 
     import store
 
-    run_ref = f"discover:{report.domain or 'trending'}:{report.generated_at}"
+    run_ref = run_ref or f"discover:{report.domain or 'trending'}:{report.generated_at}"
     as_of = (report.generated_at or "")[:10] or report.range_to
     annotated: list[schema.DiscoveryTopic] = []
     with store.scoped_db(_scoped_store_db(args)):
@@ -1361,7 +1368,14 @@ def _annotate_and_record_discovery_queue(
         # match+record in one loop lets topic N fuzzy-match a same-anchor
         # sibling row this very run recorded seconds earlier, falsely
         # annotating a first-ever topic as "surfaced 2nd time".
-        priors = [store.match_discovery_topic(topic.name) for topic in report.topics]
+        # A row stamped by THIS run identity is this run's own earlier
+        # attempt (finalize retry), not prior state: treat it as no prior.
+        priors = [
+            None if prior and prior.get("last_run_ref") == run_ref else prior
+            for prior in (
+                store.match_discovery_topic(topic.name) for topic in report.topics
+            )
+        ]
         # Phase 2: record this run's surfacings. A topic whose (possibly
         # fuzzy) prior row is covered inherits that covered state, so a
         # user's covered mark survives judge naming drift instead of
@@ -1719,8 +1733,8 @@ def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) ->
         )
     pending_path = discovery_handoff.pending_report_path(state_dir)
     payload = {
-        "kind": "discovery-pending",
-        "schema_version": "1.0",
+        "kind": schema.DISCOVERY_PENDING_KIND,
+        "schema_version": schema.DISCOVERY_PENDING_SCHEMA_VERSION,
         "bundle_id": bundle.bundle_id,
         # Fresh TTL clock: leg 3 measures staleness from THIS resume run,
         # not from the leg-1 sweep.
@@ -1757,10 +1771,92 @@ def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) ->
 
 
 def _run_discover_finalize(args: argparse.Namespace, config: dict[str, object]) -> int:
-    """Protocol leg 3: apply angles, render, record the queue (U5 stub)."""
-    raise NotImplementedError(
-        "--discover --finalize leg is not implemented yet (U5 replaces this stub)"
+    """Protocol leg 3: load the leg-2 pending report, apply host angles,
+    render the final brief, save discovery artifacts, and record the topic
+    queue. The cheap offline leg - no sweep, no enrichment, no providers,
+    no network; everything renders from the pending report.
+
+    Contract failures (missing/stale/mismatched pending report or angles)
+    raise HandoffContractError and map to exit 2 in
+    _run_discover_protocol_leg. The pending file is deliberately LEFT IN
+    PLACE on success: a finalize retry with a corrected angles file must
+    keep working within the TTL, and the queue records under the pending
+    report's leg-2 run_ref, so retries never double-count a surfacing.
+    Mock finalize renders identically but writes no queue rows.
+    """
+    import dataclasses
+
+    if args.emit == "html" or args.publish_html:
+        # Same contract as the one-shot: discovery has no HTML pipeline yet.
+        sys.stderr.write("[last30days] discovery mode does not support HTML publishing yet.\n")
+        return 2
+
+    save_dir = getattr(args, "save_dir", None)
+    pending = discovery_handoff.read_pending_report(
+        save_dir=save_dir, config_dir=env.CONFIG_DIR,
     )
+    angles = discovery_handoff.read_angles(
+        args.angles, pending, save_dir=save_dir, config_dir=env.CONFIG_DIR,
+    )
+    report = schema.discovery_report_from_dict(pending.report)
+
+    if angles:
+        # Host angles are keyed by nomination id; the pending report's
+        # angle_inputs mapping carries each surviving id's applied topic
+        # name, which is how angles land on the right DiscoveryTopic.
+        angles_by_name = {
+            name: host
+            for nomination_id, host in angles.items()
+            if (name := (pending.angle_inputs.get(nomination_id) or {}).get("name"))
+        }
+        report = dataclasses.replace(report, topics=[
+            dataclasses.replace(
+                topic,
+                podcast_angle=host.podcast,
+                x_article_angle=host.x_article,
+            )
+            if (host := angles_by_name.get(topic.name)) is not None
+            else topic
+            for topic in report.topics
+        ])
+
+    # Persistent topic queue: the protocol's ONE queue write happens here,
+    # under the leg-2 run identity (pending.run_ref) so finalize retries are
+    # idempotent. Mock runs stay 100% side-effect-free.
+    if not args.mock:
+        try:
+            report = _annotate_and_record_discovery_queue(
+                report, args, config, run_ref=pending.run_ref or None,
+            )
+        except (sqlite3.Error, OSError) as exc:
+            # A broken queue db (locked, read-only dir, corrupt) must never
+            # destroy the protocol's final brief: warn and render the report
+            # without queue annotations (fields keep defaults).
+            sys.stderr.write(
+                f"[last30days] Warning: discovery queue unavailable ({exc}); "
+                "continuing without queue annotations.\n"
+            )
+
+    if args.emit == "json":
+        payload = schema.to_dict(report) if args.json_profile == "raw" else schema.to_discovery_export(report)
+        rendered = json.dumps(payload, indent=2, sort_keys=True)
+    else:
+        rendered = render.render_discovery(report)
+
+    if args.output:
+        output_path = save_rendered_output(rendered, args.output)
+        sys.stderr.write(f"[last30days] Saved output to {output_path}\n")
+    if args.save_dir:
+        save_path = _save_discovery_output(
+            rendered,
+            domain=report.domain or "trending",
+            emit=args.emit,
+            save_dir=args.save_dir,
+            suffix=args.save_suffix or "",
+        )
+        sys.stderr.write(f"[last30days] Saved output to {save_path}\n")
+    print(rendered)
+    return 0
 
 
 def _run_discover_protocol_leg(

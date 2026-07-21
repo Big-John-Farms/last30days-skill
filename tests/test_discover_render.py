@@ -160,6 +160,51 @@ def test_angle_lines_render_in_order_between_voice_and_evidence():
     assert voice < podcast < article < evidence
 
 
+def test_host_authored_angles_render_verbatim_and_capped(tmp_path):
+    """Finalize-leg path: host angle sentences pass through the handoff
+    reader (word-boundary capped at 200 chars) and render verbatim on the
+    card - relayable text, never paraphrased or re-wrapped."""
+    import dataclasses
+    import json
+
+    from lib import discovery_handoff
+
+    pending = discovery_handoff.PendingReport(
+        schema_version="1.0",
+        bundle_id="cafe1234cafe1234",
+        generated_at="2026-07-10T00:00:00+00:00",
+        run_ref="discover:AI agents:2026-07-10T00:00:00+00:00",
+        report={},
+        angle_inputs={"n1": {"name": "OpenAI Agent SDK"}},
+    )
+    long_angle = " ".join(["angle"] * 60)  # well over the 200-char cap
+    angles_path = tmp_path / "angles.json"
+    angles_path.write_text(json.dumps({
+        "bundle_id": pending.bundle_id,
+        "angles": [{
+            "id": "n1",
+            "podcast": "Is the Agent SDK a platform play or a lock-in play?",
+            "x_article": long_angle,
+        }],
+    }), encoding="utf-8")
+    host = discovery_handoff.read_angles(angles_path, pending)["n1"]
+
+    topic = dataclasses.replace(
+        _topic(1, "OpenAI Agent SDK"),
+        podcast_angle=host.podcast,
+        x_article_angle=host.x_article,
+    )
+    rendered = render.render_discovery(_report(topics=[topic]))
+    assert (
+        "**Podcast angle:** Is the Agent SDK a platform play or a lock-in play?"
+        in rendered
+    )
+    capped = host.x_article
+    assert capped is not None
+    assert len(capped) <= 200
+    assert f"**X article angle:** {capped}" in rendered
+
+
 def test_no_angle_lines_when_fields_none():
     rendered = render.render_discovery(_report())
     assert "**Podcast angle:**" not in rendered
