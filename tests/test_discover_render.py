@@ -188,9 +188,10 @@ def test_pipeline_line_renders_surfaced_and_covered_comma_joined():
     )])
     rendered = render.render_discovery(report)
     assert (
-        "**Pipeline:** surfaced 3rd time in 30 days, marked covered 2026-07-14"
+        "**Pipeline:** surfaced 4th time, marked covered"
         in rendered
     )
+    assert "marked covered 2026" not in rendered  # covered date is never shown
 
 
 def test_pipeline_line_surfaced_only():
@@ -198,7 +199,7 @@ def test_pipeline_line_surfaced_only():
         1, "OpenAI Agent SDK", previously_surfaced_count=1,
     )])
     rendered = render.render_discovery(report)
-    assert "**Pipeline:** surfaced 1st time in 30 days" in rendered
+    assert "**Pipeline:** surfaced 2nd time" in rendered
     assert "marked covered" not in rendered
 
 

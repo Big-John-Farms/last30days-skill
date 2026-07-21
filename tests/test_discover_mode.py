@@ -201,22 +201,6 @@ def test_x_velocity_excludes_views_and_bookmarks():
     ) == rerank.engagement_velocity_score(standard_item, as_of_date="2026-07-10")
 
 
-def test_discovery_topic_name_uses_entities_shared_across_sources():
-    reddit = _candidate(_item("r1", "reddit", "OpenAI Agent SDK launch details"))
-    hn = _candidate(_item("h1", "hackernews", "OpenAI Agent SDK reaches developers"))
-    candidates = {reddit.candidate_id: reddit, hn.candidate_id: hn}
-    cluster = schema.Cluster(
-        cluster_id="cluster-1",
-        title=reddit.title,
-        candidate_ids=list(candidates),
-        representative_ids=[reddit.candidate_id],
-        sources=["hackernews", "reddit"],
-        score=80,
-    )
-
-    assert pipeline.discovery_topic_name(cluster, candidates, "AI agents") == "OpenAI Agent SDK"
-
-
 def test_discovery_renderer_snapshot():
     report = schema.DiscoveryReport(
         domain="AI agents",
@@ -925,8 +909,8 @@ def test_second_discovery_run_annotates_from_prior_state_then_records(tmp_path, 
     second = capsys.readouterr().out
 
     # Annotation reflects the state BEFORE this run's own surfacing was
-    # recorded: one prior surfacing -> "1st time", never "2nd".
-    assert "**Pipeline:** surfaced 1st time in 30 days" in second
+    # recorded: one prior surfacing means this appearance is the 2nd.
+    assert "**Pipeline:** surfaced 2nd time" in second
 
     import sqlite3
     conn = sqlite3.connect(save_dir / "research.db")
@@ -954,7 +938,7 @@ def test_covered_topic_resurfacing_renders_marked_covered(tmp_path, capsys):
     assert _run_scoped_discover(save_dir) == 0
     rendered = capsys.readouterr().out
     assert "marked covered" in rendered
-    assert "**Pipeline:** surfaced 1st time in 30 days, marked covered" in rendered
+    assert "**Pipeline:** surfaced 2nd time, marked covered" in rendered
 
 
 def test_queue_opt_out_via_process_env_seam(tmp_path, monkeypatch, capsys):

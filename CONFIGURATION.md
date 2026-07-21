@@ -447,7 +447,7 @@ Relevant tables: `topics`, `research_runs`, `findings`, `settings`. Schema: [`sc
 
 ### Discovery topic queue (`LAST30DAYS_DISCOVERY_QUEUE`)
 
-`--discover` runs remember what they surfaced (table `discovery_topics` in the same research.db). Re-surfaced topics get a `**Pipeline:**` line on their card ("surfaced 2nd time in 30 days", "marked covered 2026-07-14") so the discovery brief doubles as a podcast / X-article content pipeline. On by default for real runs; `--mock` runs never write. With `--save-dir`, queue rows land in that directory's scoped `research.db`, never the global one.
+`--discover` runs remember what they surfaced (table `discovery_topics` in the same research.db). Re-surfaced topics get a `**Pipeline:**` line on their card ("surfaced 2nd time", "marked covered") so the discovery brief doubles as a podcast / X-article content pipeline. On by default for real runs; `--mock` runs never write. With `--save-dir`, queue rows land in that directory's scoped `research.db`, never the global one.
 
 | Var | Effect |
 | --- | --- |

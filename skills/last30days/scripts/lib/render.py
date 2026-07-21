@@ -152,14 +152,15 @@ def render_discovery(report: schema.DiscoveryReport) -> str:
             ])
         pipeline_notes: list[str] = []
         if topic.previously_surfaced_count > 0:
+            # previously_surfaced_count is PRIOR appearances, so this
+            # appearance is the (count + 1)-th. The queue is all-time.
             pipeline_notes.append(
-                f"surfaced {_ordinal(topic.previously_surfaced_count)} time in 30 days"
+                f"surfaced {_ordinal(topic.previously_surfaced_count + 1)} time"
             )
         if topic.covered:
-            covered_note = "marked covered"
-            if topic.last_surfaced:
-                covered_note += f" {topic.last_surfaced}"
-            pipeline_notes.append(covered_note)
+            # last_surfaced is the last surfacing date, not the covered date,
+            # so no date is rendered here.
+            pipeline_notes.append("marked covered")
         if pipeline_notes:
             lines.extend([
                 f"**Pipeline:** {', '.join(pipeline_notes)}",

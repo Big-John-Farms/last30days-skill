@@ -7,7 +7,7 @@ import math
 import re
 from datetime import datetime
 
-from typing import NamedTuple
+from typing import Callable, NamedTuple, TypeVar
 
 from . import http, log, providers, schema, signals
 
@@ -711,6 +711,35 @@ class DiscoveryJudgeVerdict(NamedTuple):
     worthiness: float | None
 
 
+_DiscoveryParsedT = TypeVar("_DiscoveryParsedT")
+
+
+def _run_discovery_llm_pass(
+    provider: providers.ReasoningClient | None,
+    model: str | None,
+    entries: list[dict[str, str]],
+    prompt_builder: Callable[[list[dict[str, str]]], str],
+    parser: Callable[[dict], dict[str, _DiscoveryParsedT]],
+    failure_label: str,
+) -> dict[str, _DiscoveryParsedT] | None:
+    """Shared skeleton for the batched discovery LLM passes (stage-1 judge,
+    stage-2 angles): guard on provider/model/entries, one generate_json call,
+    parse. Any expected failure logs ``failure_label`` and returns None so the
+    caller falls back. Never raises."""
+    if not (provider and model and entries):
+        return None
+    try:
+        payload = provider.generate_json(model, prompt_builder(entries))
+        return parser(payload)
+    except (ValueError, KeyError, json.JSONDecodeError, OSError, http.HTTPError) as exc:
+        log.source_log(
+            "Discover",
+            f"{failure_label}: {type(exc).__name__}: {exc}",
+            tty_only=False,
+        )
+        return None
+
+
 def judge_discovery_topics(
     *,
     domain: str,
@@ -729,21 +758,14 @@ def judge_discovery_topics(
     provider is configured or the call failed outright, signalling a
     whole-pool heuristic fallback. Never raises.
     """
-    if not (provider and model and entries):
-        return None
-    try:
-        payload = provider.generate_json(
-            model, _build_discovery_judge_prompt(domain, entries)
-        )
-        return _parse_discovery_judge_payload(payload)
-    except (ValueError, KeyError, json.JSONDecodeError, OSError, http.HTTPError) as exc:
-        log.source_log(
-            "Discover",
-            f"stage-1 judge failed, using heuristic topic names: "
-            f"{type(exc).__name__}: {exc}",
-            tty_only=False,
-        )
-        return None
+    return _run_discovery_llm_pass(
+        provider,
+        model,
+        entries,
+        lambda batch: _build_discovery_judge_prompt(domain, batch),
+        _parse_discovery_judge_payload,
+        "stage-1 judge failed, using heuristic topic names",
+    )
 
 
 def _build_discovery_judge_prompt(domain: str, entries: list[dict[str, str]]) -> str:
@@ -788,6 +810,19 @@ def _build_discovery_judge_prompt(domain: str, entries: list[dict[str, str]]) ->
 # unbounded string. Mirrors the pre-judge 96-char title cap.
 _JUDGE_NAME_MAX_CHARS = 96
 
+# Unified trailing-punctuation charset for word-boundary truncation: judge
+# names and angle sentences share it so the strip sets cannot drift.
+_TRUNCATE_STRIP_CHARS = " \"'`.,;:!?-"
+
+
+def _truncate_at_word(text: str, max_chars: int) -> str:
+    """Cap ``text`` at ``max_chars``, cutting back to a word boundary and
+    stripping trailing punctuation. Text within the cap passes through
+    untouched."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rsplit(" ", 1)[0].rstrip(_TRUNCATE_STRIP_CHARS)
+
 
 def _parse_discovery_judge_payload(payload: dict) -> dict[str, DiscoveryJudgeVerdict]:
     verdicts: dict[str, DiscoveryJudgeVerdict] = {}
@@ -796,9 +831,8 @@ def _parse_discovery_judge_payload(payload: dict) -> dict[str, DiscoveryJudgeVer
             continue
         topic_id = str(row.get("topic_id") or "").strip()
         name = " ".join(str(row.get("short_name") or "").split())
-        name = name.strip(" \"'`.,;:!?-")
-        if len(name) > _JUDGE_NAME_MAX_CHARS:
-            name = name[:_JUDGE_NAME_MAX_CHARS].rsplit(" ", 1)[0].rstrip(" \"'`.,;:!?-")
+        name = name.strip(_TRUNCATE_STRIP_CHARS)
+        name = _truncate_at_word(name, _JUDGE_NAME_MAX_CHARS)
         if not topic_id or not name:
             # Missing identity or name: treat the row as absent so the caller
             # falls back to the deterministic heuristics for that cluster.
@@ -847,21 +881,14 @@ def generate_discovery_angles(
     Returns ``None`` when no provider is configured or the call failed
     outright - every topic then ships without angles. Never raises.
     """
-    if not (provider and model and entries):
-        return None
-    try:
-        payload = provider.generate_json(
-            model, _build_discovery_angle_prompt(domain, entries)
-        )
-        return _parse_discovery_angle_payload(payload)
-    except (ValueError, KeyError, json.JSONDecodeError, OSError, http.HTTPError) as exc:
-        log.source_log(
-            "Discover",
-            f"stage-2 angle pass failed, topics ship without content angles: "
-            f"{type(exc).__name__}: {exc}",
-            tty_only=False,
-        )
-        return None
+    return _run_discovery_llm_pass(
+        provider,
+        model,
+        entries,
+        lambda batch: _build_discovery_angle_prompt(domain, batch),
+        _parse_discovery_angle_payload,
+        "stage-2 angle pass failed, topics ship without content angles",
+    )
 
 
 def _build_discovery_angle_prompt(domain: str, entries: list[dict[str, str]]) -> str:
@@ -905,9 +932,7 @@ def _sanitized_angle(raw: object) -> str | None:
     anything unusable. Non-strings are rejected outright, never coerced."""
     if not isinstance(raw, str):
         return None
-    text = " ".join(raw.split())
-    if len(text) > _ANGLE_MAX_CHARS:
-        text = text[:_ANGLE_MAX_CHARS].rsplit(" ", 1)[0].rstrip(" \"'`,;:!?-")
+    text = _truncate_at_word(" ".join(raw.split()), _ANGLE_MAX_CHARS)
     return text or None
 
 

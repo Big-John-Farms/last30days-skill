@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterator, List, Optional
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from lib import entity_extract, schema
+from lib import dedupe, entity_extract, schema
 
 DB_DIR = Path.home() / ".local" / "share" / "last30days"
 DB_PATH = DB_DIR / "research.db"
@@ -811,8 +811,9 @@ DISCOVERY_QUEUE_OVERLAP_THRESHOLD = 0.6
 
 
 def _normalize_discovery_name(name: str) -> str:
-    """Queue identity: casefold, punctuation-stripped, whitespace-collapsed."""
-    return " ".join(re.sub(r"[^\w\s]", " ", name).casefold().split())
+    """Queue identity: lowercased, punctuation-stripped, whitespace-collapsed
+    (thin alias for dedupe.normalize_text)."""
+    return dedupe.normalize_text(name)
 
 
 def _discovery_entity_key(name: str) -> str:
@@ -833,7 +834,7 @@ def _discovery_anchor_entities(name: str) -> set[str]:
         lower = word.casefold()
         if lower in entity_extract.ENTITY_STOPWORDS:
             continue
-        if word[0].isupper() or word.isupper() or any(char.isdigit() for char in word):
+        if entity_extract.has_anchor_signal(word):
             anchors.add(lower)
     return anchors
 

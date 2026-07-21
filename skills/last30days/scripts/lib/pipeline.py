@@ -477,41 +477,6 @@ def _fetch_discovery_source(
     raise ValueError(f"Unsupported discovery source: {source}")
 
 
-def discovery_topic_name(
-    cluster: schema.Cluster,
-    candidates: dict[str, schema.Candidate],
-    domain: str,
-) -> str:
-    """Turn a story cluster into a concise, reusable research topic."""
-    members = [candidates[cid] for cid in cluster.candidate_ids if cid in candidates]
-    leader = candidates.get(cluster.representative_ids[0]) if cluster.representative_ids else None
-    leader = leader or (members[0] if members else None)
-    if leader is None:
-        return domain
-    title = re.sub(r"^(?:show|ask|tell|launch) hn:\s*", "", leader.title, flags=re.I)
-    title = re.sub(r"^digg cluster (?:about|on)\s+", "", title, flags=re.I)
-    title = re.sub(r"\s*(?::|-)?\s*(?:discussion thread|gains momentum)$", "", title, flags=re.I)
-
-    if len(members) > 1:
-        entity_sets = [
-            entity_extract.extract_text_entities(f"{member.title} {member.snippet}")
-            for member in members
-        ]
-        shared = set.intersection(*entity_sets) if entity_sets else set()
-        shared_words = [
-            word.strip(".,:;!?()[]{}\"'")
-            for word in title.split()
-            if word.strip(".,:;!?()[]{}\"'").lower() in shared
-        ]
-        if 2 <= len(shared_words) <= 7:
-            title = " ".join(shared_words)
-
-    title = " ".join(title.split()).strip(" -:;,.\"'")
-    if len(title) > 96:
-        title = title[:93].rsplit(" ", 1)[0] + "..."
-    return title or domain
-
-
 def _discovery_engagement(
     items: list[schema.SourceItem],
 ) -> dict[str, dict[str, float | int]]:
@@ -667,15 +632,27 @@ def _disambiguated_topic_name(
     cluster: schema.Cluster,
     earlier_cluster: schema.Cluster,
     candidate_map: dict[str, schema.Candidate],
+    entity_counts_cache: dict[str, Counter],
 ) -> str | None:
     """Disambiguate a colliding topic name by appending the later cluster's
     strongest entity token that the earlier cluster does not share.
 
+    ``entity_counts_cache`` (keyed by cluster id, owned by the caller) memoizes
+    per-cluster entity counts so repeated collisions against the same cluster
+    never recompute them.
+
     Returns None when no distinguishing entity exists - the clusters cannot be
     told apart by content, so the caller treats them as the same story.
     """
-    later_counts = _cluster_entity_counts(cluster, candidate_map)
-    earlier_entities = set(_cluster_entity_counts(earlier_cluster, candidate_map))
+    def cached_counts(target: schema.Cluster) -> Counter:
+        counts = entity_counts_cache.get(target.cluster_id)
+        if counts is None:
+            counts = _cluster_entity_counts(target, candidate_map)
+            entity_counts_cache[target.cluster_id] = counts
+        return counts
+
+    later_counts = cached_counts(cluster)
+    earlier_entities = set(cached_counts(earlier_cluster))
     name_tokens = {token.casefold() for token in name.split()}
     choices = [
         (count, token) for token, count in later_counts.items()
@@ -803,13 +780,16 @@ def nominate_topics(
 
     nominations: list[Nomination] = []
     taken_names: dict[str, schema.Cluster] = {}
+    entity_counts_cache: dict[str, Counter] = {}
     for blended, cluster, cluster_items, name, junk_shape, worthiness in judged:
         name_key = name.casefold()
         if name_key in taken_names:
             earlier_cluster = taken_names[name_key]
             if set(cluster.representative_ids) & set(earlier_cluster.representative_ids):
                 continue  # same story surfacing twice
-            resolved = _disambiguated_topic_name(name, cluster, earlier_cluster, candidate_map)
+            resolved = _disambiguated_topic_name(
+                name, cluster, earlier_cluster, candidate_map, entity_counts_cache,
+            )
             if resolved is None or resolved.casefold() in taken_names:
                 continue  # indistinguishable by content: treat as the same story
             name = resolved
