@@ -1133,7 +1133,9 @@ def run_discover(
 
     topics: list[schema.DiscoveryTopic] = []
     weak_signal: tuple[float, str] | None = None
+    junk_weak_signal: tuple[float, str] | None = None
     for entry in enriched_entries:
+        nomination = entry.nomination
         evidence_items = _enriched_evidence_items(entry)
         sources = sorted({item.source for item in evidence_items})
         native_total = sum(
@@ -1144,15 +1146,25 @@ def run_discover(
             source_count=len(sources),
             engagement_total=native_total,
             item_count=len(evidence_items),
+            junk_shape=nomination.junk_shape,
+            # Junk corroboration counts distinct SEED listing sources, never
+            # the enriched corpus - a successful enrichment pass is
+            # multi-source for almost any topic, so it would never bind.
+            seed_source_count=len({item.source for item in nomination.items}),
         ):
             # Sub-floor evidence never ranks; remember what came closest so a
             # nothing-solid brief can still name the strongest weak signal.
-            if weak_signal is None or score > weak_signal[0]:
-                weak_signal = (score, entry.nomination.name)
+            # Junk-shaped failures are tracked separately: the brief prefers
+            # the strongest NON-junk failure and names a junk one only when
+            # every failure is junk-shaped (never empty when failures exist).
+            if nomination.junk_shape:
+                if junk_weak_signal is None or score > junk_weak_signal[0]:
+                    junk_weak_signal = (score, nomination.name)
+            elif weak_signal is None or score > weak_signal[0]:
+                weak_signal = (score, nomination.name)
             continue
         if len(topics) >= topic_limit:
             break
-        nomination = entry.nomination
         source_phrase = ", ".join(sources[:-1]) + (
             f" and {sources[-1]}" if len(sources) > 1 else (sources[0] if sources else "the listings")
         )
@@ -1175,6 +1187,9 @@ def run_discover(
             top_comment=_best_community_comment(evidence_items) if entry.report is not None else None,
             corroboration_count=len(sources),
         ))
+
+    if weak_signal is None:
+        weak_signal = junk_weak_signal
 
     outcome = "ok" if topics else "nothing-solid"
 

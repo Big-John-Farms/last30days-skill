@@ -96,6 +96,14 @@ def discovery_velocity_score(
 #   (>= FLOOR_MIN_SOURCES) OR a genuinely strong single-source spike
 #   (>= FLOOR_SINGLE_SOURCE_ENGAGEMENT) - a 1,600-point single-source HN
 #   thread is a real story, a 30-upvote single-source meme is not.
+# - Junk-shaped topics (help-me/beginner/musing shapes flagged by the stage-1
+#   judge or the topic_shape heuristics) get a stricter read: the
+#   single-source engagement bypass is OFF (a 226-comment "help me choose"
+#   thread is a busy support thread, not a story), and their
+#   FLOOR_MIN_SOURCES corroboration is counted against SEED listing sources
+#   when the caller provides that count - a successful enrichment pass pulls
+#   a multi-source corpus for almost any topic, so an enriched-count check
+#   would never bind.
 FLOOR_MIN_ENGAGEMENT = 25.0
 FLOOR_MIN_SOURCES = 2
 FLOOR_SINGLE_SOURCE_ENGAGEMENT = 200.0
@@ -106,14 +114,25 @@ def passes_discovery_floor(
     source_count: int,
     engagement_total: float,
     item_count: int,
+    junk_shape: bool = False,
+    seed_source_count: int | None = None,
 ) -> bool:
     """Whether a discovery topic's evidence is strong enough to show a user.
 
     Below this floor the honest output is "nothing solid this window", not a
     ranked list of whatever survived the sweep.
+
+    ``junk_shape=True`` removes the single-source engagement bypass and
+    evaluates the corroboration requirement against ``seed_source_count``
+    (distinct SEED listing sources) when provided, falling back to
+    ``source_count`` otherwise. Non-junk topics are unaffected by both
+    parameters.
     """
     if item_count <= 0 or engagement_total < FLOOR_MIN_ENGAGEMENT:
         return False
+    if junk_shape:
+        corroboration = seed_source_count if seed_source_count is not None else source_count
+        return corroboration >= FLOOR_MIN_SOURCES
     if source_count >= FLOOR_MIN_SOURCES:
         return True
     return engagement_total >= FLOOR_SINGLE_SOURCE_ENGAGEMENT

@@ -188,3 +188,159 @@ def test_passes_discovery_floor_policy():
     # Single-source needs a genuinely strong spike.
     assert not floor(source_count=1, engagement_total=100, item_count=3)
     assert floor(source_count=1, engagement_total=1600, item_count=1)
+
+
+# --- U3 junk-shape gate ------------------------------------------------------
+# Extends the frozen corpus above (existing cases stay byte-identical). A
+# junk-shaped nomination (help-me/beginner/musing, per the stage-1 judge or
+# topic_shape heuristics) loses the single-source engagement bypass, and its
+# corroboration is counted against SEED listing sources - never the enriched
+# corpus, which is multi-source for almost any topic that enriches cleanly.
+
+
+def test_junk_shape_blocks_single_source_engagement_bypass():
+    """A 226-comment single-source 'help me' thread is a busy support thread,
+    not a story: junk shape disables the engagement bypass."""
+    report = _run_discover_with({
+        "reddit": [_reddit_item(
+            "junkhelp1", "Help me understand the new Karvella sports doping ruling", 30, 226,
+        )],
+    })
+
+    assert report.topics == []
+    assert report.outcome == "nothing-solid"
+    assert report.weak_signal is not None
+
+
+def test_same_engagement_without_junk_shape_surfaces():
+    """The identical engagement in a statement shape is a genuine
+    single-source spike and must still rank (non-junk behavior unchanged)."""
+    report = _run_discover_with({
+        "reddit": [_reddit_item(
+            "story2", "Karvella sports doping ruling rocks the league", 30, 226,
+        )],
+    })
+
+    assert report.outcome == "ok"
+    assert len(report.topics) == 1
+
+
+def test_junk_shape_with_two_seed_sources_surfaces():
+    """A junk-shaped story corroborated across two SEED listing sources
+    (reddit + hackernews) clears the floor."""
+    title = "Help me understand the Marseille sports betting collapse"
+    report = _run_discover_with({
+        "reddit": [_reddit_item("junk2a", title, 40, 30)],
+        "hackernews": [_hn_item("junk2b", title, 35, 20)],
+    })
+
+    assert report.outcome == "ok"
+    assert len(report.topics) == 1
+    assert set(report.topics[0].sources) == {"hackernews", "reddit"}
+
+
+def test_junk_corroboration_counts_seed_sources_not_enriched_corpus():
+    """THE key case: a junk-shaped topic with ONE seed listing source must
+    fail the floor even when enrichment succeeded and returned a rich
+    multi-source corpus - a successful enrichment pass pulls a multi-source
+    corpus for almost any topic, so an enriched-count check would never bind."""
+    seed = {"reddit": [_reddit_item(
+        "junkseed1", "Help me understand the new Karvella sports doping ruling", 40, 226,
+    )]}
+
+    def fake_run(*, topic, **_kwargs):
+        items = {
+            "reddit": [
+                schema.SourceItem(
+                    item_id="e1", source="reddit", title=topic, body=topic,
+                    url="https://reddit.com/r/x/1", published_at="2026-07-09",
+                    engagement={"score": 800, "num_comments": 300}, snippet=topic,
+                ),
+            ],
+            "hackernews": [
+                schema.SourceItem(
+                    item_id="e2", source="hackernews", title=topic, body=topic,
+                    url="https://example.com/e2", published_at="2026-07-09",
+                    engagement={"points": 400, "comments": 150}, snippet=topic,
+                ),
+            ],
+        }
+        return schema.Report(
+            topic=topic,
+            range_from="2026-06-10", range_to="2026-07-10",
+            generated_at="2026-07-10T00:00:00+00:00",
+            provider_runtime=schema.ProviderRuntime(
+                reasoning_provider="none",
+                planner_model="deterministic",
+                rerank_model="deterministic",
+            ),
+            query_plan=schema.QueryPlan(
+                intent="factual", freshness_mode="balanced_recent",
+                cluster_mode="none", raw_topic=topic, subqueries=[],
+                source_weights={},
+            ),
+            clusters=[], ranked_candidates=[],
+            items_by_source=items, errors_by_source={},
+        )
+
+    with mock.patch.object(pipeline, "run", side_effect=fake_run):
+        report = _run_discover_with(seed, enrich=True)
+
+    assert report.topics == []
+    assert report.outcome == "nothing-solid"
+    assert report.weak_signal is not None
+
+
+def test_weak_signal_prefers_non_junk_failure():
+    """A nothing-solid brief names the strongest NON-junk weak signal even
+    when a junk-shaped failure has higher velocity."""
+    report = _run_discover_with({
+        "reddit": [_reddit_item("junkfast1", "Help me pick my first sports bike", 30, 100)],
+        "hackernews": [_hn_item("slow1", "Zion Bay sports arena funding vote stalls", 20, 10)],
+    })
+
+    assert report.topics == []
+    assert report.outcome == "nothing-solid"
+    assert report.weak_signal is not None
+    assert "zion" in report.weak_signal.lower()
+
+
+def test_weak_signal_named_when_all_failures_junk():
+    """When every sub-floor failure is junk-shaped, the brief still names one
+    (never empty when failures exist)."""
+    report = _run_discover_with({
+        "reddit": [
+            _reddit_item("alljunk1", "Help me pick my first sports bike", 40, 20),
+            _reddit_item("alljunk2", "Any advice on sports nutrition apps", 25, 15),
+        ],
+    })
+
+    assert report.topics == []
+    assert report.outcome == "nothing-solid"
+    assert report.weak_signal is not None
+
+
+def test_passes_discovery_floor_junk_params():
+    floor = rerank.passes_discovery_floor
+    # Junk + single seed source: no engagement bypass, however huge.
+    assert not floor(source_count=1, engagement_total=999, item_count=3,
+                     junk_shape=True, seed_source_count=1)
+    # Junk corroboration binds on SEED sources - a rich enriched corpus
+    # (source_count high) cannot rescue a single-seed-source junk topic.
+    assert not floor(source_count=5, engagement_total=999, item_count=10,
+                     junk_shape=True, seed_source_count=1)
+    # Junk + seed corroboration >= FLOOR_MIN_SOURCES clears.
+    assert floor(source_count=1, engagement_total=30, item_count=2,
+                 junk_shape=True, seed_source_count=2)
+    # Junk still needs the absolute engagement minimum.
+    assert not floor(source_count=2, engagement_total=10, item_count=2,
+                     junk_shape=True, seed_source_count=2)
+    # Junk without a seed count falls back to the evidence source count -
+    # corroboration still required, bypass still off.
+    assert floor(source_count=2, engagement_total=30, item_count=2, junk_shape=True)
+    assert not floor(source_count=1, engagement_total=999, item_count=1, junk_shape=True)
+    # Non-junk behavior is unchanged, seed count present or not.
+    assert floor(source_count=1, engagement_total=1600, item_count=1,
+                 junk_shape=False, seed_source_count=1)
+    assert floor(source_count=2, engagement_total=30, item_count=2,
+                 junk_shape=False, seed_source_count=1)
