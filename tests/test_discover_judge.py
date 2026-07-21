@@ -426,15 +426,18 @@ def test_clusters_sharing_a_representative_dedupe_to_one():
 # ------------------------------------------------- run_discover threading ----
 
 
-def test_mock_run_never_resolves_runtime():
+def test_mock_run_never_resolves_runtime(capsys):
     """--mock must stay network-clean: subprocess tests inherit ambient env
-    keys, so the mock path may never even construct a live provider."""
+    keys, so the mock path may never even construct a live provider - and it
+    must not emit the no-reasoning-provider fallback note either (the note is
+    for real keyless runs, not deliberate mock runs)."""
     with mock.patch.object(pipeline.providers, "resolve_runtime") as spy:
         report = pipeline.run_discover(
             domain="AI agents", config={}, mock=True, as_of_date="2026-07-10",
         )
     spy.assert_not_called()
     assert report.topics
+    assert "deterministic fallback" not in capsys.readouterr().err
 
 
 def test_live_run_resolves_runtime_once_and_enrichment_gets_judged_name():

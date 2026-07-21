@@ -320,6 +320,251 @@ def test_weak_signal_named_when_all_failures_junk():
     assert report.weak_signal is not None
 
 
+def test_keyless_live_run_emits_reasoning_fallback_note_once(capsys):
+    """A non-mock run with no reasoning provider configured must say so LOUDLY
+    (exactly once) instead of silently degrading to deterministic names."""
+    report = _run_discover_with(
+        {"hackernews": [_hn_item("big1", "Sixty percent of consumers say AI in sports ads is a turnoff", 1084, 577)]},
+    )
+
+    assert report.outcome == "ok"
+    err = capsys.readouterr().err
+    assert err.count("deterministic fallback") == 1
+    assert "no reasoning provider configured" in err
+
+
+# --- Same-story fold + velocity rank order -----------------------------------
+# Real-run regression (2026-07): "China open-weights AI strategy is winning"
+# and "Chinese models" surfaced as two ranked topics quoting the IDENTICAL
+# 1,635-vote comment. Survivors that share enriched evidence are the same
+# story: fold them, keep the higher velocity, and rank by displayed velocity.
+
+KESTREL_TITLE = "Kestrel Avionics Merger Approved"
+SOURDOUGH_TITLE = "Sourdough Robot Bakery Funding"
+
+_SHARED_COMMENT = {
+    "text": "The merger filings quietly admit the avionics unit was insolvent",
+    "score": 1635,
+    "author": "modelwatcher",
+}
+
+
+def _evidence_item(
+    item_id: str,
+    source: str,
+    title: str,
+    url: str,
+    *,
+    score: int = 500,
+    comments: int = 200,
+    top_comments: list[dict] | None = None,
+) -> schema.SourceItem:
+    engagement = (
+        {"score": score, "num_comments": comments}
+        if source == "reddit"
+        else {"points": score, "comments": comments}
+    )
+    return schema.SourceItem(
+        item_id=item_id, source=source, title=title, body=title,
+        url=url, published_at="2026-07-09",
+        engagement=engagement, snippet=title,
+        metadata={"top_comments": top_comments} if top_comments else {},
+    )
+
+
+def _fake_report(topic: str, items: list[schema.SourceItem]) -> schema.Report:
+    by_source: dict[str, list[schema.SourceItem]] = {}
+    for item in items:
+        by_source.setdefault(item.source, []).append(item)
+    return schema.Report(
+        topic=topic,
+        range_from="2026-06-10", range_to="2026-07-10",
+        generated_at="2026-07-10T00:00:00+00:00",
+        provider_runtime=schema.ProviderRuntime(
+            reasoning_provider="none",
+            planner_model="deterministic",
+            rerank_model="deterministic",
+        ),
+        query_plan=schema.QueryPlan(
+            intent="factual", freshness_mode="balanced_recent",
+            cluster_mode="none", raw_topic=topic, subqueries=[],
+            source_weights={},
+        ),
+        clusters=[], ranked_candidates=[],
+        items_by_source=by_source, errors_by_source={},
+    )
+
+
+def _run_discover_enriched(reports_by_key: dict[str, list[schema.SourceItem]]):
+    """Two strong seed stories (Kestrel first / higher seed velocity), each
+    enriched via a fake pipeline.run keyed on the topic name. Returns the
+    report plus the angle entries the stage-2 pass was handed."""
+    seed = {"hackernews": [
+        _hn_item("k1", KESTREL_TITLE, 900, 400),
+        _hn_item("s1", SOURDOUGH_TITLE, 700, 300),
+    ]}
+
+    def fake_run(*, topic, **_kwargs):
+        for key, items in reports_by_key.items():
+            if key in topic.lower():
+                return _fake_report(topic, items)
+        raise AssertionError(f"unexpected enrichment topic: {topic!r}")
+
+    captured_angle_entries: list[dict[str, str]] = []
+
+    def spy_angles(*, domain, entries, provider, model):
+        captured_angle_entries.extend(entries)
+        return None
+
+    with mock.patch.object(pipeline, "run", side_effect=fake_run), mock.patch.object(
+        pipeline.discovery_judge, "generate_discovery_angles", side_effect=spy_angles,
+    ):
+        report = _run_discover_with(seed, enrich=True)
+    return report, captured_angle_entries
+
+
+def test_same_story_survivors_fold_to_higher_velocity_one(capsys):
+    """Two distinct-named survivors quoting the IDENTICAL top comment (and
+    sharing 2 evidence URLs) are one story: only the higher-velocity one
+    ships, a fold line reaches stderr, ranks are contiguous from 1, and the
+    angle-entry list matches the surviving topics."""
+    report, angle_entries = _run_discover_enriched({
+        "kestrel": [
+            _evidence_item("ka", "reddit", KESTREL_TITLE,
+                           "https://reddit.com/r/aero/comments/shared1",
+                           score=900, comments=300, top_comments=[_SHARED_COMMENT]),
+            _evidence_item("kb", "hackernews", KESTREL_TITLE,
+                           "https://news.example.com/shared2",
+                           score=500, comments=200),
+        ],
+        "sourdough": [
+            _evidence_item("sa", "reddit", SOURDOUGH_TITLE,
+                           "https://reddit.com/r/aero/comments/shared1",
+                           score=300, comments=100, top_comments=[_SHARED_COMMENT]),
+            _evidence_item("sb", "hackernews", SOURDOUGH_TITLE,
+                           "https://news.example.com/shared2",
+                           score=200, comments=80),
+        ],
+    })
+
+    assert report.outcome == "ok"
+    assert len(report.topics) == 1
+    survivor = report.topics[0]
+    assert survivor.rank == 1
+    assert "kestrel" in survivor.name.lower()
+    err = capsys.readouterr().err
+    assert "folded duplicate story" in err
+    assert [entry["topic_id"] for entry in angle_entries] == ["topic-1"]
+    assert [entry["name"] for entry in angle_entries] == [survivor.name]
+
+
+def test_distinct_stories_do_not_fold():
+    """No shared URLs, different comments: both genuinely distinct stories
+    survive with contiguous ranks."""
+    report, angle_entries = _run_discover_enriched({
+        "kestrel": [
+            _evidence_item("ka", "reddit", KESTREL_TITLE,
+                           "https://reddit.com/r/aero/comments/k1",
+                           score=900, comments=300,
+                           top_comments=[{"text": "Regulators folded like a cheap suit here", "score": 40, "author": "a"}]),
+            _evidence_item("kb", "hackernews", KESTREL_TITLE,
+                           "https://news.example.com/k2", score=500, comments=200),
+        ],
+        "sourdough": [
+            _evidence_item("sa", "reddit", SOURDOUGH_TITLE,
+                           "https://reddit.com/r/bread/comments/s1",
+                           score=300, comments=100,
+                           top_comments=[{"text": "The starter culture is doing the heavy lifting", "score": 30, "author": "b"}]),
+            _evidence_item("sb", "hackernews", SOURDOUGH_TITLE,
+                           "https://news.example.com/s2", score=200, comments=80),
+        ],
+    })
+
+    assert len(report.topics) == 2
+    assert [topic.rank for topic in report.topics] == [1, 2]
+    assert [entry["topic_id"] for entry in angle_entries] == ["topic-1", "topic-2"]
+
+
+def test_rank_order_follows_displayed_velocity():
+    """Seed order inverts enriched velocity: rank 1 must be the topic with the
+    higher DISPLAYED velocity, and rank values equal list positions."""
+    report, _ = _run_discover_enriched({
+        # Kestrel is the stronger SEED story but enriches thin.
+        "kestrel": [
+            _evidence_item("ka", "reddit", KESTREL_TITLE,
+                           "https://reddit.com/r/aero/comments/k1",
+                           score=100, comments=50),
+            _evidence_item("kb", "hackernews", KESTREL_TITLE,
+                           "https://news.example.com/k2", score=60, comments=20),
+        ],
+        "sourdough": [
+            _evidence_item("sa", "reddit", SOURDOUGH_TITLE,
+                           "https://reddit.com/r/bread/comments/s1",
+                           score=900, comments=300),
+            _evidence_item("sb", "hackernews", SOURDOUGH_TITLE,
+                           "https://news.example.com/s2", score=500, comments=200),
+        ],
+    })
+
+    assert len(report.topics) == 2
+    assert [topic.rank for topic in report.topics] == [1, 2]
+    assert "sourdough" in report.topics[0].name.lower()
+    assert "kestrel" in report.topics[1].name.lower()
+    assert report.topics[0].velocity_score > report.topics[1].velocity_score
+
+
+def test_url_only_overlap_folds_without_shared_comment(capsys):
+    """No top comments at all, but 3 shared evidence URLs: still one story."""
+    shared_urls = [
+        "https://reddit.com/r/aero/comments/shared1",
+        "https://reddit.com/r/aero/comments/shared2",
+        "https://news.example.com/shared3",
+    ]
+    report, _ = _run_discover_enriched({
+        "kestrel": [
+            _evidence_item("ka", "reddit", KESTREL_TITLE, shared_urls[0], score=900, comments=300),
+            _evidence_item("kb", "reddit", KESTREL_TITLE, shared_urls[1], score=400, comments=100),
+            _evidence_item("kc", "hackernews", KESTREL_TITLE, shared_urls[2], score=500, comments=200),
+        ],
+        "sourdough": [
+            _evidence_item("sa", "reddit", SOURDOUGH_TITLE, shared_urls[0], score=300, comments=100),
+            _evidence_item("sb", "reddit", SOURDOUGH_TITLE, shared_urls[1], score=100, comments=40),
+            _evidence_item("sc", "hackernews", SOURDOUGH_TITLE, shared_urls[2], score=200, comments=80),
+        ],
+    })
+
+    assert len(report.topics) == 1
+    assert report.topics[0].rank == 1
+    assert "kestrel" in report.topics[0].name.lower()
+    assert "folded duplicate story" in capsys.readouterr().err
+
+
+def test_single_shared_url_with_different_comments_does_not_fold():
+    """Exactly 1 shared URL and different top comments is corroboration
+    overlap, not the same story."""
+    report, _ = _run_discover_enriched({
+        "kestrel": [
+            _evidence_item("ka", "reddit", KESTREL_TITLE,
+                           "https://reddit.com/r/aero/comments/k1",
+                           score=900, comments=300,
+                           top_comments=[{"text": "Regulators folded like a cheap suit here", "score": 40, "author": "a"}]),
+            _evidence_item("kb", "hackernews", KESTREL_TITLE,
+                           "https://news.example.com/shared", score=500, comments=200),
+        ],
+        "sourdough": [
+            _evidence_item("sa", "reddit", SOURDOUGH_TITLE,
+                           "https://reddit.com/r/bread/comments/s1",
+                           score=300, comments=100,
+                           top_comments=[{"text": "The starter culture is doing the heavy lifting", "score": 30, "author": "b"}]),
+            _evidence_item("sb", "hackernews", SOURDOUGH_TITLE,
+                           "https://news.example.com/shared", score=200, comments=80),
+        ],
+    })
+
+    assert len(report.topics) == 2
+    assert [topic.rank for topic in report.topics] == [1, 2]
+
+
 def test_passes_discovery_floor_junk_params():
     floor = rerank.passes_discovery_floor
     # Junk + single seed source: no engagement bypass, however huge.

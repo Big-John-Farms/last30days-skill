@@ -41,6 +41,7 @@ from . import (
     linkedin,
     library,
     library_index,
+    log,
     normalize,
     permission_preflight,
     perplexity,
@@ -1051,6 +1052,14 @@ def run_discover(
     if not mock:
         judge_runtime, judge_provider = providers.resolve_runtime(config, depth)
         judge_model = judge_runtime.rerank_model if judge_provider else None
+        if judge_provider is None:
+            log.source_log(
+                "Discover",
+                "topic names and angles are using the deterministic fallback - "
+                "no reasoning provider configured (set GEMINI_API_KEY, "
+                "XAI_API_KEY, OPENROUTER_API_KEY, or OpenAI auth)",
+                tty_only=False,
+            )
     available = list(DISCOVERY_SOURCES) if mock else [
         source for source in available_sources(config, requested, x_pending=False)
         if source in DISCOVERY_SOURCES
@@ -1132,8 +1141,7 @@ def run_discover(
             EnrichedTopic(nomination=nomination) for nomination in nominations
         ]
 
-    topics: list[schema.DiscoveryTopic] = []
-    angle_entries: list[dict[str, str]] = []
+    survivors: list[dict[str, Any]] = []
     weak_signal: tuple[float, str] | None = None
     junk_weak_signal: tuple[float, str] | None = None
     for entry in enriched_entries:
@@ -1165,7 +1173,7 @@ def run_discover(
             elif weak_signal is None or score > weak_signal[0]:
                 weak_signal = (score, nomination.name)
             continue
-        if len(topics) >= topic_limit:
+        if len(survivors) >= topic_limit:
             break
         source_phrase = ", ".join(sources[:-1]) + (
             f" and {sources[-1]}" if len(sources) > 1 else (sources[0] if sources else "the listings")
@@ -1177,19 +1185,6 @@ def run_discover(
             f"{nomination.summary[:220]}"
         )
         top_comment = _best_community_comment(evidence_items) if entry.report is not None else None
-        topics.append(schema.DiscoveryTopic(
-            rank=len(topics) + 1,
-            name=nomination.name,
-            why_spiking=why,
-            momentum=_discovery_momentum(evidence_items, to_date),
-            velocity_score=round(score, 2),
-            sources=sources,
-            engagement_by_source=_discovery_engagement(evidence_items),
-            command=f'/last30days "{nomination.name.replace(chr(34), chr(39))}"',
-            evidence_urls=list(dict.fromkeys(item.url for item in evidence_items if item.url))[:5],
-            top_comment=top_comment,
-            corroboration_count=len(sources),
-        ))
         # Stage-2 angle input: the survivor's strongest evidence, enriched
         # corpus when the pipeline pass succeeded, seed items otherwise
         # (evidence_items already resolves that).
@@ -1202,12 +1197,76 @@ def run_discover(
             )
             if item.title and item.title.strip()
         ][:3]
-        angle_entries.append({
-            "topic_id": f"topic-{len(topics)}",
+        survivors.append({
             "name": nomination.name,
+            "why": why,
+            "momentum": _discovery_momentum(evidence_items, to_date),
+            "velocity_score": round(score, 2),
+            "sources": sources,
+            "engagement_by_source": _discovery_engagement(evidence_items),
+            "evidence_urls": list(dict.fromkeys(item.url for item in evidence_items if item.url))[:5],
+            "top_comment": top_comment,
             "titles": "; ".join(top_titles),
-            "top_comment": top_comment or "",
-            "engagement": f"{native_total:,.0f} native interactions across {source_phrase}",
+            "engagement_phrase": f"{native_total:,.0f} native interactions across {source_phrase}",
+        })
+
+    # Same-story fold: floor survivors that share enriched evidence are the
+    # SAME story wearing two judged names (the real-run failure: two topics
+    # quoting the identical 1,635-vote comment). Duplicates = identical
+    # non-None top comment OR >= 2 shared evidence URLs; the lower-velocity
+    # twin is dropped. Selection above stays seed-ordered; this only prunes.
+    def _same_story(a: dict[str, Any], b: dict[str, Any]) -> bool:
+        if a["top_comment"] is not None and a["top_comment"] == b["top_comment"]:
+            return True
+        return len(set(a["evidence_urls"]) & set(b["evidence_urls"])) >= 2
+
+    folded: list[dict[str, Any]] = []
+    for record in survivors:
+        dup_index = next(
+            (index for index, kept in enumerate(folded) if _same_story(record, kept)),
+            None,
+        )
+        if dup_index is None:
+            folded.append(record)
+            continue
+        kept = folded[dup_index]
+        if record["velocity_score"] > kept["velocity_score"]:
+            folded[dup_index] = record
+            dropped_name, kept_name = kept["name"], record["name"]
+        else:
+            dropped_name, kept_name = record["name"], kept["name"]
+        log.source_log(
+            "Discover",
+            f"folded duplicate story {dropped_name!r} into {kept_name!r} (shared evidence)",
+            tty_only=False,
+        )
+
+    # Presentation order follows displayed velocity (stable sort): rank 1 is
+    # the highest velocity_score, ranks equal 1-based list positions.
+    folded.sort(key=lambda record: record["velocity_score"], reverse=True)
+
+    topics: list[schema.DiscoveryTopic] = []
+    angle_entries: list[dict[str, str]] = []
+    for position, record in enumerate(folded, start=1):
+        topics.append(schema.DiscoveryTopic(
+            rank=position,
+            name=record["name"],
+            why_spiking=record["why"],
+            momentum=record["momentum"],
+            velocity_score=record["velocity_score"],
+            sources=record["sources"],
+            engagement_by_source=record["engagement_by_source"],
+            command=f'/last30days "{record["name"].replace(chr(34), chr(39))}"',
+            evidence_urls=record["evidence_urls"],
+            top_comment=record["top_comment"],
+            corroboration_count=len(record["sources"]),
+        ))
+        angle_entries.append({
+            "topic_id": f"topic-{position}",
+            "name": record["name"],
+            "titles": record["titles"],
+            "top_comment": record["top_comment"] or "",
+            "engagement": record["engagement_phrase"],
         })
 
     # Stage-2 angle pass: ONE batched call over the floor survivors turns
@@ -3525,17 +3584,22 @@ def _google_key(config: dict[str, Any]) -> str | None:
 
 
 def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[dict], dict]:
+    # Namespace URLs and the canned comment by topic: real runs never hand two
+    # distinct stories byte-identical evidence, and discovery's same-story fold
+    # (correctly) collapses topics that share it. Mock enrichment sub-runs feed
+    # this fixture one topic per subquery, so the slug keeps them distinct.
+    slug = re.sub(r"[^a-z0-9]+", "-", subquery.search_query.lower()).strip("-") or "topic"
     payloads = {
         "reddit": [
             {
                 "id": "R1",
                 "title": f"{subquery.search_query} discussion thread",
-                "url": "https://reddit.com/r/example/comments/1",
+                "url": f"https://reddit.com/r/example/comments/{slug}-1",
                 "subreddit": "example",
                 "date": dates.get_date_range(5)[0],
                 "engagement": {"score": 120, "num_comments": 48, "upvote_ratio": 0.91},
                 "selftext": f"Community discussion about {subquery.search_query}.",
-                "top_comments": [{"excerpt": "Strong firsthand feedback from users."}],
+                "top_comments": [{"excerpt": f"Strong firsthand feedback from {subquery.search_query} users."}],
                 "relevance": 0.82,
                 "why_relevant": "Mock Reddit result",
             }
@@ -3544,7 +3608,7 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
             {
                 "id": "X1",
                 "text": f"People on X are discussing {subquery.search_query} right now.",
-                "url": "https://x.com/example/status/1",
+                "url": f"https://x.com/example/status/{slug}-1",
                 "author_handle": "example",
                 "date": dates.get_date_range(2)[0],
                 "engagement": {"likes": 200, "reposts": 35, "replies": 18, "quotes": 4},
@@ -3556,7 +3620,7 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
             {
                 "id": "WB1",
                 "title": f"{subquery.search_query} article",
-                "url": "https://example.com/article",
+                "url": f"https://example.com/article/{slug}",
                 "source_domain": "example.com",
                 "snippet": f"Recent web reporting about {subquery.search_query}.",
                 "date": dates.get_date_range(7)[0],
@@ -3568,7 +3632,7 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
             {
                 "id": "mock1abc",
                 "title": f"Digg cluster about {subquery.search_query}",
-                "url": "https://di.gg/ai/mock1abc",
+                "url": f"https://di.gg/ai/mock1abc-{slug}",
                 "tldr": f"Curated cluster summarizing recent {subquery.search_query} discussion across the AI 1000.",
                 "author": "",
                 "date": dates.get_date_range(3)[0],
@@ -3592,7 +3656,7 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
             {
                 "id": "mock2def",
                 "title": f"Second Digg cluster on {subquery.search_query}",
-                "url": "https://di.gg/ai/mock2def",
+                "url": f"https://di.gg/ai/mock2def-{slug}",
                 "tldr": f"Another angle on {subquery.search_query}.",
                 "author": "",
                 "date": dates.get_date_range(8)[0],
@@ -3605,9 +3669,9 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
         ],
         "arxiv": [
             {
-                "id": "http://arxiv.org/abs/2606.00001v1",
+                "id": f"http://arxiv.org/abs/2606.00001v1-{slug}",
                 "title": f"A Survey of {subquery.search_query}",
-                "url": "https://arxiv.org/abs/2606.00001v1",
+                "url": f"https://arxiv.org/abs/2606.00001v1-{slug}",
                 "summary": f"We present a comprehensive study of {subquery.search_query} and its recent advances.",
                 "author": "Ada Lovelace et al.",
                 "authors": ["Ada Lovelace", "Alan Turing"],
@@ -3619,9 +3683,9 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
         ],
         "techmeme": [
             {
-                "id": "https://www.techmeme.com/260627/p1",
+                "id": f"https://www.techmeme.com/260627/p1-{slug}",
                 "title": f"Major development in {subquery.search_query} reshapes the industry",
-                "url": "https://www.techmeme.com/260627/p1",
+                "url": f"https://www.techmeme.com/260627/p1-{slug}",
                 "source_name": "techcrunch.com",
                 "date": dates.get_date_range(1)[0],
                 "engagement": {},
@@ -3633,7 +3697,7 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
             {
                 "id": "DS1",
                 "title": f"Deep dive: {subquery.search_query} from a paid newsletter",
-                "url": "https://newsletter.example.com/deep-dive",
+                "url": f"https://newsletter.example.com/deep-dive-{slug}",
                 "author": "newsletter.example.com",
                 "date": dates.get_date_range(3)[0],
                 "engagement": {},
@@ -3652,7 +3716,7 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
             {
                 "id": "example.com",
                 "title": f"{subquery.search_query}: TrustScore 3.4",
-                "url": "https://www.trustpilot.com/review/example.com",
+                "url": f"https://www.trustpilot.com/review/{slug}.example.com",
                 "summary": f"Across recent reviews, customers were split on {subquery.search_query}: some praised support, others cited delays.",
                 "name": subquery.search_query,
                 "trustScore": 3.4,
@@ -3667,7 +3731,7 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
             {
                 "id": "J1",
                 "title": "Founding Enterprise Solutions Engineer",
-                "url": "https://boards.greenhouse.io/example/jobs/1",
+                "url": f"https://boards.greenhouse.io/example/jobs/{slug}-1",
                 "description": (
                     f"Work with enterprise customers on SSO, SOC 2, security, "
                     f"and procurement workflows for {subquery.search_query}."
@@ -3682,7 +3746,7 @@ def _mock_stream_results(source: str, subquery: schema.SubQuery) -> tuple[list[d
             {
                 "id": "J2",
                 "title": "Security Platform Engineer",
-                "url": "https://boards.greenhouse.io/example/jobs/2",
+                "url": f"https://boards.greenhouse.io/example/jobs/{slug}-2",
                 "description": "Build enterprise security, audit, and admin workflows.",
                 "department": "Engineering",
                 "location": "Remote",
