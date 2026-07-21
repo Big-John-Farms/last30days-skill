@@ -9,13 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Discovery is now a three-command host-judged protocol (SKILL.md LAW 11: "YOU ARE THE JUDGE"): `--discover --nominate-only` writes a nominations bundle and a fenced judging digest, the hosting model writes a judgments file (short names, junk flags, worthiness) and later an angles file, and `--discover --judgments <file>` / `--discover --finalize [--angles <file>]` complete the run. No API key is ever needed for host-judged trending. ([#XXX](https://github.com/mvanhorn/last30days-skill/pull/XXX))
-- Discovery protocol runs enrich at the normal-research tier (default depth, 4 workers, `LAST30DAYS_ENRICH_BUDGET_SECONDS` default 450s) instead of the 240s quick sweep; one-shot `--discover` keeps the quick tier unchanged. ([#XXX](https://github.com/mvanhorn/last30days-skill/pull/XXX))
-- Displayed discovery ranks now descend by the card's velocity score, and survivors sharing evidence (same top comment or 2+ shared URLs) fold into the higher-velocity story. ([#XXX](https://github.com/mvanhorn/last30days-skill/pull/XXX))
+- Discovery is now a three-command host-judged protocol (SKILL.md LAW 11: "YOU ARE THE JUDGE"): `--discover --nominate-only` writes a nominations bundle and a fenced judging digest, the hosting model writes a judgments file (short names, junk flags, worthiness) and later an angles file, and `--discover --judgments <file>` / `--discover --finalize [--angles <file>]` complete the run. No API key is ever needed for host-judged trending. ([#856](https://github.com/mvanhorn/last30days-skill/pull/856))
+- Discovery protocol runs enrich at the normal-research tier (default depth, 4 workers, `LAST30DAYS_ENRICH_BUDGET_SECONDS` default 450s) instead of the 240s quick sweep; one-shot `--discover` keeps the quick tier unchanged. ([#856](https://github.com/mvanhorn/last30days-skill/pull/856))
+- Displayed discovery ranks now descend by the card's velocity score, and survivors sharing evidence (same top comment or 2+ shared URLs) fold into the higher-velocity story. ([#856](https://github.com/mvanhorn/last30days-skill/pull/856))
 
 ### Removed
 
-- The engine-side discovery LLM judge (`lib/discovery_judge.py` and all reasoning-provider resolution in the discovery path). One-shot cron runs use deterministic heuristic names, velocity-only order, and no angles, with one loud stderr note pointing at the host-judged protocol. Keyed one-shot users lose provider naming/angles by design - the protocol replaces them. ([#XXX](https://github.com/mvanhorn/last30days-skill/pull/XXX))
+- The engine-side discovery LLM judge (`lib/discovery_judge.py` and all reasoning-provider resolution in the discovery path). One-shot cron runs use deterministic heuristic names, velocity-only order, and no angles, with one loud stderr note pointing at the host-judged protocol. Keyed one-shot users lose provider naming/angles by design - the protocol replaces them. ([#856](https://github.com/mvanhorn/last30days-skill/pull/856))
 
 ## [3.17.0] - 2026-07-21
 
