@@ -1290,9 +1290,11 @@ def _fold_same_story_records(survivors: list[dict[str, Any]]) -> list[dict[str, 
     Floor survivors that share enriched evidence are the SAME story wearing
     two judged names (the real-run failure: two topics quoting the identical
     1,635-vote comment). Duplicates = identical non-None top comment OR >= 2
-    shared evidence URLs; the lower-velocity twin is dropped. Selection stays
-    seed-ordered upstream; this only prunes, then sorts by displayed velocity
-    (stable) so rank 1 is the highest velocity_score.
+    shared evidence URLs; the lower-velocity twin is dropped, and a winning
+    replacement re-scans the kept list to a fixpoint so chained overlap
+    (A~C~B) still collapses to one survivor. Selection stays seed-ordered
+    upstream; this only prunes, then sorts by displayed velocity (stable) so
+    rank 1 is the highest velocity_score.
     """
     def _same_story(a: dict[str, Any], b: dict[str, Any]) -> bool:
         if a["top_comment"] is not None and a["top_comment"] == b["top_comment"]:
@@ -1301,24 +1303,32 @@ def _fold_same_story_records(survivors: list[dict[str, Any]]) -> list[dict[str, 
 
     folded: list[dict[str, Any]] = []
     for record in survivors:
-        dup_index = next(
-            (index for index, kept in enumerate(folded) if _same_story(record, kept)),
-            None,
-        )
-        if dup_index is None:
-            folded.append(record)
-            continue
-        kept = folded[dup_index]
-        if record["velocity_score"] > kept["velocity_score"]:
-            folded[dup_index] = record
-            dropped_name, kept_name = kept["name"], record["name"]
-        else:
-            dropped_name, kept_name = record["name"], kept["name"]
-        log.source_log(
-            "Discover",
-            f"folded duplicate story {dropped_name!r} into {kept_name!r} (shared evidence)",
-            tty_only=False,
-        )
+        # Fold to a fixpoint: when the incoming record REPLACES a kept one,
+        # the replacement may share evidence with entries the dropped record
+        # never matched (three-way chains: A kept, C shares the comment with
+        # A and URLs with B). The winner re-scans the remaining kept entries
+        # until nothing matches, so one story always yields one survivor.
+        incoming: dict[str, Any] | None = record
+        while incoming is not None:
+            dup_index = next(
+                (index for index, kept in enumerate(folded) if _same_story(incoming, kept)),
+                None,
+            )
+            if dup_index is None:
+                folded.append(incoming)
+                break
+            kept = folded[dup_index]
+            if incoming["velocity_score"] > kept["velocity_score"]:
+                folded.pop(dup_index)
+                dropped_name, kept_name = kept["name"], incoming["name"]
+            else:
+                dropped_name, kept_name = incoming["name"], kept["name"]
+                incoming = None  # dropped; the kept entry stays in place
+            log.source_log(
+                "Discover",
+                f"folded duplicate story {dropped_name!r} into {kept_name!r} (shared evidence)",
+                tty_only=False,
+            )
 
     folded.sort(key=lambda record: record["velocity_score"], reverse=True)
     return folded
@@ -1352,8 +1362,9 @@ def _discovery_report_warnings(
     source_status: dict[str, schema.SourceOutcome],
 ) -> list[str]:
     """Coverage warnings shared by the one-shot and resume discovery paths.
-    The resume leg passes an empty ``source_status`` - it never re-sweeps, so
-    it has no degraded-feed signal to report."""
+    The resume leg never re-sweeps: it passes the bundle's RESTORED leg-1
+    sweep status, so a degraded feed from the sweep still reaches the leg-2
+    report exactly as the one-shot reports it."""
     warnings: list[str] = []
     if outcome == "nothing-solid":
         warnings.append(
@@ -1503,8 +1514,9 @@ class DiscoverResumeResult:
     """Leg 2 output of the host-judged discovery protocol: the floored,
     folded, velocity-ranked report plus the per-topic angle inputs (keyed by
     surviving nomination id) that the host writes leg-3 angles from.
-    ``report.source_status`` is empty by design - leg 2 resumes from the
-    bundle and never re-sweeps the listing feeds."""
+    ``report.source_status`` is the bundle's restored leg-1 sweep status -
+    leg 2 never re-sweeps the listing feeds, so the sweep's degraded-coverage
+    signal must survive the handoff instead of reading as clean."""
 
     report: schema.DiscoveryReport
     angle_inputs: dict[str, dict[str, str]]
@@ -1666,6 +1678,10 @@ def run_discover_resume(
             })
         ),
     )
+    # The bundle's restored leg-1 sweep status (empty for pre-field bundles):
+    # degraded sweep coverage must reach this report's status map and its
+    # degraded-sources warning exactly as the one-shot reports it.
+    source_status = dict(getattr(bundle, "source_status", None) or {})
     report = schema.DiscoveryReport(
         domain=bundle.domain,
         range_from=bundle.from_date,
@@ -1673,8 +1689,8 @@ def run_discover_resume(
         generated_at=datetime.now(timezone.utc).isoformat(),
         plan=plan,
         topics=topics,
-        source_status={},
-        warnings=_discovery_report_warnings(topics, outcome, {}),
+        source_status=source_status,
+        warnings=_discovery_report_warnings(topics, outcome, source_status),
         outcome=outcome,
         weak_signal=weak_signal[1] if weak_signal and not topics else None,
     )

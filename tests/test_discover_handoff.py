@@ -190,6 +190,42 @@ def test_source_boundary_and_shallow_tier_survive_round_trip(tmp_path):
     assert read.lookback_days == 7
 
 
+def test_bundle_round_trips_sweep_source_status_and_mock_flag(tmp_path):
+    """F1a/F19: the leg-1 sweep's per-source outcomes (including degraded
+    states) and the mock provenance flag ride in the bundle so legs 2-3 can
+    restore them - reusing the schema round-trip, never a parallel shape."""
+    status = {
+        "hackernews": schema.SourceOutcome(
+            source="hackernews", state="ok", items_returned=2,
+            at="2026-07-21T00:00:00Z",
+        ),
+        "reddit": schema.SourceOutcome(
+            source="reddit", state=schema.UNREACHABLE, detail="dns failure",
+            at="2026-07-21T00:00:01Z", fix_hint="doctor",
+        ),
+    }
+    written = _write(tmp_path, source_status=status, mock=True)
+    assert written.source_status == status
+    assert written.mock is True
+    read = handoff.read_nominations_bundle(config_dir=tmp_path)
+    assert read.source_status == status
+    assert read.mock is True
+
+
+def test_bundle_reader_defaults_source_status_and_mock_for_older_files(tmp_path):
+    """Older bundles carry neither key: restore an empty status map and a
+    real (mock=False) provenance."""
+    _write(tmp_path)
+    path = tmp_path / handoff.NOMINATIONS_BUNDLE_FILENAME
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload.pop("source_status", None)
+    payload.pop("mock", None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    read = handoff.read_nominations_bundle(config_dir=tmp_path)
+    assert read.source_status == {}
+    assert read.mock is False
+
+
 # --- Scenario 2: parity pin --------------------------------------------------
 
 
@@ -789,6 +825,15 @@ def test_pending_report_round_trip(tmp_path):
     assert pending.report == payload["report"]
     assert pending.angle_inputs == payload["angle_inputs"]
     assert pending.path == tmp_path / handoff.PENDING_REPORT_FILENAME
+
+
+def test_pending_report_parses_mock_flag_defaulting_false(tmp_path):
+    """F19: the pending reader restores the leg-2 mock provenance; files
+    written before the flag existed read as real (mock=False)."""
+    _write_pending(tmp_path, mock=True)
+    assert handoff.read_pending_report(config_dir=tmp_path).mock is True
+    _write_pending(tmp_path)  # no "mock" key at all
+    assert handoff.read_pending_report(config_dir=tmp_path).mock is False
 
 
 def test_pending_report_save_dir_takes_precedence(tmp_path):

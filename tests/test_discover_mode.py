@@ -1875,6 +1875,69 @@ def test_discovery_cli_double_finalize_same_run_ref_counts_once(tmp_path, capsys
     assert row == (1, None)
 
 
+def test_discovery_cli_finalize_retry_with_prior_history_renders_identically(tmp_path, capsys):
+    """F3: a finalize retry over a topic WITH pre-run history reconstructs
+    the pre-run queue state (surface_count minus this run's own recording)
+    instead of nulling the prior - the retry renders the same 'surfaced Nth
+    time' line as the first attempt."""
+    import sqlite3 as _sqlite3
+
+    import store
+
+    with store.scoped_db(tmp_path / "research.db"):
+        store.record_discovery_surfacing(
+            "Gemma 4 chat templates", domain="AI agents", run_ref="run-old",
+            as_of="2026-07-13",
+        )
+    _write_pending_report(tmp_path)
+
+    assert _run_leg3(tmp_path) == 0
+    first = capsys.readouterr().out
+    assert "**Pipeline:** surfaced 2nd time" in first
+
+    assert _run_leg3(tmp_path) == 0
+    second = capsys.readouterr().out
+    assert "**Pipeline:** surfaced 2nd time" in second
+    assert first == second
+
+    # The retry never double-counted the surfacing.
+    conn = _sqlite3.connect(tmp_path / "research.db")
+    count = conn.execute(
+        "SELECT surface_count FROM discovery_topics"
+    ).fetchone()[0]
+    conn.close()
+    assert count == 2
+
+
+def test_discovery_cli_finalize_retry_keeps_covered_history(tmp_path, capsys):
+    """F3: the reconstructed pre-run state keeps the prior's covered mark
+    (covered_at intact), so a retry still renders 'marked covered'."""
+    import store
+
+    with store.scoped_db(tmp_path / "research.db"):
+        store.record_discovery_surfacing(
+            "Gemma 4 chat templates", domain="AI agents", run_ref="run-old",
+            as_of="2026-07-13",
+        )
+        store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-14")
+    _write_pending_report(tmp_path)
+
+    assert _run_leg3(tmp_path) == 0
+    first = capsys.readouterr().out
+    assert "**Pipeline:** surfaced 2nd time, marked covered" in first
+
+    assert _run_leg3(tmp_path) == 0
+    second = capsys.readouterr().out
+    assert "**Pipeline:** surfaced 2nd time, marked covered" in second
+    assert first == second
+
+    with store.scoped_db(tmp_path / "research.db"):
+        row = store.match_discovery_topic("Gemma 4 chat templates")
+    assert row is not None
+    assert row["status"] == "covered"
+    assert row["covered_at"] == "2026-07-14"
+
+
 def test_discovery_cli_finalize_new_run_ref_still_increments(tmp_path, capsys):
     """Scenario 8: the guard is per-run. A LATER protocol round (fresh pending
     report, fresh run_ref) increments and annotates normally."""
@@ -1979,15 +2042,39 @@ def test_discovery_cli_finalize_emit_json_carries_host_angles(tmp_path, capsys):
     assert payload["results"][0]["x_article_angle"] is None
 
 
-def test_discovery_cli_finalize_rejects_html_like_the_one_shot(tmp_path, capsys):
+def test_discovery_cli_finalize_rejects_html_like_the_one_shot(tmp_path):
+    """The HTML guard is hoisted to the shared --discover dispatch: finalize
+    rejects --emit=html before touching any handoff state, even when a valid
+    pending report exists."""
     _write_pending_report(tmp_path)
-    parser = cli.build_parser()
-    args, _extra = parser.parse_known_args([
+    result = _run_protocol_cli([
         "--discover", "AI agents", "--save-dir", str(tmp_path), "--finalize",
         "--emit", "html",
     ])
-    assert cli._run_discover_protocol_leg(args, {}) == 2
-    assert "does not support HTML publishing" in capsys.readouterr().err
+    assert result.returncode == 2, result.stderr
+    assert "does not support HTML publishing" in result.stderr
+
+
+def test_discovery_cli_protocol_legs_reject_as_of_and_html(tmp_path):
+    """F4: the one-shot's --as-of and HTML guards bind on EVERY protocol leg
+    before dispatch - legs 1 and 2 must not sweep historical dates or accept
+    an HTML pipeline discovery does not have."""
+    nominate = _run_protocol_cli([
+        "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+        "--nominate-only", "--as-of", "2026-06-01",
+    ])
+    assert nominate.returncode == 2, nominate.stderr
+    assert "--as-of cannot be used with --discover" in nominate.stderr
+    assert "current live listings" in nominate.stderr
+
+    # The judgments file deliberately does not exist: the guard must fire
+    # before any handoff file is read.
+    judgments = _run_protocol_cli([
+        "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+        "--judgments", str(tmp_path / "missing-judgments.json"), "--emit=html",
+    ])
+    assert judgments.returncode == 2, judgments.stderr
+    assert "does not support HTML publishing" in judgments.stderr
 
 
 def test_discovery_cli_finalize_stale_pending_exits_2(tmp_path, capsys):
@@ -2046,6 +2133,21 @@ def test_discovery_cli_finalize_invalid_pending_json_exits_2(tmp_path, capsys):
     assert "JSON" in capsys.readouterr().err
 
 
+def test_discovery_cli_finalize_malformed_pending_report_body_exits_2(tmp_path, capsys):
+    """F7: a pending file whose top-level envelope validates but whose report
+    body is structurally incomplete (missing required report keys) is a
+    contract failure with the resume remedy - exit 2, never a traceback."""
+    payload = _write_pending_report(tmp_path)
+    payload["report"] = {"domain": "AI agents", "topics": []}  # no range/dates
+    (tmp_path / discovery_handoff.PENDING_REPORT_FILENAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    assert _run_leg3(tmp_path) == 2
+    err = capsys.readouterr().err
+    assert "malformed" in err
+    assert "--discover --judgments" in err
+
+
 def test_discovery_cli_finalize_wrong_kind_or_version_exits_2(tmp_path, capsys):
     payload = _write_pending_report(tmp_path)
     pending_path = tmp_path / discovery_handoff.PENDING_REPORT_FILENAME
@@ -2060,6 +2162,278 @@ def test_discovery_cli_finalize_wrong_kind_or_version_exits_2(tmp_path, capsys):
     pending_path.write_text(json.dumps(payload), encoding="utf-8")
     assert _run_leg3(tmp_path) == 2
     assert "99.0" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores directory permission bits",
+)
+def test_discovery_cli_resume_unwritable_pending_write_is_contract_error(tmp_path, capsys):
+    """F9: the leg-2 pending-report write gets the same fail-closed treatment
+    as the bundle write - a read-only state dir is HandoffContractError
+    (exit 2 naming the path), never a raw OSError traceback."""
+    bundle_payload = _leg1_bundle_payload(tmp_path)
+    capsys.readouterr()
+    judgments_path = tmp_path / "judgments.json"
+    judgments_path.write_text(json.dumps({
+        "bundle_id": bundle_payload["bundle_id"],
+        "judgments": [],
+    }), encoding="utf-8")
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+        "--judgments", str(judgments_path),
+    ])
+
+    def fake_run(*, topic, **_kwargs):
+        return _rich_enrichment_report(topic)
+
+    tmp_path.chmod(0o500)
+    try:
+        with mock.patch.object(pipeline, "run", side_effect=fake_run):
+            assert cli._run_discover_protocol_leg(args, {}) == 2
+    finally:
+        tmp_path.chmod(0o700)
+    err = capsys.readouterr().err
+    assert "Could not write pending discovery report" in err
+    assert str(
+        tmp_path.resolve() / discovery_handoff.PENDING_REPORT_FILENAME
+    ) in err
+
+
+# --- F11: cross-round pending invalidation ------------------------------------
+
+
+def test_discovery_cli_nominate_clears_stale_pending_from_prior_round(tmp_path, capsys):
+    """F11: a fresh leg-1 bundle starts a NEW protocol round - any pending
+    report left by a prior round is deleted, so a bare --finalize afterwards
+    is not-found (exit 2) instead of silently consuming stale state."""
+    _write_pending_report(tmp_path)  # prior round's leg-2 output
+    _leg1_bundle_payload(tmp_path)   # fresh round: leg 1 writes a new bundle
+    capsys.readouterr()
+    assert not (tmp_path / discovery_handoff.PENDING_REPORT_FILENAME).exists()
+
+    assert _run_leg3(tmp_path) == 2
+    assert "No pending discovery report found" in capsys.readouterr().err
+
+
+def test_discovery_cli_resume_nothing_solid_clears_stale_pending(tmp_path, capsys):
+    """F11: a zero-survivor leg 2 wrote no pending file THIS round, so a
+    stale one from an earlier round must not survive it - bare --finalize
+    afterwards exits 2 not-found."""
+    bundle_payload = _leg1_bundle_payload(tmp_path)
+    _write_pending_report(tmp_path)  # stale pending from an earlier round
+    judgments = {
+        "bundle_id": bundle_payload["bundle_id"],
+        "judgments": [
+            {"id": row["id"], "junk": True}
+            for row in bundle_payload["nominations"]
+        ],
+    }
+    with mock.patch.object(pipeline, "enrich_nominations") as enrich:
+        assert _run_leg2(tmp_path, judgments) == 0
+    enrich.assert_not_called()
+    capsys.readouterr()
+    assert not (tmp_path / discovery_handoff.PENDING_REPORT_FILENAME).exists()
+
+    assert _run_leg3(tmp_path) == 2
+    assert "No pending discovery report found" in capsys.readouterr().err
+
+
+# --- F19: mock/real handoff provenance must match across legs ------------------
+
+
+def test_discovery_cli_resume_rejects_mock_state_mismatch(tmp_path, capsys):
+    """F19: a leg-2 run whose --mock flag disagrees with the bundle's stamped
+    provenance exits 2 before any resume work; matching modes still pass."""
+    bundle_payload = _leg1_bundle_payload(tmp_path)  # mock-born bundle
+    capsys.readouterr()
+    judgments_path = tmp_path / "judgments.json"
+    judgments_path.write_text(json.dumps({
+        "bundle_id": bundle_payload["bundle_id"],
+        "judgments": [],
+    }), encoding="utf-8")
+    parser = cli.build_parser()
+    bundle_path = tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME
+
+    # Real leg 2 over the mock-born bundle: exit 2, the resume never runs.
+    args, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--save-dir", str(tmp_path),
+        "--judgments", str(judgments_path),
+    ])
+    with mock.patch.object(pipeline, "run_discover_resume") as resume:
+        assert cli._run_discover_protocol_leg(args, {}) == 2
+    resume.assert_not_called()
+    err = capsys.readouterr().err
+    assert "mock-born state cannot be finalized by a real run" in err
+
+    # Mock leg 2 over a real bundle: the inverse also exits 2.
+    payload = json.loads(bundle_path.read_text(encoding="utf-8"))
+    payload["mock"] = False
+    bundle_path.write_text(json.dumps(payload), encoding="utf-8")
+    args, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+        "--judgments", str(judgments_path),
+    ])
+    with mock.patch.object(pipeline, "run_discover_resume") as resume:
+        assert cli._run_discover_protocol_leg(args, {}) == 2
+    resume.assert_not_called()
+    err = capsys.readouterr().err
+    assert "cannot be finalized by a --mock run" in err
+
+    # Matching modes pass the parity gate and reach the resume engine.
+    payload["mock"] = True
+    bundle_path.write_text(json.dumps(payload), encoding="utf-8")
+    with mock.patch.object(pipeline, "enrich_nominations", return_value=[]):
+        assert cli._run_discover_protocol_leg(args, {}) == 0
+    capsys.readouterr()
+
+
+def test_discovery_cli_finalize_rejects_mock_state_mismatch(tmp_path, capsys):
+    """F19: finalize enforces the same provenance parity against the pending
+    report's stamped mock flag, in both directions."""
+    _write_pending_report(tmp_path)  # real pending (no mock stamp = real)
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+        "--finalize",
+    ])
+    assert cli._run_discover_protocol_leg(args, {}) == 2
+    assert "cannot be finalized by a --mock run" in capsys.readouterr().err
+
+    # Mock-born pending finalized by a real run: inverse direction.
+    pending_path = tmp_path / discovery_handoff.PENDING_REPORT_FILENAME
+    payload = json.loads(pending_path.read_text(encoding="utf-8"))
+    payload["mock"] = True
+    pending_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert _run_leg3(tmp_path) == 2
+    assert (
+        "mock-born state cannot be finalized by a real run"
+        in capsys.readouterr().err
+    )
+
+
+# --- F1: degraded sweep state survives the protocol (strict exit on legs) ------
+
+
+def _degraded_nominate_result() -> pipeline.DiscoverNominateResult:
+    from_date, to_date = dates.get_date_range(30)
+    nomination = pipeline.Nomination(
+        name="Agent SDK Wars",
+        seed_score=61.0,
+        items=[_item(
+            "hn1", "hackernews", "Agent SDK Wars heat up",
+            engagement={"points": 900, "comments": 400},
+        )],
+        summary="Agent SDK Wars heat up across the listings.",
+        junk_shape=False,
+        worthiness=None,
+    )
+    return pipeline.DiscoverNominateResult(
+        plan=schema.DiscoveryPlan(
+            domain="AI agents", category=None, subreddits=[],
+            sources=["hackernews"],
+        ),
+        from_date=from_date,
+        to_date=to_date,
+        source_status={
+            "hackernews": schema.SourceOutcome(
+                source="hackernews", state="ok", items_returned=1,
+            ),
+            "reddit": schema.SourceOutcome(
+                source="reddit", state=schema.UNREACHABLE, detail="dns failure",
+            ),
+        },
+        pool=[(nomination, "c-agent")],
+    )
+
+
+def test_discovery_protocol_strict_exit_and_degraded_state_survive_all_legs(tmp_path, capsys):
+    """F1: the leg-1 sweep's degraded source outcomes ride the bundle into
+    leg 2's report and pending file, and on into leg 3's brief - and under
+    LAST30DAYS_STRICT_EXIT every leg renders normally but exits 3, mirroring
+    the one-shot's strict-exit contract."""
+    strict = {"LAST30DAYS_STRICT_EXIT": "1"}
+    parser = cli.build_parser()
+
+    # Leg 1: bundle written (render/output still happens), exit shifts to 3.
+    args1, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+        "--nominate-only",
+    ])
+    with mock.patch.object(
+        pipeline, "run_discover_nominate",
+        return_value=_degraded_nominate_result(),
+    ):
+        assert cli._run_discover_protocol_leg(args1, strict) == 3
+    captured = capsys.readouterr()
+    assert "strict-exit: degraded sources: reddit" in captured.err
+    bundle_payload = json.loads(
+        (tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert bundle_payload["source_status"]["reddit"]["state"] == schema.UNREACHABLE
+
+    # Leg 2: the restored sweep status reaches the pending report (degraded
+    # warning included) and the exit code stays strict.
+    judgments = {
+        "bundle_id": bundle_payload["bundle_id"],
+        "judgments": [{"id": "n1", "junk": False, "worthiness": 80}],
+    }
+
+    def fake_run(*, topic, **_kwargs):
+        return _rich_enrichment_report(topic)
+
+    with mock.patch.object(pipeline, "run", side_effect=fake_run):
+        assert _run_leg2(tmp_path, judgments, config=strict) == 3
+    captured = capsys.readouterr()
+    assert "strict-exit: degraded sources: reddit" in captured.err
+    pending_payload = json.loads(
+        (tmp_path / discovery_handoff.PENDING_REPORT_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert pending_payload["report"]["source_status"]["reddit"]["state"] == (
+        schema.UNREACHABLE
+    )
+    assert any(
+        "Some discovery sources degraded: reddit" in warning
+        for warning in pending_payload["report"]["warnings"]
+    )
+
+    # Leg 3: the brief renders the degraded coverage note and exits 3 too.
+    args3, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+        "--finalize",
+    ])
+    assert cli._run_discover_protocol_leg(args3, strict) == 3
+    captured = capsys.readouterr()
+    assert "Some discovery sources degraded: reddit" in captured.out
+    assert "strict-exit: degraded sources: reddit" in captured.err
+
+
+def test_discovery_nominate_nothing_solid_applies_strict_exit(tmp_path, capsys):
+    """F1c: the leg-1 nothing-solid short-circuit is a terminal return too -
+    it renders the brief and still exits 3 under strict exit when the sweep
+    itself was degraded."""
+    import dataclasses
+
+    strict = {"LAST30DAYS_STRICT_EXIT": "1"}
+    result = dataclasses.replace(_degraded_nominate_result(), pool=[])
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+        "--nominate-only",
+    ])
+    with mock.patch.object(
+        pipeline, "run_discover_nominate", return_value=result,
+    ):
+        assert cli._run_discover_protocol_leg(args, strict) == 3
+    captured = capsys.readouterr()
+    assert "Nothing solid this window." in captured.out
+    assert "strict-exit: degraded sources: reddit" in captured.err
+    assert not (tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).exists()
 
 
 def test_discovery_cli_full_mock_protocol_three_legs_end_to_end(tmp_path):

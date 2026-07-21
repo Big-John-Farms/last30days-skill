@@ -568,6 +568,56 @@ def test_single_shared_url_with_different_comments_does_not_fold():
     assert [topic.rank for topic in report.topics] == [1, 2]
 
 
+def _fold_record(
+    name: str,
+    velocity: float,
+    urls: list[str],
+    comment: str | None = None,
+) -> dict:
+    """Minimal floor-survivor record: only the fields the fold reads."""
+    return {
+        "name": name,
+        "velocity_score": velocity,
+        "top_comment": comment,
+        "evidence_urls": urls,
+    }
+
+
+def test_fold_three_way_chain_collapses_to_one_survivor(capsys):
+    """F18: after a replacement fold, the survivor re-scans to a fixpoint. A
+    kept, B kept, then C (highest velocity) shares the comment with A and two
+    URLs with B: one survivor, and BOTH folds are logged by name."""
+    a = _fold_record("Story A", 10.0, ["https://a/1", "https://a/2"],
+                     comment="the shared 1,635-vote take")
+    b = _fold_record("Story B", 5.0, ["https://b/1", "https://b/2"])
+    c = _fold_record("Story C", 20.0, ["https://b/1", "https://b/2", "https://c/1"],
+                     comment="the shared 1,635-vote take")
+
+    folded = pipeline._fold_same_story_records([a, b, c])
+
+    assert [record["name"] for record in folded] == ["Story C"]
+    err = capsys.readouterr().err
+    assert "folded duplicate story 'Story A' into 'Story C'" in err
+    assert "folded duplicate story 'Story B' into 'Story C'" in err
+
+
+def test_fold_velocity_inversion_replaces_kept_twin_and_logs_names(capsys):
+    """F13: the first-processed LOWER-velocity twin is replaced by the
+    second-processed higher-velocity twin, and the log line names the right
+    direction (low folded INTO high)."""
+    low = _fold_record("Low velocity twin", 5.0, ["https://s/1", "https://s/2"])
+    high = _fold_record("High velocity twin", 9.0, ["https://s/1", "https://s/2"])
+
+    folded = pipeline._fold_same_story_records([low, high])
+
+    assert [record["name"] for record in folded] == ["High velocity twin"]
+    err = capsys.readouterr().err
+    assert (
+        "folded duplicate story 'Low velocity twin' into 'High velocity twin'"
+        in err
+    )
+
+
 def test_passes_discovery_floor_junk_params():
     floor = rerank.passes_discovery_floor
     # Junk + single seed source: no engagement bypass, however huge.
@@ -951,3 +1001,36 @@ def test_resume_reuses_same_story_fold_and_velocity_ranks(capsys):
     assert set(entry) == {"name", "titles", "top_comment", "engagement"}
     assert entry["name"] == report.topics[0].name
     assert "folded duplicate story" in capsys.readouterr().err
+
+
+def test_resume_report_carries_restored_leg1_source_status_and_warning():
+    """F1b: the resume report's source_status is the bundle's restored leg-1
+    sweep status - a degraded feed from the sweep reaches the leg-2 report
+    and its degraded-sources warning, exactly as the one-shot reports it."""
+    import dataclasses
+
+    status = {
+        "hackernews": schema.SourceOutcome(
+            source="hackernews", state="ok", items_returned=1,
+        ),
+        "reddit": schema.SourceOutcome(
+            source="reddit", state=schema.UNREACHABLE, detail="dns failure",
+        ),
+    }
+    rows = [_bundle_row(
+        "n1", "Window pinned story",
+        [_seed_item("s1", "hackernews", "Window pinned story",
+                    points=900, comments=400)],
+    )]
+    bundle = dataclasses.replace(_resume_bundle(rows), source_status=status)
+    with mock.patch.object(
+        pipeline, "run", side_effect=RuntimeError("enrichment down"),
+    ):
+        result = pipeline.run_discover_resume(bundle, {}, config={})
+
+    report = result.report
+    assert report.source_status == status
+    assert any(
+        "Some discovery sources degraded: reddit" in warning
+        for warning in report.warnings
+    )

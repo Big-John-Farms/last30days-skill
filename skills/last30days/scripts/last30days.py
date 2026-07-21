@@ -1329,6 +1329,29 @@ def _save_discovery_output(
     raise RuntimeError("Could not find a unique discovery output filename")
 
 
+def _pre_run_prior_state(
+    prior: dict[str, object] | None, run_ref: str
+) -> dict[str, object] | None:
+    """Reconstruct the queue state a topic had BEFORE this run identity
+    recorded it.
+
+    A row whose last_run_ref equals THIS run's run_ref was stamped by this
+    very run's own earlier attempt (a finalize retry), so its surface_count
+    already includes this run's surfacing: subtract it and keep the prior's
+    covered state (covered_at intact) so the retry renders exactly like the
+    first attempt did. Only when nothing remains after the subtraction AND
+    the row was never covered is the topic genuinely first-ever (no prior).
+    """
+    if not prior or prior.get("last_run_ref") != run_ref:
+        return prior
+    previously = max(0, int(prior["surface_count"]) - 1)
+    if previously == 0 and prior["status"] != "covered":
+        return None
+    adjusted = dict(prior)
+    adjusted["surface_count"] = previously
+    return adjusted
+
+
 def _annotate_and_record_discovery_queue(
     report: schema.DiscoveryReport,
     args: argparse.Namespace,
@@ -1369,9 +1392,11 @@ def _annotate_and_record_discovery_queue(
         # sibling row this very run recorded seconds earlier, falsely
         # annotating a first-ever topic as "surfaced 2nd time".
         # A row stamped by THIS run identity is this run's own earlier
-        # attempt (finalize retry), not prior state: treat it as no prior.
+        # attempt (finalize retry), not prior state: reconstruct the pre-run
+        # state (count minus this run's own surfacing, covered state kept)
+        # so retries render identically for topics WITH history too.
         priors = [
-            None if prior and prior.get("last_run_ref") == run_ref else prior
+            _pre_run_prior_state(prior, run_ref)
             for prior in (
                 store.match_discovery_topic(topic.name) for topic in report.topics
             )
@@ -1401,6 +1426,110 @@ def _annotate_and_record_discovery_queue(
             )
         annotated.append(topic)
     return dataclasses.replace(report, topics=annotated)
+
+
+def _record_discovery_queue_safely(
+    report: schema.DiscoveryReport,
+    args: argparse.Namespace,
+    config: dict[str, object],
+    run_ref: str | None = None,
+) -> schema.DiscoveryReport:
+    """Annotate + record the discovery queue, degrading a broken research.db
+    (locked, read-only dir, corrupt) to a stderr warning: a queue failure
+    must never destroy a finished pipeline run or the protocol's final
+    brief. Shared verbatim by the one-shot and finalize paths."""
+    try:
+        return _annotate_and_record_discovery_queue(
+            report, args, config, run_ref=run_ref,
+        )
+    except (sqlite3.Error, OSError) as exc:
+        sys.stderr.write(
+            f"[last30days] Warning: discovery queue unavailable ({exc}); "
+            "continuing without queue annotations.\n"
+        )
+        return report
+
+
+def _emit_and_save_discovery_report(
+    report: schema.DiscoveryReport,
+    args: argparse.Namespace,
+    domain: str,
+) -> None:
+    """Render a discovery report per --emit, honor --output/--save-dir, and
+    print it. Shared verbatim by the one-shot and finalize paths."""
+    if args.emit == "json":
+        payload = schema.to_dict(report) if args.json_profile == "raw" else schema.to_discovery_export(report)
+        rendered = json.dumps(payload, indent=2, sort_keys=True)
+    else:
+        rendered = render.render_discovery(report)
+
+    if args.output:
+        output_path = save_rendered_output(rendered, args.output)
+        sys.stderr.write(f"[last30days] Saved output to {output_path}\n")
+    if args.save_dir:
+        save_path = _save_discovery_output(
+            rendered,
+            domain=domain or "trending",
+            emit=args.emit,
+            save_dir=args.save_dir,
+            suffix=args.save_suffix or "",
+        )
+        sys.stderr.write(f"[last30days] Saved output to {save_path}\n")
+    print(rendered)
+
+
+def _discovery_strict_exit_code(
+    source_status: dict[str, schema.SourceOutcome],
+    config: dict[str, object],
+) -> int:
+    """The ONE LAST30DAYS_STRICT_EXIT evaluation for every discovery
+    invocation - the one-shot and all three protocol legs (issue #384's
+    discovery counterpart). Rendering/output already happened by the time
+    this runs; only the exit code shifts to 3 when strict exit is on and any
+    source outcome is neither clean nor an expected skip."""
+    strict = str(config.get("LAST30DAYS_STRICT_EXIT") or "").strip().lower()
+    if strict not in {"1", "true", "yes", "on"}:
+        return 0
+    degraded = sorted(
+        source for source, outcome in (source_status or {}).items()
+        if outcome.state not in _STRICT_EXIT_OK_STATES
+    )
+    if not degraded:
+        return 0
+    sys.stderr.write(
+        f"[last30days] strict-exit: degraded sources: {', '.join(degraded)}\n"
+    )
+    sys.stderr.flush()
+    return 3
+
+
+def _require_discover_mock_parity(
+    loaded_mock: bool,
+    args_mock: bool,
+    *,
+    label: str,
+    path: Path | None,
+) -> None:
+    """A protocol leg's --mock flag must match the loaded handoff file's
+    stamped provenance: mock-born state finalized by a real run would fake a
+    real brief from fixture data, and real state finalized by --mock would
+    silently drop the round's queue write. Mismatch is a contract failure
+    (exit 2 via HandoffContractError)."""
+    if bool(loaded_mock) == bool(args_mock):
+        return
+    location = str(path) if path is not None else "(unknown path)"
+    if loaded_mock:
+        raise discovery_handoff.HandoffContractError(
+            f"{label} {location} is mock-born (a --mock leg wrote it): "
+            "mock-born state cannot be finalized by a real run. Re-run this "
+            "leg with --mock, or start a fresh real `--discover "
+            "--nominate-only` sweep."
+        )
+    raise discovery_handoff.HandoffContractError(
+        f"{label} {location} was written by a real run: real state "
+        "cannot be finalized by a --mock run. Drop --mock, or start a fresh "
+        "`--discover --nominate-only --mock` sweep."
+    )
 
 
 def _run_queue_list(args: argparse.Namespace, config: dict[str, object]) -> int:
@@ -1535,15 +1664,8 @@ def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
     domain = _discover_domain(args)
     # Empty domain = global trending: sweep every river feed's hot list with no
     # keyword gate. The confidence floor is what keeps junk out, not a keyword.
-    if args.as_of_date:
-        sys.stderr.write(
-            "[last30days] --as-of cannot be used with --discover because discovery "
-            "sweeps current live listings.\n"
-        )
-        return 2
-    if args.emit == "html" or args.publish_html:
-        sys.stderr.write("[last30days] discovery mode does not support HTML publishing yet.\n")
-        return 2
+    # (--as-of and HTML rejection live in _main's shared --discover dispatch,
+    # so every leg - one-shot or protocol - applies the same guards.)
     if args.synthesis_file:
         sys.stderr.write("[last30days] Warning: --synthesis-file is not used by discovery mode.\n")
 
@@ -1575,48 +1697,10 @@ def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
     # line and the JSON queue fields see the annotations. Mock runs stay 100%
     # side-effect-free.
     if not args.mock:
-        try:
-            report = _annotate_and_record_discovery_queue(report, args, config)
-        except (sqlite3.Error, OSError) as exc:
-            # A broken queue db (locked, read-only dir, corrupt) must never
-            # destroy a finished multi-minute pipeline run: warn and render
-            # the report without queue annotations (fields keep defaults).
-            sys.stderr.write(
-                f"[last30days] Warning: discovery queue unavailable ({exc}); "
-                "continuing without queue annotations.\n"
-            )
+        report = _record_discovery_queue_safely(report, args, config)
 
-    if args.emit == "json":
-        payload = schema.to_dict(report) if args.json_profile == "raw" else schema.to_discovery_export(report)
-        rendered = json.dumps(payload, indent=2, sort_keys=True)
-    else:
-        rendered = render.render_discovery(report)
-
-    if args.output:
-        output_path = save_rendered_output(rendered, args.output)
-        sys.stderr.write(f"[last30days] Saved output to {output_path}\n")
-    if args.save_dir:
-        save_path = _save_discovery_output(
-            rendered,
-            domain=domain or "trending",
-            emit=args.emit,
-            save_dir=args.save_dir,
-            suffix=args.save_suffix or "",
-        )
-        sys.stderr.write(f"[last30days] Saved output to {save_path}\n")
-    print(rendered)
-
-    strict = str(config.get("LAST30DAYS_STRICT_EXIT") or "").strip().lower()
-    degraded = [
-        source for source, outcome in report.source_status.items()
-        if outcome.state not in _STRICT_EXIT_OK_STATES
-    ]
-    if strict in {"1", "true", "yes", "on"} and degraded:
-        sys.stderr.write(
-            f"[last30days] strict-exit: degraded sources: {', '.join(sorted(degraded))}\n"
-        )
-        return 3
-    return 0
+    _emit_and_save_discovery_report(report, args, domain)
+    return _discovery_strict_exit_code(report.source_status, config)
 
 
 def _discover_handoff_state_dir(args: argparse.Namespace) -> Path | None:
@@ -1637,6 +1721,8 @@ def _run_discover_nominate(args: argparse.Namespace, config: dict[str, object]) 
     this leg - the host judges from the bundle and leg 2 (--judgments)
     resumes from it. A zero-nomination sweep short-circuits to the existing
     nothing-solid brief with NO bundle written: there is nothing to judge.
+    Writing a fresh bundle starts a NEW protocol round, so any pending
+    report left by a prior round is deleted alongside it.
     """
     domain = _discover_domain(args)
     boundary = _resolve_discovery_source_boundary(args, config)
@@ -1661,7 +1747,7 @@ def _run_discover_nominate(args: argparse.Namespace, config: dict[str, object]) 
 
     if not result.pool:
         print(render.render_discovery(pipeline.nominate_nothing_solid_report(result)))
-        return 0
+        return _discovery_strict_exit_code(result.source_status, config)
 
     entries = [
         discovery_handoff.PoolEntry(
@@ -1684,11 +1770,22 @@ def _run_discover_nominate(args: argparse.Namespace, config: dict[str, object]) 
         lookback_days=lookback_days,
         enrichment_source_boundary=enrich_requested_sources,
         requested_sources=requested_sources,
+        # The sweep's finalized per-source outcomes ride the bundle so legs
+        # 2-3 report degraded coverage instead of silently reading clean; the
+        # mock stamp keeps mock-born and real state from cross-finalizing.
+        source_status=result.source_status,
+        mock=args.mock,
         # Same resolution as _discover_handoff_state_dir: save dir when
         # given, else the config dir.
         save_dir=getattr(args, "save_dir", None),
         config_dir=env.CONFIG_DIR,
     )
+    # A fresh bundle starts a NEW protocol round: a pending report left by a
+    # prior round is cross-round state a bare --finalize could silently
+    # consume - delete it (missing file is a no-op).
+    state_dir = _discover_handoff_state_dir(args)
+    if state_dir is not None:
+        discovery_handoff.pending_report_path(state_dir).unlink(missing_ok=True)
     print(discovery_handoff.build_host_digest(bundle))
     print(
         "\nJudgments file schema (leg 2): "
@@ -1697,7 +1794,7 @@ def _run_discover_nominate(args: argparse.Namespace, config: dict[str, object]) 
         '"worthiness": 0-100}, ...]}. '
         "Then resume with: --discover --judgments <path>."
     )
-    return 0
+    return _discovery_strict_exit_code(result.source_status, config)
 
 
 def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) -> int:
@@ -1705,15 +1802,22 @@ def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) ->
     judgments file, run the deep per-topic research pass, and persist the
     ranked result as the pending report for leg 3 (--finalize).
 
-    Contract failures (missing/stale bundle, judgments not bound to it) raise
-    HandoffContractError and map to exit 2 in _run_discover_protocol_leg.
-    Zero floor survivors renders the nothing-solid brief right here: exit 0,
-    no pending file, no leg 3. No queue writes and no artifact saves happen
-    on this leg - the topic queue and the rendered brief belong to leg 3.
+    Contract failures (missing/stale bundle, judgments not bound to it, a
+    bundle whose mock provenance disagrees with this run's --mock flag, an
+    unwritable pending-report path) raise HandoffContractError and map to
+    exit 2 in _run_discover_protocol_leg. Zero floor survivors renders the
+    nothing-solid brief right here (clearing any stale prior-round pending
+    file): no pending file, no leg 3. No queue writes and no artifact saves
+    happen on this leg - the topic queue and the rendered brief belong to
+    leg 3.
     """
     save_dir = getattr(args, "save_dir", None)
     bundle = discovery_handoff.read_nominations_bundle(
         save_dir=save_dir, config_dir=env.CONFIG_DIR,
+    )
+    _require_discover_mock_parity(
+        bundle.mock, args.mock,
+        label="Nominations bundle", path=bundle.path,
     )
     judgments = discovery_handoff.read_judgments(
         args.judgments, bundle, save_dir=save_dir, config_dir=env.CONFIG_DIR,
@@ -1725,8 +1829,14 @@ def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) ->
 
     if not report.topics:
         # Nothing cleared the floor: the honest brief ends the protocol here.
+        # This round wrote no pending file, so a stale one from an earlier
+        # round must not survive to feed a bare --finalize (missing file is
+        # a no-op).
+        state_dir = _discover_handoff_state_dir(args)
+        if state_dir is not None:
+            discovery_handoff.pending_report_path(state_dir).unlink(missing_ok=True)
         print(render.render_discovery(report))
-        return 0
+        return _discovery_strict_exit_code(report.source_status, config)
 
     state_dir = _discover_handoff_state_dir(args)
     if state_dir is None:
@@ -1746,6 +1856,9 @@ def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) ->
         "generated_at": report.generated_at,
         # Same run_ref format the queue records (leg 3 replays it verbatim).
         "run_ref": f"discover:{report.domain or 'trending'}:{report.generated_at}",
+        # Leg-2 provenance: leg 3 refuses to finalize across the mock/real
+        # boundary in either direction.
+        "mock": bool(args.mock),
         # Full schema round-trip (the _write_last_run precedent): leg 3
         # rebuilds the report from this dict instead of re-running anything.
         "report": schema.to_dict(report),
@@ -1753,8 +1866,15 @@ def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) ->
     }
     # ONE post-loop write from the main thread; enrichment workers are daemon
     # threads and never touch disk.
-    state_dir.mkdir(parents=True, exist_ok=True)
-    pending_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        pending_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except OSError as exc:
+        # A locked/read-only/full disk is the protocol's clean exit-2 path,
+        # never a traceback (same contract as the bundle write).
+        raise discovery_handoff.HandoffContractError(
+            f"Could not write pending discovery report {pending_path}: {exc}"
+        ) from exc
 
     print(
         f"Judged discovery resume: {len(report.topics)} topic"
@@ -1772,14 +1892,15 @@ def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) ->
         "above.\n"
         "Then finalize with: --discover --finalize --angles <path>."
     )
-    return 0
+    return _discovery_strict_exit_code(report.source_status, config)
 
 
 def _run_discover_finalize(args: argparse.Namespace, config: dict[str, object]) -> int:
     """Protocol leg 3: load the leg-2 pending report, apply host angles,
     render the final brief, save discovery artifacts, and record the topic
     queue. The cheap offline leg - no sweep, no enrichment, no providers,
-    no network; everything renders from the pending report.
+    no network; everything renders from the pending report. (HTML/--as-of
+    rejection lives in _main's shared --discover dispatch.)
 
     Contract failures (missing/stale/mismatched pending report or angles)
     raise HandoffContractError and map to exit 2 in
@@ -1791,19 +1912,28 @@ def _run_discover_finalize(args: argparse.Namespace, config: dict[str, object]) 
     """
     import dataclasses
 
-    if args.emit == "html" or args.publish_html:
-        # Same contract as the one-shot: discovery has no HTML pipeline yet.
-        sys.stderr.write("[last30days] discovery mode does not support HTML publishing yet.\n")
-        return 2
-
     save_dir = getattr(args, "save_dir", None)
     pending = discovery_handoff.read_pending_report(
         save_dir=save_dir, config_dir=env.CONFIG_DIR,
     )
+    _require_discover_mock_parity(
+        pending.mock, args.mock,
+        label="Pending discovery report", path=pending.path,
+    )
     angles = discovery_handoff.read_angles(
         args.angles, pending, save_dir=save_dir, config_dir=env.CONFIG_DIR,
     )
-    report = schema.discovery_report_from_dict(pending.report)
+    try:
+        report = schema.discovery_report_from_dict(pending.report)
+    except (KeyError, TypeError, ValueError) as exc:
+        # The envelope validated but the report body is structurally
+        # incomplete: a contract failure with the resume remedy, never a
+        # traceback out of the finalize leg.
+        raise discovery_handoff.HandoffContractError(
+            f"Pending discovery report {pending.path} carries a malformed "
+            f"report body ({type(exc).__name__}: {exc}). "
+            f"{discovery_handoff._RESUME_REMEDY}"
+        ) from exc
 
     if angles:
         # Host angles are keyed by nomination id; the pending report's
@@ -1829,39 +1959,12 @@ def _run_discover_finalize(args: argparse.Namespace, config: dict[str, object]) 
     # under the leg-2 run identity (pending.run_ref) so finalize retries are
     # idempotent. Mock runs stay 100% side-effect-free.
     if not args.mock:
-        try:
-            report = _annotate_and_record_discovery_queue(
-                report, args, config, run_ref=pending.run_ref or None,
-            )
-        except (sqlite3.Error, OSError) as exc:
-            # A broken queue db (locked, read-only dir, corrupt) must never
-            # destroy the protocol's final brief: warn and render the report
-            # without queue annotations (fields keep defaults).
-            sys.stderr.write(
-                f"[last30days] Warning: discovery queue unavailable ({exc}); "
-                "continuing without queue annotations.\n"
-            )
-
-    if args.emit == "json":
-        payload = schema.to_dict(report) if args.json_profile == "raw" else schema.to_discovery_export(report)
-        rendered = json.dumps(payload, indent=2, sort_keys=True)
-    else:
-        rendered = render.render_discovery(report)
-
-    if args.output:
-        output_path = save_rendered_output(rendered, args.output)
-        sys.stderr.write(f"[last30days] Saved output to {output_path}\n")
-    if args.save_dir:
-        save_path = _save_discovery_output(
-            rendered,
-            domain=report.domain or "trending",
-            emit=args.emit,
-            save_dir=args.save_dir,
-            suffix=args.save_suffix or "",
+        report = _record_discovery_queue_safely(
+            report, args, config, run_ref=pending.run_ref or None,
         )
-        sys.stderr.write(f"[last30days] Saved output to {save_path}\n")
-    print(rendered)
-    return 0
+
+    _emit_and_save_discovery_report(report, args, report.domain)
+    return _discovery_strict_exit_code(report.source_status, config)
 
 
 def _run_discover_protocol_leg(
@@ -2628,6 +2731,18 @@ def _main(
             return 2
         if args.drill:
             sys.stderr.write("[last30days] --discover and --drill are mutually exclusive.\n")
+            return 2
+        # Shared guards for EVERY discover invocation - the one-shot and all
+        # three protocol legs - hoisted here so no leg can drift: discovery
+        # sweeps live listings (never --as-of) and has no HTML pipeline yet.
+        if args.as_of_date:
+            sys.stderr.write(
+                "[last30days] --as-of cannot be used with --discover because discovery "
+                "sweeps current live listings.\n"
+            )
+            return 2
+        if args.emit == "html" or args.publish_html:
+            sys.stderr.write("[last30days] discovery mode does not support HTML publishing yet.\n")
             return 2
         # The three protocol legs are one-leg-per-invocation: each pairing
         # below asks for two legs at once, so name the combination and stop.

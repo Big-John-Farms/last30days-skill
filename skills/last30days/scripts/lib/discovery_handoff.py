@@ -110,7 +110,14 @@ class BundleNomination:
 
 @dataclass(frozen=True)
 class NominationsBundle:
-    """A parsed leg-1 nominations bundle (also returned by the writer)."""
+    """A parsed leg-1 nominations bundle (also returned by the writer).
+
+    ``source_status`` is the leg-1 sweep's finalized per-source outcome map:
+    legs 2 and 3 restore it so degraded sweep coverage survives the protocol
+    instead of silently reading as clean. ``mock`` is the writing run's
+    provenance - mock-born state must never be finalized by a real run (and
+    vice versa); files written before either field existed read as an empty
+    map and a real run."""
 
     schema_version: str
     bundle_id: str
@@ -123,6 +130,8 @@ class NominationsBundle:
     requested_sources: list[str] | None
     lookback_days: int
     nominations: list[BundleNomination]
+    source_status: dict[str, schema.SourceOutcome] = field(default_factory=dict)
+    mock: bool = False
     path: Path | None = None
 
 
@@ -164,6 +173,9 @@ class PendingReport:
     run_ref: str
     report: dict[str, Any]
     angle_inputs: dict[str, dict[str, str]]
+    # Leg-2 provenance: True when a --mock resume wrote this file. Files
+    # written before the flag existed read as real (False).
+    mock: bool = False
     path: Path | None = None
 
 
@@ -231,6 +243,8 @@ def write_nominations_bundle(
     lookback_days: int,
     enrichment_source_boundary: list[str] | None,
     requested_sources: list[str] | None,
+    source_status: dict[str, schema.SourceOutcome] | None = None,
+    mock: bool = False,
     save_dir: str | Path | None = None,
     config_dir: Path | None = None,
 ) -> NominationsBundle:
@@ -240,7 +254,10 @@ def write_nominations_bundle(
     invocation context (enrichment source boundary, requested discovery
     sources, lookback days) rides along so leg 2 resumes with identical
     settings. ``None`` boundaries are preserved as null - "no boundary" and
-    "empty boundary" are different contracts.
+    "empty boundary" are different contracts. ``source_status`` is the
+    sweep's finalized per-source outcome map (serialized via the same
+    ``schema.to_dict`` round trip every report uses) so degraded coverage
+    survives into legs 2-3; ``mock`` stamps the writing run's provenance.
     """
     if tier not in _VALID_TIERS:
         raise ValueError(f"tier must be one of {_VALID_TIERS}, got {tier!r}")
@@ -287,6 +304,11 @@ def write_nominations_bundle(
         "to_date": to_date,
         "domain": domain,
         "tier": tier,
+        "mock": bool(mock),
+        "source_status": {
+            source: schema.to_dict(outcome)
+            for source, outcome in (source_status or {}).items()
+        },
         "context": {
             "enrichment_source_boundary": (
                 list(enrichment_source_boundary)
@@ -328,6 +350,8 @@ def write_nominations_bundle(
         ),
         lookback_days=int(lookback_days),
         nominations=nominations,
+        source_status=dict(source_status or {}),
+        mock=bool(mock),
         path=path,
     )
 
@@ -489,6 +513,15 @@ def _parse_bundle_file(path: Path) -> NominationsBundle:
             f"(leg 1 never writes an empty pool). {_RESWEEP_REMEDY}"
         )
 
+    # Sweep status is advisory coverage context: restore it through the same
+    # deserializer every report uses, but degrade a malformed map to empty
+    # rather than discarding an otherwise-valid pool.
+    try:
+        source_status = schema._source_status_from_dict(payload)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        _warn(f"ignoring malformed source_status map in {path.name}")
+        source_status = {}
+
     return NominationsBundle(
         schema_version=str(version),
         bundle_id=bundle_id,
@@ -507,6 +540,8 @@ def _parse_bundle_file(path: Path) -> NominationsBundle:
         ),
         lookback_days=lookback_days,
         nominations=nominations,
+        source_status=source_status,
+        mock=bool(payload.get("mock")),
         path=path,
     )
 
@@ -572,6 +607,7 @@ def _parse_pending_file(path: Path) -> PendingReport:
         run_ref=str(payload.get("run_ref") or ""),
         report=report,
         angle_inputs=angle_inputs,
+        mock=bool(payload.get("mock")),
         path=path,
     )
 
