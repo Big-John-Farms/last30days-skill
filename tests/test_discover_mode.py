@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import subprocess
@@ -8,7 +9,7 @@ from unittest import mock
 import pytest
 
 import last30days as cli
-from lib import pipeline, planner, reddit_listing, render, rerank, schema
+from lib import discovery_handoff, pipeline, planner, reddit_listing, render, rerank, schema
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1177,3 +1178,135 @@ def test_discovery_exits_when_configured_sources_have_no_discovery_feed(monkeypa
     err = capsys.readouterr().err
     assert "no discovery-capable sources" in err
     assert "reddit" in err
+
+
+# --- U2: three-command protocol CLI surface (flags, scoping, dispatch) ---
+
+
+def _run_protocol_cli(argv: list[str], env_overrides: dict[str, str] | None = None):
+    """Run the real CLI entry point; env overrides layer onto the test env."""
+    return subprocess.run(
+        [sys.executable, "skills/last30days/scripts/last30days.py", *argv],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, **(env_overrides or {})},
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "fragment"),
+    [
+        # Orphans: protocol flags without --discover reject loudly (never a
+        # silent no-op into a normal research run - same rule as
+        # --discover-shallow).
+        (
+            ["AI agents", "--nominate-only", "--mock"],
+            "--nominate-only only applies to --discover runs",
+        ),
+        (
+            ["AI agents", "--judgments", "judgments.json", "--mock"],
+            "--judgments only applies to --discover runs",
+        ),
+        (
+            ["AI agents", "--finalize", "--mock"],
+            "--finalize only applies to --discover runs",
+        ),
+        (
+            ["AI agents", "--angles", "angles.json", "--mock"],
+            "--angles only applies to --discover --finalize runs",
+        ),
+        # --angles is a --finalize modifier even when --discover is present.
+        (
+            ["--discover", "AI agents", "--angles", "angles.json", "--mock"],
+            "--angles only applies to --discover --finalize runs",
+        ),
+        # The three legs are mutually exclusive: one leg per invocation.
+        (
+            ["--discover", "AI agents", "--nominate-only", "--judgments", "j.json"],
+            "--nominate-only and --judgments are mutually exclusive",
+        ),
+        (
+            ["--discover", "AI agents", "--nominate-only", "--finalize"],
+            "--nominate-only and --finalize are mutually exclusive",
+        ),
+        (
+            ["--discover", "AI agents", "--judgments", "j.json", "--finalize"],
+            "--judgments and --finalize are mutually exclusive",
+        ),
+    ],
+)
+def test_discovery_cli_protocol_flag_combinations_exit_2(argv, fragment):
+    """Every orphan/mutual-exclusion combination names the offending flags."""
+    result = _run_protocol_cli(argv)
+    assert result.returncode == 2, result.stderr
+    assert fragment in result.stderr
+
+
+@pytest.mark.parametrize(
+    "leg_argv",
+    [
+        ["--nominate-only"],
+        ["--judgments", "judgments.json"],
+        ["--finalize"],
+    ],
+)
+def test_discovery_cli_mock_protocol_leg_requires_save_dir(leg_argv):
+    """--mock protocol legs without --save-dir would write handoff state into
+    the real config dir; reject before any leg runs. LAST30DAYS_MEMORY_DIR is
+    pinned empty so a dev machine's save-dir fallback can't mask the check."""
+    result = _run_protocol_cli(
+        ["--discover", "AI agents", "--mock", *leg_argv],
+        env_overrides={"LAST30DAYS_MEMORY_DIR": ""},
+    )
+    assert result.returncode == 2, result.stderr
+    assert "mock protocol legs require --save-dir to stay side-effect-free" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("leg_argv", "marker"),
+    [
+        (["--nominate-only"], "nominate-only leg"),
+        (["--judgments", "judgments.json"], "judgments resume leg"),
+        (["--finalize"], "finalize leg"),
+    ],
+)
+def test_discovery_cli_protocol_flags_reach_their_leg_stub(tmp_path, leg_argv, marker):
+    """With --save-dir, each protocol flag routes to its own leg. The legs are
+    U3-U5 stubs for now, so the distinct NotImplementedError message is the
+    dispatch evidence (U3-U5 will retarget these pins to real behavior)."""
+    result = _run_protocol_cli(
+        ["--discover", "AI agents", "--mock", "--save-dir", str(tmp_path), *leg_argv],
+    )
+    assert result.returncode == 1, result.stderr
+    assert "NotImplementedError" in result.stderr
+    assert marker in result.stderr
+
+
+def test_discover_handoff_state_dir_scopes_to_save_dir_then_config(tmp_path, monkeypatch):
+    """One resolver for all three legs: save dir when given, else config dir
+    (the same base the report cache uses)."""
+    save_dir = tmp_path / "client"
+    resolved = cli._discover_handoff_state_dir(argparse.Namespace(save_dir=str(save_dir)))
+    assert resolved == save_dir.resolve()
+
+    monkeypatch.setattr(cli.env, "CONFIG_DIR", tmp_path / "config")
+    resolved = cli._discover_handoff_state_dir(argparse.Namespace(save_dir=None))
+    assert resolved == tmp_path / "config"
+
+
+def test_discovery_protocol_dispatch_maps_contract_error_to_exit_2(monkeypatch, capsys):
+    """HandoffContractError raised inside any leg body maps to stderr + exit 2
+    at the dispatch layer, so U3-U5 leg bodies can raise it freely."""
+
+    def _stale_bundle(_args, _config):
+        raise discovery_handoff.HandoffContractError(
+            "Nominations bundle is stale; run a fresh re-sweep."
+        )
+
+    monkeypatch.setattr(cli, "_run_discover_nominate", _stale_bundle)
+    args = argparse.Namespace(nominate_only=True, judgments=None, finalize=False)
+    assert cli._run_discover_protocol_leg(args, {}) == 2
+    err = capsys.readouterr().err
+    assert "Nominations bundle is stale; run a fresh re-sweep." in err

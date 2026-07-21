@@ -49,7 +49,7 @@ if os.name == "nt":
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from lib import corpus, dates, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, schema, ui
+from lib import corpus, dates, discovery_handoff, env, freshness, html_render, http, permission_preflight, pipeline, registers, render, schema, ui
 
 _child_pids: set[int] = set()
 _child_pids_lock = threading.Lock()
@@ -529,6 +529,41 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Skip the per-topic research pass during --discover: rank on listing "
             "evidence only (faster, thinner; the confidence floor still applies)"
+        ),
+    )
+    parser.add_argument(
+        "--nominate-only",
+        action="store_true",
+        help=(
+            "Leg 1 of the host-judged discovery protocol: sweep, write the "
+            "nominations bundle for host judgment, and stop (no judging, no "
+            "enrichment). Requires --discover"
+        ),
+    )
+    parser.add_argument(
+        "--judgments",
+        metavar="PATH",
+        help=(
+            "Leg 2 of the discovery protocol: resume from the nominations "
+            "bundle, applying the host judgments file at PATH. Requires "
+            "--discover"
+        ),
+    )
+    parser.add_argument(
+        "--finalize",
+        action="store_true",
+        help=(
+            "Leg 3 of the discovery protocol: apply host angles, render the "
+            "final discovery brief, and record the topic queue. Requires "
+            "--discover"
+        ),
+    )
+    parser.add_argument(
+        "--angles",
+        metavar="PATH",
+        help=(
+            "Optional host angles file for --discover --finalize (omitting it "
+            "ships the brief without angle lines)"
         ),
     )
     parser.add_argument("--debug", action="store_true", help="Enable HTTP debug logging")
@@ -1547,6 +1582,56 @@ def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
     return 0
 
 
+def _discover_handoff_state_dir(args: argparse.Namespace) -> Path | None:
+    """One resolver for every protocol leg's handoff files: the save dir when
+    given (mirroring _scoped_store_db's scoping), else the config dir - the
+    same base _last_report_cache_path uses. args.save_dir is read AFTER the
+    LAST30DAYS_MEMORY_DIR fallback in _main resolved it."""
+    return discovery_handoff.handoff_state_dir(
+        getattr(args, "save_dir", None), env.CONFIG_DIR
+    )
+
+
+def _run_discover_nominate(args: argparse.Namespace, config: dict[str, object]) -> int:
+    """Protocol leg 1: sweep and write the nominations bundle (U3 stub)."""
+    raise NotImplementedError(
+        "--discover --nominate-only leg is not implemented yet (U3 replaces this stub)"
+    )
+
+
+def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) -> int:
+    """Protocol leg 2: apply host judgments and enrich (U4 stub)."""
+    raise NotImplementedError(
+        "--discover --judgments resume leg is not implemented yet (U4 replaces this stub)"
+    )
+
+
+def _run_discover_finalize(args: argparse.Namespace, config: dict[str, object]) -> int:
+    """Protocol leg 3: apply angles, render, record the queue (U5 stub)."""
+    raise NotImplementedError(
+        "--discover --finalize leg is not implemented yet (U5 replaces this stub)"
+    )
+
+
+def _run_discover_protocol_leg(
+    args: argparse.Namespace, config: dict[str, object]
+) -> int:
+    """Route one validated protocol invocation to its leg. Contract failures
+    (unreadable/stale/mismatched handoff files) map to stderr + exit 2 here,
+    so the leg bodies (U3-U5) raise HandoffContractError freely."""
+    try:
+        if args.nominate_only:
+            return _run_discover_nominate(args, config)
+        # --judgments dispatch keys on flag presence (is not None), matching
+        # the --discover convention: never on the path string's truthiness.
+        if args.judgments is not None:
+            return _run_discover_resume(args, config)
+        return _run_discover_finalize(args, config)
+    except discovery_handoff.HandoffContractError as exc:
+        sys.stderr.write(f"[last30days] {exc.message}\n")
+        return 2
+
+
 _STRICT_EXIT_OK_STATES = {"ok", "no-results", "skipped-unconfigured"}
 
 
@@ -2293,6 +2378,42 @@ def _main(
         if args.drill:
             sys.stderr.write("[last30days] --discover and --drill are mutually exclusive.\n")
             return 2
+        # The three protocol legs are one-leg-per-invocation: each pairing
+        # below asks for two legs at once, so name the combination and stop.
+        # (--judgments/--angles dispatch on presence, never path truthiness.)
+        for first, second, conflict in (
+            ("--nominate-only", "--judgments", args.nominate_only and args.judgments is not None),
+            ("--nominate-only", "--finalize", args.nominate_only and args.finalize),
+            ("--judgments", "--finalize", args.judgments is not None and args.finalize),
+        ):
+            if conflict:
+                sys.stderr.write(
+                    f"[last30days] {first} and {second} are mutually exclusive: "
+                    "each runs a different leg of the discovery protocol.\n"
+                )
+                return 2
+        if args.angles is not None and not args.finalize:
+            sys.stderr.write(
+                "[last30days] --angles only applies to --discover --finalize "
+                "runs; add --finalize or drop the flag.\n"
+            )
+            return 2
+        protocol_leg = (
+            args.nominate_only or args.judgments is not None or args.finalize
+        )
+        if protocol_leg and args.mock and not args.save_dir:
+            # Truthiness is right here: an empty --save-dir/env value means
+            # "no save dir", and handoff state would land in the real config
+            # dir - a side effect mock runs must never have.
+            sys.stderr.write(
+                "[last30days] mock protocol legs require --save-dir to stay "
+                "side-effect-free: --mock with --nominate-only/--judgments/"
+                "--finalize would otherwise write handoff state into the real "
+                "config dir.\n"
+            )
+            return 2
+        if protocol_leg:
+            return _run_discover_protocol_leg(args, config)
         return _run_discover(args, config)
 
     if args.discover_shallow:
@@ -2301,6 +2422,26 @@ def _main(
         sys.stderr.write(
             "[last30days] --discover-shallow only applies to --discover runs; "
             "add --discover [domain] or drop the flag.\n"
+        )
+        return 2
+
+    # Same orphan rule for every protocol-leg flag: without --discover each
+    # would silently no-op into a normal research run.
+    for flag_label, present in (
+        ("--nominate-only", args.nominate_only),
+        ("--judgments", args.judgments is not None),
+        ("--finalize", args.finalize),
+    ):
+        if present:
+            sys.stderr.write(
+                f"[last30days] {flag_label} only applies to --discover runs; "
+                "add --discover [domain] or drop the flag.\n"
+            )
+            return 2
+    if args.angles is not None:
+        sys.stderr.write(
+            "[last30days] --angles only applies to --discover --finalize runs; "
+            "add --discover --finalize or drop the flag.\n"
         )
         return 2
 
