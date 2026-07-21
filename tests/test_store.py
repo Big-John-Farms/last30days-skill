@@ -1042,6 +1042,65 @@ def test_match_discovery_topic_empty_queue_returns_none(temp_db):
     assert store.match_discovery_topic("Anything at all") is None
 
 
+def test_record_discovery_surfacing_inherit_covered_creates_row_born_covered(temp_db):
+    """A fresh row recorded with inherit_covered_at is born covered - the
+    caller passes it when the name fuzzy-matched an already-covered prior,
+    so a user's covered mark survives judge naming drift (review #7)."""
+    row = store.record_discovery_surfacing(
+        "Gemma 4 template fixes", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+        inherit_covered_at="2026-07-14",
+    )
+
+    assert row["status"] == "covered"
+    assert row["covered_at"] == "2026-07-14"
+    assert row["surface_count"] == 1
+
+
+def test_record_discovery_surfacing_inherit_never_alters_existing_row_status(temp_db):
+    """The ON CONFLICT path ignores inherit_covered_at: an existing surfaced
+    row stays surfaced, and an existing covered row stays covered with its
+    original covered_at."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+        inherit_covered_at="2026-07-14",
+    )
+    assert row["status"] == "surfaced"
+    assert row["covered_at"] is None
+
+    store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-21")
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-3", as_of="2026-07-22",
+        inherit_covered_at=None,
+    )
+    assert row["status"] == "covered"
+    assert row["covered_at"] == "2026-07-21"
+
+
+def test_covered_status_survives_judge_rename_across_runs(temp_db):
+    """Flip-flop regression (review #7): cover name A; a fuzzy-matching
+    rename B is recorded born-covered; resurfacing B exact-matches its own
+    covered row, so the covered mark never silently evaporates."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-14")
+
+    prior = store.match_discovery_topic("Gemma 4 template fixes")
+    assert prior is not None and prior["status"] == "covered"
+    store.record_discovery_surfacing(
+        "Gemma 4 template fixes", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+        inherit_covered_at=prior["covered_at"],
+    )
+
+    exact = store.match_discovery_topic("Gemma 4 template fixes")
+    assert exact is not None
+    assert exact["status"] == "covered"
+    assert exact["covered_at"] == "2026-07-14"
+
+
 def test_mark_discovery_covered_by_exact_name(temp_db):
     store.record_discovery_surfacing(
         "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",

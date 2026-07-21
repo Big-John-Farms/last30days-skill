@@ -1327,13 +1327,20 @@ def _annotate_and_record_discovery_queue(
         # sibling row this very run recorded seconds earlier, falsely
         # annotating a first-ever topic as "surfaced 2nd time".
         priors = [store.match_discovery_topic(topic.name) for topic in report.topics]
-        # Phase 2: record this run's surfacings.
-        for topic in report.topics:
+        # Phase 2: record this run's surfacings. A topic whose (possibly
+        # fuzzy) prior row is covered inherits that covered state, so a
+        # user's covered mark survives judge naming drift instead of
+        # silently forking into a fresh uncovered row.
+        for topic, prior in zip(report.topics, priors):
+            inherit_covered_at = None
+            if prior and prior["status"] == "covered":
+                inherit_covered_at = prior["covered_at"] or prior["last_surfaced"]
             store.record_discovery_surfacing(
                 topic.name,
                 domain=report.domain,
                 run_ref=run_ref,
                 as_of=as_of,
+                inherit_covered_at=inherit_covered_at,
             )
     for topic, prior in zip(report.topics, priors):
         if prior:

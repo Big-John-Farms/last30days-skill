@@ -844,6 +844,7 @@ def record_discovery_surfacing(
     domain: str = "",
     run_ref: str = "",
     as_of: str = "",
+    inherit_covered_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Upsert a queue row by normalized name.
 
@@ -857,24 +858,32 @@ def record_discovery_surfacing(
     non-empty. ``domain`` is normalized to "" here (never NULL bound) so the
     column's storage convention stays consistent regardless of whether a
     caller passes "" or None.
+
+    ``inherit_covered_at`` makes a FRESH row be born covered (status
+    'covered', covered_at set to the given date). Callers pass it when this
+    name fuzzy-matched an already-covered prior row, so a user's covered
+    mark survives judge naming drift instead of forking into a fresh
+    uncovered row. An existing row's status/covered_at are never modified
+    by this function - the ON CONFLICT path deliberately ignores it.
     """
     init_db()
     domain = domain or ""
     normalized = _normalize_discovery_name(name)
     entity_key = _discovery_entity_key(name)
+    status = "covered" if inherit_covered_at else "surfaced"
     conn = _connect()
     try:
         conn.execute(
             """INSERT INTO discovery_topics
                (name, normalized_name, entity_key, domain, first_surfaced,
-                last_surfaced, surface_count, last_run_ref)
-               VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                last_surfaced, surface_count, last_run_ref, status, covered_at)
+               VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                ON CONFLICT(normalized_name) DO UPDATE SET
                    surface_count = surface_count + 1,
                    last_surfaced = excluded.last_surfaced,
                    last_run_ref = excluded.last_run_ref,
                    domain = CASE WHEN excluded.domain <> '' THEN excluded.domain ELSE domain END""",
-            (name, normalized, entity_key, domain, as_of, as_of, run_ref),
+            (name, normalized, entity_key, domain, as_of, as_of, run_ref, status, inherit_covered_at),
         )
         conn.commit()
         row = conn.execute(
