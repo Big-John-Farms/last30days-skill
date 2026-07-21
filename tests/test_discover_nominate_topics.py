@@ -2,11 +2,13 @@
 candidate topics.
 
 nominate_topics() is the contract between the nominate stage and the
-enrichment fan-out: names ordered by seed velocity, deduped casefold, never
-padded past what the evidence supports.
+enrichment fan-out: short distilled names ordered by worthiness-blended seed
+velocity, casefold-collision-safe, never padded past what the evidence
+supports. The heuristic (no-provider) naming path is pinned here; the LLM
+stage-1 judge path lives in test_discover_judge.py.
 """
 
-from lib import pipeline, schema
+from lib import pipeline, schema, topic_shape
 
 
 def _item(
@@ -120,6 +122,68 @@ def test_zero_velocity_clusters_are_dropped():
         to_date="2026-07-10", limit=8,
     )
     assert nominations == []
+
+
+# Real-run shapes from the motivating 2026-07 discovery sweep (see topic_shape).
+ANECDOTE_TITLE = (
+    "My coworker let an AI agent handle Slack replies while he was "
+    '"unavailable." It did not go well.'
+)
+HELP_TITLE = "I need help starting to learn about AI agents"
+
+
+def test_names_are_short_distilled_topics_not_raw_titles():
+    """The nomination's name IS the enrichment search query and the
+    /last30days handoff - anecdote/question scaffolding must not leak into it."""
+    items = [
+        _item("story1", "hackernews", ANECDOTE_TITLE,
+              engagement={"points": 400, "comments": 100}),
+    ]
+    nominations = pipeline.nominate_topics(
+        _bundle(items), _query_plan("AI agents", ["hackernews"]),
+        _plan("AI agents", ["hackernews"]),
+        to_date="2026-07-10", limit=10,
+    )
+    assert nominations
+    name = nominations[0].name
+    assert len(name.split()) <= 6
+    assert not name.lower().startswith("my coworker")
+
+
+def test_no_provider_names_are_distilled_and_deterministic():
+    """provider=None (keyless/mock) is the pure-heuristic path: names come
+    from topic_shape.distill_topic_name, junk flags from is_junk_shape, and
+    two identical runs produce identical output - no LLM, no randomness."""
+    items = [
+        _item("story1", "hackernews", ANECDOTE_TITLE,
+              engagement={"points": 400, "comments": 100}),
+        _item("junk1", "hackernews", HELP_TITLE,
+              engagement={"points": 200, "comments": 50}),
+    ]
+    bundle = _bundle(items)
+
+    def run() -> list[pipeline.Nomination]:
+        return pipeline.nominate_topics(
+            bundle, _query_plan("AI agents", ["hackernews"]),
+            _plan("AI agents", ["hackernews"]),
+            to_date="2026-07-10", limit=10, provider=None, model=None,
+        )
+
+    first, second = run(), run()
+    assert [nomination.name for nomination in first] == [
+        nomination.name for nomination in second
+    ]
+    assert [nomination.junk_shape for nomination in first] == [
+        nomination.junk_shape for nomination in second
+    ]
+
+    by_leader = {nomination.items[0].item_id: nomination for nomination in first}
+    story = by_leader["story1"]
+    assert story.name == topic_shape.distill_topic_name(ANECDOTE_TITLE)
+    assert story.junk_shape is False
+    assert by_leader["junk1"].junk_shape is True
+    # No provider -> no worthiness signal; ranking stays velocity-only.
+    assert all(nomination.worthiness is None for nomination in first)
 
 
 def test_nomination_carries_leader_summary_and_items():

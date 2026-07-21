@@ -7,7 +7,9 @@ import math
 import re
 from datetime import datetime
 
-from . import http, providers, query, schema, signals
+from typing import NamedTuple
+
+from . import http, log, providers, query, schema, signals
 
 
 # Penalty applied when a candidate does not mention the primary entity
@@ -115,6 +117,27 @@ def passes_discovery_floor(
     if source_count >= FLOOR_MIN_SOURCES:
         return True
     return engagement_total >= FLOOR_SINGLE_SOURCE_ENGAGEMENT
+
+
+# Stage-1 discovery judge (nominate stage). The top JUDGE_POOL_LIMIT clusters
+# by velocity get ONE batched LLM verdict each (short searchable name, junk
+# flag, 0-100 content-worthiness); clusters beyond the pool keep heuristic
+# names and their velocity-only score. Worthiness blends into the ranking
+# score as
+#   blended = velocity * (JUDGE_BLEND_BASE + worthiness / 100)
+# so velocity stays dominant (the multiplier spans 0.5x-1.5x) but a quiet,
+# highly content-worthy cluster can overtake a viral junk one. A missing
+# worthiness (heuristic fallback, judge skipped a row) is neutral at 50 -
+# the multiplier is exactly 1.0, i.e. the plain velocity score.
+JUDGE_POOL_LIMIT = 15
+JUDGE_BLEND_BASE = 0.5
+
+
+def judge_blended_score(velocity: float, worthiness: float | None) -> float:
+    """Velocity-dominant, worthiness-weighted ranking score (constants above)."""
+    effective = 50.0 if worthiness is None else max(0.0, min(100.0, worthiness))
+    return velocity * (JUDGE_BLEND_BASE + effective / 100.0)
+
 
 # Engagement rescue: a high-engagement X post that is on-topic (entity-grounded
 # or first-party) cannot be fully zeroed by the other penalties. The floor is a
@@ -659,6 +682,123 @@ def _final_score(candidate: schema.Candidate) -> float:
     return base
 
 
+
+
+class DiscoveryJudgeVerdict(NamedTuple):
+    """One cluster's stage-1 judge verdict (see judge_discovery_topics)."""
+
+    short_name: str
+    junk_shape: bool
+    worthiness: float | None
+
+
+def judge_discovery_topics(
+    *,
+    domain: str,
+    entries: list[dict[str, str]],
+    provider: providers.ReasoningClient | None,
+    model: str | None,
+) -> dict[str, DiscoveryJudgeVerdict] | None:
+    """Stage-1 discovery judge: one batched LLM call naming and scoring the
+    nominated topic clusters BEFORE enrichment.
+
+    ``entries`` carries one dict per cluster: ``topic_id`` plus the leader's
+    ``title`` and ``snippet`` (fenced as untrusted in the prompt). Returns a
+    mapping keyed by ``topic_id``; a key missing from a structurally valid
+    response means the model skipped that cluster and the caller falls back
+    per-cluster to the topic_shape heuristics. Returns ``None`` when no
+    provider is configured or the call failed outright, signalling a
+    whole-pool heuristic fallback. Never raises.
+    """
+    if not (provider and model and entries):
+        return None
+    try:
+        payload = provider.generate_json(
+            model, _build_discovery_judge_prompt(domain, entries)
+        )
+        return _parse_discovery_judge_payload(payload)
+    except (ValueError, KeyError, json.JSONDecodeError, OSError, http.HTTPError) as exc:
+        log.source_log(
+            "Discover",
+            f"stage-1 judge failed, using heuristic topic names: "
+            f"{type(exc).__name__}: {exc}",
+            tty_only=False,
+        )
+        return None
+
+
+def _build_discovery_judge_prompt(domain: str, entries: list[dict[str, str]]) -> str:
+    entry_block = "\n".join(
+        "\n".join([
+            f"- topic_id: {entry['topic_id']}",
+            f"  title: {str(entry.get('title') or '')[:220]}",
+            f"  snippet: {str(entry.get('snippet') or '')[:420]}",
+        ])
+        for entry in entries
+    )
+    domain_label = domain or "global trending (no domain filter)"
+    return (
+        "You are the stage-1 topic judge for a trend-research tool. Each entry "
+        "below is one candidate trending TOPIC (the leading post of a cluster "
+        "of community chatter). The names you produce become search queries "
+        "and podcast/article research briefs.\n\n"
+        f"Domain being swept: {domain_label}\n\n"
+        "For EVERY entry return one verdict:\n"
+        "- short_name: a short SEARCHABLE topic name, 2-6 words. Name the "
+        "underlying entities, launches, or debates (products, models, "
+        "companies, events, controversies). Strip question/anecdote "
+        "scaffolding. No punctuation, no quote characters. Names must be "
+        "unique within this batch: when two entries cover different stories "
+        "about the same entity, add a distinguishing word to each.\n"
+        "- junk_shape: true when the post shape is not content-worthy: "
+        "help-me/beginner questions, personal musings, am-I-the-only-one "
+        "asks. Launches and entity-bearing news statements are not junk.\n"
+        "- worthiness: 0-100. Would this make a good podcast or article "
+        "topic for a tech-savvy audience? Judge novelty, stakes, "
+        "specificity, and discussion-worthiness. 90+ is a story people "
+        "would subscribe for; below 20 is filler.\n\n"
+        "Return JSON only:\n"
+        '{"topics": [{"topic_id": "id", "short_name": "2-6 word name", '
+        '"junk_shape": false, "worthiness": 0-100}]}\n\n'
+        f"{_fenced_untrusted_content(entry_block)}"
+    )
+
+
+# Defensive cap on judge-supplied names: they become search queries and the
+# /last30days handoff, so a runaway (or adversarial) response never yields an
+# unbounded string. Mirrors the pre-judge 96-char title cap.
+_JUDGE_NAME_MAX_CHARS = 96
+
+
+def _parse_discovery_judge_payload(payload: dict) -> dict[str, DiscoveryJudgeVerdict]:
+    verdicts: dict[str, DiscoveryJudgeVerdict] = {}
+    for row in payload.get("topics") or []:
+        if not isinstance(row, dict):
+            continue
+        topic_id = str(row.get("topic_id") or "").strip()
+        name = " ".join(str(row.get("short_name") or "").split())
+        name = name.strip(" \"'`.,;:!?-")
+        if len(name) > _JUDGE_NAME_MAX_CHARS:
+            name = name[:_JUDGE_NAME_MAX_CHARS].rsplit(" ", 1)[0].rstrip(" \"'`.,;:!?-")
+        if not topic_id or not name:
+            # Missing identity or name: treat the row as absent so the caller
+            # falls back to the deterministic heuristics for that cluster.
+            continue
+        raw_worthiness = row.get("worthiness")
+        worthiness: float | None
+        try:
+            worthiness = (
+                None if isinstance(raw_worthiness, bool)
+                else max(0.0, min(100.0, float(raw_worthiness)))
+            )
+        except (TypeError, ValueError):
+            worthiness = None
+        verdicts[topic_id] = DiscoveryJudgeVerdict(
+            short_name=name,
+            junk_shape=bool(row.get("junk_shape")),
+            worthiness=worthiness,
+        )
+    return verdicts
 
 
 def score_fun(

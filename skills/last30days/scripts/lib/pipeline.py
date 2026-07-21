@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -59,6 +60,7 @@ from . import (
     techmeme,
     threads,
     tiktok,
+    topic_shape,
     truthsocial,
     trustpilot,
     xai_x,
@@ -628,15 +630,79 @@ def nominate_candidates(
 class Nomination:
     """A named candidate topic produced by the nominate stage.
 
-    ``seed_score`` is the cheap pre-enrichment velocity rank - enough to decide
-    WHICH candidates deserve a full pipeline pass, but not the final ranking
-    signal (that comes from enriched evidence downstream).
+    ``seed_score`` is the cheap pre-enrichment rank - velocity, blended with
+    the stage-1 judge's content-worthiness when one ran (see
+    ``rerank.judge_blended_score``). Enough to decide WHICH candidates deserve
+    a full pipeline pass, but not the final ranking signal (that comes from
+    enriched evidence downstream). ``junk_shape`` flags help-me/beginner/
+    musing shapes that should not become content topics; ``worthiness`` is the
+    judge's 0-100 content score, None on the heuristic path.
     """
 
     name: str
     seed_score: float
     items: list[schema.SourceItem] = field(default_factory=list)
     summary: str = ""
+    junk_shape: bool = False
+    worthiness: float | None = None
+
+
+def _cluster_entity_counts(
+    cluster: schema.Cluster,
+    candidate_map: dict[str, schema.Candidate],
+) -> Counter:
+    """Entity-token frequencies across a cluster's members (title + snippet)."""
+    counts: Counter = Counter()
+    for candidate_id in cluster.candidate_ids:
+        candidate = candidate_map.get(candidate_id)
+        if candidate:
+            counts.update(entity_extract.extract_text_entities(
+                f"{candidate.title} {candidate.snippet}"
+            ))
+    return counts
+
+
+def _disambiguated_topic_name(
+    name: str,
+    cluster: schema.Cluster,
+    earlier_cluster: schema.Cluster,
+    candidate_map: dict[str, schema.Candidate],
+) -> str | None:
+    """Disambiguate a colliding topic name by appending the later cluster's
+    strongest entity token that the earlier cluster does not share.
+
+    Returns None when no distinguishing entity exists - the clusters cannot be
+    told apart by content, so the caller treats them as the same story.
+    """
+    later_counts = _cluster_entity_counts(cluster, candidate_map)
+    earlier_entities = set(_cluster_entity_counts(earlier_cluster, candidate_map))
+    name_tokens = {token.casefold() for token in name.split()}
+    choices = [
+        (count, token) for token, count in later_counts.items()
+        if token not in earlier_entities and token.casefold() not in name_tokens
+    ]
+    if not choices:
+        return None
+    # Strongest = most frequent across the cluster; alphabetical tie-break
+    # keeps the result deterministic.
+    _, token = sorted(choices, key=lambda entry: (-entry[0], entry[1]))[0]
+    display = token
+    for candidate_id in cluster.candidate_ids:
+        candidate = candidate_map.get(candidate_id)
+        if candidate is None:
+            continue
+        match = next(
+            (
+                word.strip("\"'`()[]{}.,:;!?")
+                for word in f"{candidate.title} {candidate.snippet}".split()
+                if word.strip("\"'`()[]{}.,:;!?").lower() == token
+            ),
+            None,
+        )
+        if match:
+            display = match
+            break
+    return f"{name} {display}"
 
 
 def nominate_topics(
@@ -646,14 +712,32 @@ def nominate_topics(
     *,
     to_date: str,
     limit: int,
+    provider: providers.ReasoningClient | None = None,
+    model: str | None = None,
 ) -> list[Nomination]:
     """Stage 1b of discovery: cluster nominated items into named candidate
-    topics and rank them by seed velocity.
+    topics and rank them for enrichment.
 
-    Names are deduped casefold so the same story surfacing under two clusters
-    yields one nomination. Returns at most ``limit`` nominations, never padded -
-    fewer clusters than ``limit`` means a shorter list, and the confidence
-    floor downstream decides whether what survived is worth showing.
+    Naming and content judgment run as a stage-1 judge pass BEFORE the limit
+    cut: the top ``rerank.JUDGE_POOL_LIMIT`` clusters by velocity share one
+    batched LLM call returning a short searchable name, a junk-shape flag, and
+    a 0-100 content-worthiness per cluster; worthiness blends into the ranking
+    score (``rerank.judge_blended_score``, velocity-dominant) so a quiet but
+    content-worthy cluster can outrank a viral junk one. Without a provider
+    (keyless/mock), or when the judge call fails, names fall back to the
+    deterministic ``topic_shape`` heuristics and ranking is velocity-only;
+    clusters beyond the judge pool always take the heuristic path.
+
+    Casefold name collisions are disambiguated (the later cluster's strongest
+    non-shared entity token is appended) rather than blindly dropped: short
+    judged names collide far more often than raw 96-char titles, and a silent
+    drop hides a distinct story. A colliding cluster is dropped only when it
+    shares a representative candidate with the earlier one (the same story
+    surfacing twice) or when no distinguishing entity exists.
+
+    Returns at most ``limit`` nominations, never padded - fewer clusters than
+    ``limit`` means a shorter list, and the confidence floor downstream
+    decides whether what survived is worth showing.
     """
     candidates = weighted_rrf(bundle.items_by_source_and_query, query_plan, pool_limit=80)
     for candidate in candidates:
@@ -676,21 +760,70 @@ def nominate_topics(
         ranked_clusters.append((score, cluster, cluster_items))
     ranked_clusters.sort(key=lambda entry: (-entry[0], entry[1].title.lower()))
 
-    nominations: list[Nomination] = []
-    seen_topic_names: set[str] = set()
+    # Leader text per cluster: what the judge sees and what the heuristics
+    # distill from.
+    leader_text: dict[str, tuple[str, str]] = {}
+    for _, cluster, _ in ranked_clusters:
+        leader = candidate_map.get(cluster.representative_ids[0]) if cluster.representative_ids else None
+        leader_text[cluster.cluster_id] = (
+            (leader.title if leader else cluster.title) or "",
+            (leader.snippet if leader else "") or "",
+        )
+
+    judge_pool = ranked_clusters[:rerank.JUDGE_POOL_LIMIT]
+    verdicts = rerank.judge_discovery_topics(
+        domain=plan.domain,
+        entries=[
+            {
+                "topic_id": cluster.cluster_id,
+                "title": leader_text[cluster.cluster_id][0],
+                "snippet": leader_text[cluster.cluster_id][1],
+            }
+            for _, cluster, _ in judge_pool
+        ],
+        provider=provider,
+        model=model,
+    ) or {}
+
+    judged: list[tuple[float, schema.Cluster, list[schema.SourceItem], str, bool, float | None]] = []
     for score, cluster, cluster_items in ranked_clusters:
-        name = discovery_topic_name(cluster, candidate_map, plan.domain)
+        title, snip = leader_text[cluster.cluster_id]
+        verdict = verdicts.get(cluster.cluster_id)
+        if verdict is not None:
+            name: str = verdict.short_name
+            junk_shape = verdict.junk_shape
+            worthiness = verdict.worthiness
+        else:
+            name = topic_shape.distill_topic_name(title, snip) or plan.domain or title
+            junk_shape = topic_shape.is_junk_shape(title, snip)
+            worthiness = None
+        blended = rerank.judge_blended_score(score, worthiness)
+        judged.append((blended, cluster, cluster_items, name, junk_shape, worthiness))
+    judged.sort(key=lambda entry: (-entry[0], entry[3].lower()))
+
+    nominations: list[Nomination] = []
+    taken_names: dict[str, schema.Cluster] = {}
+    for blended, cluster, cluster_items, name, junk_shape, worthiness in judged:
         name_key = name.casefold()
-        if name_key in seen_topic_names:
-            continue
-        seen_topic_names.add(name_key)
+        if name_key in taken_names:
+            earlier_cluster = taken_names[name_key]
+            if set(cluster.representative_ids) & set(earlier_cluster.representative_ids):
+                continue  # same story surfacing twice
+            resolved = _disambiguated_topic_name(name, cluster, earlier_cluster, candidate_map)
+            if resolved is None or resolved.casefold() in taken_names:
+                continue  # indistinguishable by content: treat as the same story
+            name = resolved
+            name_key = name.casefold()
+        taken_names[name_key] = cluster
         leader = candidate_map.get(cluster.representative_ids[0]) if cluster.representative_ids else None
         summary = (leader.snippet if leader else "") or (leader.title if leader else name)
         nominations.append(Nomination(
             name=name,
-            seed_score=score,
+            seed_score=blended,
             items=cluster_items,
             summary=summary,
+            junk_shape=junk_shape,
+            worthiness=worthiness,
         ))
         if len(nominations) >= limit:
             break
@@ -906,6 +1039,17 @@ def run_discover(
             "Discovery supports listing sources only: reddit, hackernews, digg "
             f"(unsupported: {', '.join(unsupported)})"
         )
+
+    # Stage-1 judge runtime, resolved ONCE here (mirrors run()'s provider
+    # resolution). In mock runs the judge is skipped outright and
+    # providers.resolve_runtime is NEVER called: subprocess tests inherit the
+    # caller's env, so an ungated resolve could pick up ambient keys and let a
+    # --mock run reach the network.
+    judge_provider: providers.ReasoningClient | None = None
+    judge_model: str | None = None
+    if not mock:
+        judge_runtime, judge_provider = providers.resolve_runtime(config, depth)
+        judge_model = judge_runtime.rerank_model if judge_provider else None
     available = list(DISCOVERY_SOURCES) if mock else [
         source for source in available_sources(config, requested, x_pending=False)
         if source in DISCOVERY_SOURCES
@@ -969,6 +1113,8 @@ def run_discover(
         bundle, query_plan, plan,
         to_date=to_date,
         limit=ENRICH_LIMIT if enrich else topic_limit,
+        provider=judge_provider,
+        model=judge_model,
     )
 
     if enrich and nominations:
