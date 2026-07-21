@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.18.0] - 2026-07-21
+
 ### Changed
 
 - Discovery is now a three-command host-judged protocol (SKILL.md LAW 11: "YOU ARE THE JUDGE"): `--discover --nominate-only` writes a nominations bundle and a fenced judging digest, the hosting model writes a judgments file (short names, junk flags, worthiness) and later an angles file, and `--discover --judgments <file>` / `--discover --finalize [--angles <file>]` complete the run. No API key is ever needed for host-judged trending. ([#856](https://github.com/mvanhorn/last30days-skill/pull/856))
