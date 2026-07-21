@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.17.0] - 2026-07-21
+
 ### Added
 
 - Discovery trend cards now lead with short judged topic names: a stage-1 LLM judge gives each nominated cluster a 2-6 word searchable name (with a deterministic fallback namer), replacing raw post titles as card headings, and blends a 0-100 content-worthiness score into the ranking. ([#852](https://github.com/mvanhorn/last30days-skill/pull/852))
