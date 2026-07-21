@@ -685,6 +685,15 @@ def test_angles_bundle_id_mismatch_against_pending_report(tmp_path):
     message = excinfo.value.message
     assert "deadbeefdeadbeef" in message
     assert pending.bundle_id in message
+    # The finalize leg validates against the PENDING report - the mismatch
+    # message must point the host's retry at discover-pending.json and the
+    # resume-leg remedy, never at the nominations bundle (regression: the
+    # binding error used to name the wrong file on this leg).
+    assert "pending discovery report" in message
+    assert "Pending-report locations searched" in message
+    assert handoff.PENDING_REPORT_FILENAME in message
+    assert "--discover --judgments" in message
+    assert handoff.NOMINATIONS_BUNDLE_FILENAME not in message
 
 
 # --- Hygiene ---------------------------------------------------------------------

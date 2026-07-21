@@ -23,9 +23,8 @@ import json
 import secrets
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from . import env, log, pipeline, rerank, schema
 
@@ -168,10 +167,6 @@ class PendingReport:
     path: Path | None = None
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def _warn(message: str) -> None:
     log.source_log("Discover", message, tty_only=False)
 
@@ -201,16 +196,18 @@ def pending_report_path(state_dir: str | Path) -> Path:
     return Path(state_dir) / PENDING_REPORT_FILENAME
 
 
-def _bundle_search_paths(
+def _search_paths(
     save_dir: str | Path | None,
     config_dir: Path | None,
+    path_fn: Callable[[Path], Path],
 ) -> list[Path]:
-    """Candidate bundle locations in lookup order: save-dir, then config dir."""
+    """Candidate handoff-file locations in lookup order: save-dir, then
+    config dir. ``path_fn`` picks which handoff file (bundle vs pending)."""
     paths: list[Path] = []
     if save_dir:
-        paths.append(nominations_bundle_path(Path(save_dir).expanduser().resolve()))
+        paths.append(path_fn(Path(save_dir).expanduser().resolve()))
     if config_dir is not None:
-        candidate = nominations_bundle_path(Path(config_dir))
+        candidate = path_fn(Path(config_dir))
         if candidate not in paths:
             paths.append(candidate)
     return paths
@@ -252,7 +249,7 @@ def write_nominations_bundle(
             "pass --save-dir or configure ~/.config/last30days/."
         )
     bundle_id = secrets.token_hex(8)
-    generated_at = _utc_now()
+    generated_at = schema._utc_now()
 
     rows: list[dict[str, Any]] = []
     nominations: list[BundleNomination] = []
@@ -337,7 +334,7 @@ def read_nominations_bundle(
     (naming every searched location and the re-sweep remedy) when no bundle
     exists, and for any top-level contract violation in the file found.
     """
-    searched = _bundle_search_paths(save_dir, config_dir)
+    searched = _search_paths(save_dir, config_dir, nominations_bundle_path)
     path = next((candidate for candidate in searched if candidate.exists()), None)
     if path is None:
         raise HandoffContractError(
@@ -347,50 +344,76 @@ def read_nominations_bundle(
     return _parse_bundle_file(path)
 
 
-def _parse_bundle_file(path: Path) -> NominationsBundle:
+def _parse_handoff_envelope(
+    path: Path,
+    *,
+    label: str,
+    kind: str,
+    schema_version: str,
+    remedy: str,
+    missing_id_context: str,
+    stale_context: str,
+) -> tuple[dict[str, Any], str, Any]:
+    """Shared strict top-level validation for the two engine-written handoff
+    files (nominations bundle, pending report): readable, valid JSON object,
+    right kind and schema version, bundle_id present, within TTL. Returns
+    (payload, bundle_id, generated_at)."""
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise HandoffContractError(
-            f"Could not read nominations bundle {path}: {exc}"
+            f"Could not read {label.lower()} {path}: {exc}"
         ) from exc
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise HandoffContractError(
-            f"Nominations bundle {path} is not valid JSON: {exc}"
+            f"{label} {path} is not valid JSON: {exc}"
         ) from exc
     if not isinstance(payload, dict):
         raise HandoffContractError(
-            f"Nominations bundle {path} must be a top-level JSON object, "
+            f"{label} {path} must be a top-level JSON object, "
             f"got {type(payload).__name__}."
         )
     version = payload.get("schema_version")
-    if version != schema.DISCOVERY_NOMINATIONS_SCHEMA_VERSION:
+    if version != schema_version:
         raise HandoffContractError(
-            f"Nominations bundle {path} has schema version {version!r}; this "
-            f"build reads {schema.DISCOVERY_NOMINATIONS_SCHEMA_VERSION!r}. "
-            f"{_RESWEEP_REMEDY}"
+            f"{label} {path} has schema version {version!r}; this "
+            f"build reads {schema_version!r}. {remedy}"
         )
-    kind = payload.get("kind")
-    if kind != schema.DISCOVERY_NOMINATIONS_KIND:
+    file_kind = payload.get("kind")
+    if file_kind != kind:
         raise HandoffContractError(
-            f"Nominations bundle {path} has kind {kind!r}; expected "
-            f"{schema.DISCOVERY_NOMINATIONS_KIND!r}. {_RESWEEP_REMEDY}"
+            f"{label} {path} has kind {file_kind!r}; expected "
+            f"{kind!r}. {remedy}"
         )
     bundle_id = str(payload.get("bundle_id") or "")
     if not bundle_id:
         raise HandoffContractError(
-            f"Nominations bundle {path} is missing its bundle_id; judgments "
-            f"cannot bind to it. {_RESWEEP_REMEDY}"
+            f"{label} {path} is missing its bundle_id; "
+            f"{missing_id_context}. {remedy}"
         )
     generated_at = payload.get("generated_at")
     if not env.is_timestamp_fresh(generated_at, DISCOVERY_HANDOFF_TTL_SECONDS):
         raise HandoffContractError(
-            f"Nominations bundle {path} is stale (generated_at="
+            f"{label} {path} is stale (generated_at="
             f"{generated_at!r}, TTL {int(DISCOVERY_HANDOFF_TTL_SECONDS)}s): "
-            f"the momentum window it captured has moved on. {_RESWEEP_REMEDY}"
+            f"{stale_context}. {remedy}"
         )
+    return payload, bundle_id, generated_at
+
+
+def _parse_bundle_file(path: Path) -> NominationsBundle:
+    payload, bundle_id, generated_at = _parse_handoff_envelope(
+        path,
+        label="Nominations bundle",
+        kind=schema.DISCOVERY_NOMINATIONS_KIND,
+        schema_version=schema.DISCOVERY_NOMINATIONS_SCHEMA_VERSION,
+        remedy=_RESWEEP_REMEDY,
+        missing_id_context="judgments cannot bind to it",
+        stale_context="the momentum window it captured has moved on",
+    )
+    version = payload.get("schema_version")
 
     context = payload.get("context") or {}
     boundary = context.get("enrichment_source_boundary")
@@ -460,22 +483,6 @@ def _parse_bundle_file(path: Path) -> NominationsBundle:
     )
 
 
-def _pending_search_paths(
-    save_dir: str | Path | None,
-    config_dir: Path | None,
-) -> list[Path]:
-    """Candidate pending-report locations in lookup order: save-dir, then
-    config dir (the same order the bundle reader uses)."""
-    paths: list[Path] = []
-    if save_dir:
-        paths.append(pending_report_path(Path(save_dir).expanduser().resolve()))
-    if config_dir is not None:
-        candidate = pending_report_path(Path(config_dir))
-        if candidate not in paths:
-            paths.append(candidate)
-    return paths
-
-
 def read_pending_report(
     *,
     save_dir: str | Path | None = None,
@@ -490,7 +497,7 @@ def read_pending_report(
     own generated_at - the leg-2 write started a fresh authoring window - and
     the remedy is the resume leg, not a full re-sweep.
     """
-    searched = _pending_search_paths(save_dir, config_dir)
+    searched = _search_paths(save_dir, config_dir, pending_report_path)
     path = next((candidate for candidate in searched if candidate.exists()), None)
     if path is None:
         raise HandoffContractError(
@@ -501,49 +508,16 @@ def read_pending_report(
 
 
 def _parse_pending_file(path: Path) -> PendingReport:
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise HandoffContractError(
-            f"Could not read pending discovery report {path}: {exc}"
-        ) from exc
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise HandoffContractError(
-            f"Pending discovery report {path} is not valid JSON: {exc}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise HandoffContractError(
-            f"Pending discovery report {path} must be a top-level JSON "
-            f"object, got {type(payload).__name__}."
-        )
+    payload, bundle_id, generated_at = _parse_handoff_envelope(
+        path,
+        label="Pending discovery report",
+        kind=schema.DISCOVERY_PENDING_KIND,
+        schema_version=schema.DISCOVERY_PENDING_SCHEMA_VERSION,
+        remedy=_RESUME_REMEDY,
+        missing_id_context="angles cannot bind to it",
+        stale_context="the judged window it captured has moved on",
+    )
     version = payload.get("schema_version")
-    if version != schema.DISCOVERY_PENDING_SCHEMA_VERSION:
-        raise HandoffContractError(
-            f"Pending discovery report {path} has schema version {version!r}; "
-            f"this build reads {schema.DISCOVERY_PENDING_SCHEMA_VERSION!r}. "
-            f"{_RESUME_REMEDY}"
-        )
-    kind = payload.get("kind")
-    if kind != schema.DISCOVERY_PENDING_KIND:
-        raise HandoffContractError(
-            f"Pending discovery report {path} has kind {kind!r}; expected "
-            f"{schema.DISCOVERY_PENDING_KIND!r}. {_RESUME_REMEDY}"
-        )
-    bundle_id = str(payload.get("bundle_id") or "")
-    if not bundle_id:
-        raise HandoffContractError(
-            f"Pending discovery report {path} is missing its bundle_id; "
-            f"angles cannot bind to it. {_RESUME_REMEDY}"
-        )
-    generated_at = payload.get("generated_at")
-    if not env.is_timestamp_fresh(generated_at, DISCOVERY_HANDOFF_TTL_SECONDS):
-        raise HandoffContractError(
-            f"Pending discovery report {path} is stale (generated_at="
-            f"{generated_at!r}, TTL {int(DISCOVERY_HANDOFF_TTL_SECONDS)}s): "
-            f"the judged window it captured has moved on. {_RESUME_REMEDY}"
-        )
     report = payload.get("report")
     if not isinstance(report, dict):
         raise HandoffContractError(
@@ -605,18 +579,29 @@ def _require_bundle_binding(
     config_dir: Path | None,
 ) -> None:
     """Enforce bundle-id binding between a host file and the current bundle
-    (or, on the finalize leg, the pending report that inherited its id)."""
+    (or, on the finalize leg, the pending report that inherited its id).
+    The mismatch message names the file actually validated against - the
+    pending report on the finalize leg - so a host's retry is not misdirected
+    at the nominations bundle."""
     file_bundle_id = str(payload.get("bundle_id") or "")
     if file_bundle_id == bundle.bundle_id:
         return
-    searched = _bundle_search_paths(save_dir, config_dir)
+    if isinstance(bundle, PendingReport):
+        searched = _search_paths(save_dir, config_dir, pending_report_path)
+        noun = "current pending discovery report"
+        location_label = "Pending-report locations searched"
+        remedy = _RESUME_REMEDY
+    else:
+        searched = _search_paths(save_dir, config_dir, nominations_bundle_path)
+        noun = "current nominations bundle"
+        location_label = "Bundle locations searched"
+        remedy = _RESWEEP_REMEDY
     if not searched and bundle.path is not None:
         searched = [bundle.path]
     raise HandoffContractError(
         f"The {label} file is bound to bundle_id {file_bundle_id!r} but the "
-        f"current nominations bundle is {bundle.bundle_id!r}. Bundle "
-        "locations searched:\n"
-        f"{_searched_lines(searched)}\n{_RESWEEP_REMEDY}"
+        f"{noun} is {bundle.bundle_id!r}. {location_label}:\n"
+        f"{_searched_lines(searched)}\n{remedy}"
     )
 
 
@@ -649,6 +634,30 @@ def _sanitized_angle(raw: object) -> str | None:
         return None
     text = _truncate_at_word(" ".join(raw.split()), _ANGLE_MAX_CHARS)
     return text or None
+
+
+def _known_rows(
+    rows: list[Any],
+    known: set[str],
+    *,
+    row_label: str,
+    unknown_label: str,
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Shared lenient per-row gate for host-authored files: skip non-object
+    rows, rows with no nomination id, and rows for unknown ids - warning on
+    each - and yield (row_id, row) for the rest."""
+    for row in rows:
+        if not isinstance(row, dict):
+            _warn(f"skipping malformed {row_label} row (not an object)")
+            continue
+        row_id = str(row.get("id") or "").strip()
+        if not row_id:
+            _warn(f"skipping {row_label} row with no nomination id")
+            continue
+        if row_id not in known:
+            _warn(f"ignoring {unknown_label} for unknown nomination id {row_id!r}")
+            continue
+        yield row_id, row
 
 
 def _clamped_worthiness(raw: object) -> int | None:
@@ -689,17 +698,9 @@ def read_judgments(
         )
     known = {entry.nomination_id for entry in bundle.nominations}
     judgments: dict[str, HostJudgment] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            _warn("skipping malformed judgments row (not an object)")
-            continue
-        row_id = str(row.get("id") or "").strip()
-        if not row_id:
-            _warn("skipping judgments row with no nomination id")
-            continue
-        if row_id not in known:
-            _warn(f"ignoring judgment for unknown nomination id {row_id!r}")
-            continue
+    for row_id, row in _known_rows(
+        rows, known, row_label="judgments", unknown_label="judgment"
+    ):
         judgments[row_id] = HostJudgment(
             name=_sanitized_name(row.get("name")),
             junk=bool(row["junk"]) if "junk" in row else None,
@@ -751,17 +752,9 @@ def read_angles(
         else {entry.nomination_id for entry in bundle.nominations}
     )
     angles: dict[str, HostAngles] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            _warn("skipping malformed angles row (not an object)")
-            continue
-        row_id = str(row.get("id") or "").strip()
-        if not row_id:
-            _warn("skipping angles row with no nomination id")
-            continue
-        if row_id not in known:
-            _warn(f"ignoring angles for unknown nomination id {row_id!r}")
-            continue
+    for row_id, row in _known_rows(
+        rows, known, row_label="angles", unknown_label="angles"
+    ):
         podcast = _sanitized_angle(row.get("podcast"))
         x_article = _sanitized_angle(row.get("x_article"))
         if podcast is None and x_article is None:

@@ -1526,8 +1526,13 @@ def _discover_subreddits(args: argparse.Namespace) -> list[str] | None:
     )
 
 
+def _discover_domain(args: argparse.Namespace) -> str:
+    """The whitespace-normalized discovery domain; empty = global trending."""
+    return " ".join(str(args.discover or "").split())
+
+
 def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
-    domain = " ".join(str(args.discover or "").split())
+    domain = _discover_domain(args)
     # Empty domain = global trending: sweep every river feed's hot list with no
     # keyword gate. The confidence floor is what keeps junk out, not a keyword.
     if args.as_of_date:
@@ -1633,7 +1638,7 @@ def _run_discover_nominate(args: argparse.Namespace, config: dict[str, object]) 
     resumes from it. A zero-nomination sweep short-circuits to the existing
     nothing-solid brief with NO bundle written: there is nothing to judge.
     """
-    domain = " ".join(str(args.discover or "").split())
+    domain = _discover_domain(args)
     boundary = _resolve_discovery_source_boundary(args, config)
     if boundary is None:
         return 2
