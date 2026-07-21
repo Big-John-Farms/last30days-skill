@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Discovery trend cards now lead with short judged topic names: a stage-1 LLM judge gives each nominated cluster a 2-6 word searchable name (with a deterministic fallback namer), replacing raw post titles as card headings, and blends a 0-100 content-worthiness score into the ranking. ([#XXX](https://github.com/mvanhorn/last30days-skill/pull/XXX))
-- Junk-shape gate in discovery: help-me / beginner / personal-musing post shapes flagged by the judge (or the deterministic classifier at the seed-source floor) lose the single-source ranking bypass and need cross-source corroboration to rank. ([#XXX](https://github.com/mvanhorn/last30days-skill/pull/XXX))
-- Stage-2 angle pass: every discovery trend card carries engine-owned `**Podcast angle:**` and `**X article angle:**` lines, so the brief doubles as a content-pipeline worksheet. ([#XXX](https://github.com/mvanhorn/last30days-skill/pull/XXX))
-- Persistent discovery topic queue: `--discover` runs record surfaced topics in research.db (on by default; `LAST30DAYS_DISCOVERY_QUEUE=off` opts out, `--mock` never writes, `--save-dir` scopes the store), re-surfaced or covered topics get a `**Pipeline:**` annotation on their card, and `queue list` / `queue cover "<name>"` manage the queue from the CLI. ([#XXX](https://github.com/mvanhorn/last30days-skill/pull/XXX))
-- Discovery JSON export schema 1.1: per-topic `podcast_angle` / `x_article_angle` plus the queue fields `previously_surfaced_count`, `last_surfaced`, and `covered` join the discovery export contract; every existing key is preserved. ([#XXX](https://github.com/mvanhorn/last30days-skill/pull/XXX))
+- Discovery trend cards now lead with short judged topic names: a stage-1 LLM judge gives each nominated cluster a 2-6 word searchable name (with a deterministic fallback namer), replacing raw post titles as card headings, and blends a 0-100 content-worthiness score into the ranking. ([#852](https://github.com/mvanhorn/last30days-skill/pull/852))
+- Junk-shape gate in discovery: help-me / beginner / personal-musing post shapes flagged by the judge (or the deterministic classifier at the seed-source floor) lose the single-source ranking bypass and need cross-source corroboration to rank. ([#852](https://github.com/mvanhorn/last30days-skill/pull/852))
+- Stage-2 angle pass: every discovery trend card carries engine-owned `**Podcast angle:**` and `**X article angle:**` lines, so the brief doubles as a content-pipeline worksheet. ([#852](https://github.com/mvanhorn/last30days-skill/pull/852))
+- Persistent discovery topic queue: `--discover` runs record surfaced topics in research.db (on by default; `LAST30DAYS_DISCOVERY_QUEUE=off` opts out, `--mock` never writes, `--save-dir` scopes the store), re-surfaced or covered topics get a `**Pipeline:**` annotation on their card, and `queue list` / `queue cover "<name>"` manage the queue from the CLI. ([#852](https://github.com/mvanhorn/last30days-skill/pull/852))
+- Discovery JSON export schema 1.1: per-topic `podcast_angle` / `x_article_angle` plus the queue fields `previously_surfaced_count`, `last_surfaced`, and `covered` join the discovery export contract; every existing key is preserved. ([#852](https://github.com/mvanhorn/last30days-skill/pull/852))
 
 ## [3.16.0] - 2026-07-15
 
