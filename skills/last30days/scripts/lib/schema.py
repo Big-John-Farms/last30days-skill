@@ -838,6 +838,54 @@ def to_agent_export(
     }
 
 
+# Discovery nominations handoff bundle (leg 1 of the three-command
+# host-judged protocol). The bundle serializes the FULL judge pool losslessly
+# so leg 2 can recompute floor/velocity/entity-token disambiguation exactly
+# as an in-memory run would. Bump the version on any incompatible change to
+# the bundle shape; the handoff reader rejects other versions outright.
+DISCOVERY_NOMINATIONS_SCHEMA_VERSION = "1.0"
+DISCOVERY_NOMINATIONS_KIND = "discovery-nominations"
+
+
+def nomination_to_dict(nomination: Any) -> dict[str, Any]:
+    """Serialize a nominate-stage Nomination to a plain dict.
+
+    Duck-typed on the Nomination fields (name, seed_score, items, summary,
+    junk_shape, worthiness) because the dataclass lives in ``pipeline``,
+    which this module must not import. Seed items serialize through
+    ``to_dict`` so the full evidence set round-trips losslessly.
+    """
+    return {
+        "name": nomination.name,
+        "seed_score": nomination.seed_score,
+        "summary": nomination.summary,
+        "junk_shape": bool(nomination.junk_shape),
+        "worthiness": nomination.worthiness,
+        "items": [to_dict(item) for item in nomination.items],
+    }
+
+
+def nomination_kwargs_from_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    """Parse a serialized nomination back to Nomination constructor kwargs.
+
+    Returns kwargs rather than an instance because the Nomination dataclass
+    lives in ``pipeline``, which this module must not import; the caller
+    (``discovery_handoff``) constructs ``pipeline.Nomination(**kwargs)``.
+    """
+    return {
+        "name": payload["name"],
+        "seed_score": float(_first_non_none(payload.get("seed_score"), 0.0)),
+        "items": [source_item_from_dict(item) for item in payload.get("items") or []],
+        "summary": payload.get("summary") or "",
+        "junk_shape": bool(payload.get("junk_shape")),
+        "worthiness": (
+            float(payload["worthiness"])
+            if payload.get("worthiness") is not None
+            else None
+        ),
+    }
+
+
 def to_discovery_export(report: DiscoveryReport) -> dict[str, Any]:
     """Serialize discovery output without changing the normal agent contract."""
     start = datetime.fromisoformat(report.range_from).date()
