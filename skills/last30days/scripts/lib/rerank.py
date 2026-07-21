@@ -9,7 +9,7 @@ from datetime import datetime
 
 from typing import NamedTuple
 
-from . import http, log, providers, query, schema, signals
+from . import http, log, providers, schema, signals
 
 
 # Penalty applied when a candidate does not mention the primary entity
