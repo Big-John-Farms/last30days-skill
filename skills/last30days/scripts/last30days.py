@@ -1682,10 +1682,78 @@ def _run_discover_nominate(args: argparse.Namespace, config: dict[str, object]) 
 
 
 def _run_discover_resume(args: argparse.Namespace, config: dict[str, object]) -> int:
-    """Protocol leg 2: apply host judgments and enrich (U4 stub)."""
-    raise NotImplementedError(
-        "--discover --judgments resume leg is not implemented yet (U4 replaces this stub)"
+    """Protocol leg 2: resume from the nominations bundle, apply the host
+    judgments file, run the deep per-topic research pass, and persist the
+    ranked result as the pending report for leg 3 (--finalize).
+
+    Contract failures (missing/stale bundle, judgments not bound to it) raise
+    HandoffContractError and map to exit 2 in _run_discover_protocol_leg.
+    Zero floor survivors renders the nothing-solid brief right here: exit 0,
+    no pending file, no leg 3. No queue writes and no artifact saves happen
+    on this leg - the topic queue and the rendered brief belong to leg 3.
+    """
+    save_dir = getattr(args, "save_dir", None)
+    bundle = discovery_handoff.read_nominations_bundle(
+        save_dir=save_dir, config_dir=env.CONFIG_DIR,
     )
+    judgments = discovery_handoff.read_judgments(
+        args.judgments, bundle, save_dir=save_dir, config_dir=env.CONFIG_DIR,
+    )
+    result = pipeline.run_discover_resume(
+        bundle, judgments, config=config, mock=args.mock,
+    )
+    report = result.report
+
+    if not report.topics:
+        # Nothing cleared the floor: the honest brief ends the protocol here.
+        print(render.render_discovery(report))
+        return 0
+
+    state_dir = _discover_handoff_state_dir(args)
+    if state_dir is None:
+        # Unreachable in practice - reading the bundle above required one of
+        # these locations - but kept as a loud contract error, not an assert.
+        raise discovery_handoff.HandoffContractError(
+            "No handoff location available to write the pending report: "
+            "pass --save-dir or configure ~/.config/last30days/."
+        )
+    pending_path = discovery_handoff.pending_report_path(state_dir)
+    payload = {
+        "kind": "discovery-pending",
+        "schema_version": "1.0",
+        "bundle_id": bundle.bundle_id,
+        # Fresh TTL clock: leg 3 measures staleness from THIS resume run,
+        # not from the leg-1 sweep.
+        "generated_at": report.generated_at,
+        # Same run_ref format the queue records (leg 3 replays it verbatim).
+        "run_ref": f"discover:{report.domain or 'trending'}:{report.generated_at}",
+        # Full schema round-trip (the _write_last_run precedent): leg 3
+        # rebuilds the report from this dict instead of re-running anything.
+        "report": schema.to_dict(report),
+        "angle_inputs": result.angle_inputs,
+    }
+    # ONE post-loop write from the main thread; enrichment workers are daemon
+    # threads and never touch disk.
+    state_dir.mkdir(parents=True, exist_ok=True)
+    pending_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    print(
+        f"Judged discovery resume: {len(report.topics)} topic"
+        f"{'s' if len(report.topics) != 1 else ''} cleared the floor "
+        f"(bundle_id {bundle.bundle_id})."
+    )
+    print(f"Pending report: {pending_path}")
+    print("\nAngle inputs by nomination id:")
+    print(json.dumps(result.angle_inputs, indent=2))
+    print(
+        "\nWrite the angles file (leg 3): "
+        f'{{"bundle_id": "{bundle.bundle_id}", "angles": '
+        '[{"id": "n1", "podcast": "<one-sentence hook>", '
+        '"x_article": "<one-sentence hook>"}, ...]} - one row per topic id '
+        "above.\n"
+        "Then finalize with: --discover --finalize --angles <path>."
+    )
+    return 0
 
 
 def _run_discover_finalize(args: argparse.Namespace, config: dict[str, object]) -> int:

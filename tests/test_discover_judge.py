@@ -156,19 +156,9 @@ def test_judge_names_flags_and_worthiness_reach_nominations():
     assert nominations[0].seed_score > nominations[1].seed_score
 
 
-def test_low_velocity_high_worthiness_survives_the_cut():
-    """The blend runs BEFORE the limit cut: at limit=1 the quiet-but-worthy
-    cluster is the survivor, not the viral-junk one."""
-    stub = _StubJudge({
-        VIRAL_TITLE: {"short_name": "Nvidia Rubin export shock",
-                      "junk_shape": False, "worthiness": 5},
-        QUIET_TITLE: {"short_name": "FOSS maintainer burnout",
-                      "junk_shape": False, "worthiness": 95},
-    })
-    nominations = _nominate(
-        _viral_and_quiet_items(), provider=stub, model="judge-model", limit=1,
-    )
-    assert [n.name for n in nominations] == ["FOSS maintainer burnout"]
+# Relocated (U4): the quiet-but-worthy rescue now lives in
+# tests/test_discover_floor.py::test_resume_quiet_but_worthy_survives_the_cut,
+# retargeted to the host judgments-file path.
 
 
 def test_partial_judge_response_falls_back_per_cluster():
@@ -440,73 +430,9 @@ def test_mock_run_never_resolves_runtime(capsys):
     assert "deterministic fallback" not in capsys.readouterr().err
 
 
-def test_live_run_resolves_runtime_once_and_enrichment_gets_judged_name():
-    """run_discover resolves the judge runtime exactly once, threads the
-    provider into nominate_topics, and enrich_nominations researches the
-    judge's short name (the nomination name IS the sub-run topic)."""
-    long_title = (
-        "Google is updating Gemma 4 chat templates and enabling "
-        "Flash Attention 4 on Hopper GPUs"
-    )
-    raw = {
-        "id": "seed1",
-        "title": long_title,
-        "url": "https://example.com/seed1",
-        "hn_url": "https://news.ycombinator.com/item?id=1",
-        "author": "example",
-        "date": "2026-07-09",
-        "engagement": {"points": 900, "comments": 400},
-        "relevance": 0.9,
-    }
-    stub = _StubJudge({
-        "Gemma 4 chat templates": {
-            "short_name": "Gemma 4 Flash Attention",
-            "junk_shape": False,
-            "worthiness": 88,
-        },
-    })
-    runtime = schema.ProviderRuntime(
-        reasoning_provider="stub",
-        planner_model="planner-model",
-        rerank_model="judge-model",
-    )
-    seen: dict[str, object] = {}
-
-    def fake_run(*, topic, **kwargs):
-        seen["topic"] = topic
-        seen.update(kwargs)
-        return schema.Report(
-            topic=topic,
-            range_from="2026-06-10",
-            range_to="2026-07-10",
-            generated_at="2026-07-10T00:00:00+00:00",
-            provider_runtime=runtime,
-            query_plan=schema.QueryPlan(
-                intent="factual", freshness_mode="balanced_recent",
-                cluster_mode="none", raw_topic=topic, subqueries=[],
-                source_weights={},
-            ),
-            clusters=[], ranked_candidates=[],
-            items_by_source={}, errors_by_source={},
-        )
-
-    with mock.patch.object(
-        pipeline.providers, "resolve_runtime", return_value=(runtime, stub),
-    ) as resolve_spy, mock.patch.object(
-        pipeline, "available_sources", return_value=["hackernews"],
-    ), mock.patch.object(
-        pipeline, "_fetch_discovery_source", return_value=([raw], None),
-    ), mock.patch.object(pipeline, "run", side_effect=fake_run):
-        pipeline.run_discover(
-            domain="AI agents", config={}, as_of_date="2026-07-10", enrich=True,
-        )
-
-    resolve_spy.assert_called_once()
-    # The one resolved handle serves BOTH discovery LLM passes: the stage-1
-    # judge and the U5 stage-2 angle pass over the floor survivors.
-    assert stub.models == ["judge-model", "judge-model"]
-    assert seen["topic"] == "Gemma 4 Flash Attention"
-    assert seen.get("internal_subrun") is True
+# Relocated (U4): host-name-becomes-enrichment-sub-run-topic now lives in
+# tests/test_discover_enrich.py::test_host_judged_name_becomes_enrichment_sub_run_topic,
+# retargeted to the host judgments-file path.
 
 
 # ------------------------------------------------------- judge unit tests ----

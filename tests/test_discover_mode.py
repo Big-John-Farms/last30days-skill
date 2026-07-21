@@ -1267,15 +1267,14 @@ def test_discovery_cli_mock_protocol_leg_requires_save_dir(leg_argv):
 @pytest.mark.parametrize(
     ("leg_argv", "marker"),
     [
-        (["--judgments", "judgments.json"], "judgments resume leg"),
         (["--finalize"], "finalize leg"),
     ],
 )
 def test_discovery_cli_protocol_flags_reach_their_leg_stub(tmp_path, leg_argv, marker):
-    """With --save-dir, each protocol flag routes to its own leg. Legs 2 and 3
-    are U4/U5 stubs for now, so the distinct NotImplementedError message is
-    the dispatch evidence (U4/U5 will retarget these pins to real behavior);
-    leg 1's real behavior is pinned below."""
+    """With --save-dir, each protocol flag routes to its own leg. Leg 3 is a
+    U5 stub for now, so the distinct NotImplementedError message is the
+    dispatch evidence (U5 will retarget this pin to real behavior); legs 1
+    and 2 have their real behavior pinned below."""
     result = _run_protocol_cli(
         ["--discover", "AI agents", "--mock", "--save-dir", str(tmp_path), *leg_argv],
     )
@@ -1466,3 +1465,244 @@ def test_discovery_protocol_dispatch_maps_contract_error_to_exit_2(monkeypatch, 
     assert cli._run_discover_protocol_leg(args, {}) == 2
     err = capsys.readouterr().err
     assert "Nominations bundle is stale; run a fresh re-sweep." in err
+
+
+# --- U4 leg 2: --discover --judgments (resume, enrich, pending report) --------
+
+
+def _leg1_bundle_payload(save_dir) -> dict:
+    """Run leg 1 in-process against the save dir and return the bundle JSON."""
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args(
+        ["--discover", "AI agents", "--mock", "--save-dir", str(save_dir),
+         "--nominate-only"]
+    )
+    assert cli._run_discover_protocol_leg(args, {}) == 0
+    return json.loads(
+        (Path(save_dir) / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def _run_leg2(save_dir, judgments_payload, config=None) -> int:
+    judgments_path = Path(save_dir) / "judgments.json"
+    judgments_path.write_text(json.dumps(judgments_payload), encoding="utf-8")
+    parser = cli.build_parser()
+    args, _extra = parser.parse_known_args([
+        "--discover", "AI agents", "--mock", "--save-dir", str(save_dir),
+        "--judgments", str(judgments_path),
+    ])
+    return cli._run_discover_protocol_leg(args, dict(config or {}))
+
+
+def _rich_enrichment_report(topic: str) -> schema.Report:
+    """A per-topic fake enrichment corpus with topic-unique URLs so distinct
+    topics never trip the same-story fold."""
+    import datetime as _datetime
+
+    slug = "".join(ch if ch.isalnum() else "-" for ch in topic.lower())
+    published = (_datetime.date.today() - _datetime.timedelta(days=1)).isoformat()
+    items = {
+        "reddit": [schema.SourceItem(
+            item_id=f"r-{slug}", source="reddit", title=topic, body=topic,
+            url=f"https://reddit.com/r/x/{slug}", published_at=published,
+            engagement={"score": 800, "num_comments": 300}, snippet=topic,
+        )],
+        "hackernews": [schema.SourceItem(
+            item_id=f"h-{slug}", source="hackernews", title=topic, body=topic,
+            url=f"https://example.com/{slug}", published_at=published,
+            engagement={"points": 400, "comments": 150}, snippet=topic,
+        )],
+    }
+    return schema.Report(
+        topic=topic,
+        range_from="2026-06-10", range_to="2026-07-10",
+        generated_at="2026-07-10T00:00:00+00:00",
+        provider_runtime=schema.ProviderRuntime(
+            reasoning_provider="none",
+            planner_model="deterministic",
+            rerank_model="deterministic",
+        ),
+        query_plan=schema.QueryPlan(
+            intent="factual", freshness_mode="balanced_recent",
+            cluster_mode="none", raw_topic=topic, subqueries=[],
+            source_weights={},
+        ),
+        clusters=[], ranked_candidates=[],
+        items_by_source=items, errors_by_source={},
+    )
+
+
+def test_discovery_cli_resume_pending_report_round_trip(tmp_path, capsys):
+    """Scenario 8: leg 2 persists ONE pending report - bundle_id binding, a
+    fresh generated_at (the leg-3 TTL clock), the queue's run_ref format, the
+    full report with host names and contiguous ranks, and angle inputs keyed
+    by surviving nomination ids - and prints the angle inputs plus the
+    finalize instructions. No queue writes, no artifact saves."""
+    from lib import env as lib_env
+
+    bundle_payload = _leg1_bundle_payload(tmp_path)
+    capsys.readouterr()
+    ids = [row["id"] for row in bundle_payload["nominations"]]
+    assert "n1" in ids
+    judgments = {
+        "bundle_id": bundle_payload["bundle_id"],
+        "judgments": [
+            {"id": "n1", "name": "Renamed Topic One", "junk": False,
+             "worthiness": 90},
+        ],
+    }
+
+    def fake_run(*, topic, **_kwargs):
+        return _rich_enrichment_report(topic)
+
+    with mock.patch.object(pipeline, "run", side_effect=fake_run):
+        assert _run_leg2(tmp_path, judgments) == 0
+    out = capsys.readouterr().out
+
+    pending_path = tmp_path / discovery_handoff.PENDING_REPORT_FILENAME
+    assert pending_path.is_file()
+    payload = json.loads(pending_path.read_text(encoding="utf-8"))
+    assert payload["bundle_id"] == bundle_payload["bundle_id"]
+    # Fresh TTL clock: generated_at is the resume run's, not the sweep's.
+    assert lib_env.is_timestamp_fresh(payload["generated_at"], 3600)
+    assert payload["generated_at"] != bundle_payload["generated_at"]
+    assert payload["run_ref"] == f"discover:AI agents:{payload['generated_at']}"
+
+    report_dict = payload["report"]
+    topic_names = [topic["name"] for topic in report_dict["topics"]]
+    assert "Renamed Topic One" in topic_names
+    assert [topic["rank"] for topic in report_dict["topics"]] == list(
+        range(1, len(topic_names) + 1)
+    )
+    assert all(topic["evidence_urls"] for topic in report_dict["topics"])
+
+    angle_inputs = payload["angle_inputs"]
+    assert angle_inputs
+    assert set(angle_inputs) <= set(ids)
+    assert angle_inputs["n1"]["name"] == "Renamed Topic One"
+    for entry in angle_inputs.values():
+        assert set(entry) == {"name", "titles", "top_comment", "engagement"}
+
+    # stdout: angle inputs + instruction block with the bundle_id echo.
+    assert "Renamed Topic One" in out
+    assert bundle_payload["bundle_id"] in out
+    assert "--discover --finalize" in out
+    # No queue writes and no artifact saves on this leg.
+    assert not (tmp_path / "research.db").exists()
+    assert not list(tmp_path.glob("*discover-raw*"))
+
+
+def test_discovery_cli_resume_zero_survivors_renders_nothing_solid(tmp_path, capsys):
+    """Scenario 9: every nomination host-junked - leg 2 renders the honest
+    nothing-solid brief itself, exits 0, and leaves NO pending file (there is
+    nothing for leg 3 to finalize)."""
+    bundle_payload = _leg1_bundle_payload(tmp_path)
+    capsys.readouterr()
+    judgments = {
+        "bundle_id": bundle_payload["bundle_id"],
+        "judgments": [
+            {"id": row["id"], "junk": True}
+            for row in bundle_payload["nominations"]
+        ],
+    }
+    with mock.patch.object(pipeline, "enrich_nominations") as enrich:
+        assert _run_leg2(tmp_path, judgments) == 0
+    enrich.assert_not_called()
+    out = capsys.readouterr().out
+    assert "Nothing solid this window." in out
+    assert not (tmp_path / discovery_handoff.PENDING_REPORT_FILENAME).exists()
+    assert not (tmp_path / "research.db").exists()
+
+
+def test_discovery_cli_resume_never_resolves_providers_or_queue(tmp_path, capsys):
+    """Leg 2 has no LLM pass (the host IS the judge) and no queue write (the
+    queue belongs to leg 3): provider resolution and the queue hook are never
+    touched on the resume leg."""
+    bundle_payload = _leg1_bundle_payload(tmp_path)
+    capsys.readouterr()
+    judgments = {"bundle_id": bundle_payload["bundle_id"], "judgments": []}
+
+    def fake_run(*, topic, **_kwargs):
+        return _rich_enrichment_report(topic)
+
+    with mock.patch.object(pipeline, "run", side_effect=fake_run), \
+         mock.patch.object(pipeline.providers, "resolve_runtime") as resolve, \
+         mock.patch.object(cli, "_annotate_and_record_discovery_queue") as queue_hook:
+        assert _run_leg2(tmp_path, judgments) == 0
+
+    resolve.assert_not_called()
+    queue_hook.assert_not_called()
+
+
+def test_discovery_cli_resume_without_bundle_exits_2(tmp_path):
+    """A resume against an empty state dir is a contract failure: exit 2 with
+    the searched locations and the re-sweep remedy on stderr."""
+    judgments_path = tmp_path / "judgments.json"
+    judgments_path.write_text(
+        json.dumps({"bundle_id": "deadbeef", "judgments": []}), encoding="utf-8"
+    )
+    result = _run_protocol_cli([
+        "--discover", "AI agents", "--mock", "--save-dir", str(tmp_path),
+        "--judgments", str(judgments_path),
+    ])
+    assert result.returncode == 2, result.stderr
+    assert "No discovery nominations bundle found" in result.stderr
+    assert "--discover --nominate-only" in result.stderr
+
+
+def test_discovery_cli_resume_full_mock_offline_is_deterministic(tmp_path):
+    """Scenario 10: a full mock leg 2 (mock judgments against a mock leg-1
+    bundle, --save-dir scoped) runs offline end to end - exit 0, a pending
+    report bound to the bundle, deterministic angle inputs across two resumes,
+    and zero queue writes."""
+    leg1 = _run_nominate_only(tmp_path)
+    assert leg1.returncode == 0, leg1.stderr
+    bundle_payload = json.loads(
+        (tmp_path / discovery_handoff.NOMINATIONS_BUNDLE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    rows = bundle_payload["nominations"]
+    keep = [row["id"] for row in rows if not row["heuristic_junk"]][:2]
+    assert keep, "mock sweep should nominate at least one non-junk topic"
+    judgments_path = tmp_path / "judgments.json"
+    judgments_path.write_text(json.dumps({
+        "bundle_id": bundle_payload["bundle_id"],
+        "judgments": [
+            {"id": keep[0], "name": "Renamed Mock Topic", "junk": False,
+             "worthiness": 90},
+            *[
+                {"id": row["id"], "junk": True}
+                for row in rows if row["id"] not in keep
+            ],
+        ],
+    }), encoding="utf-8")
+
+    def run_leg2():
+        return _run_protocol_cli(
+            [
+                "--discover", "AI agents", "--mock",
+                "--save-dir", str(tmp_path),
+                "--judgments", str(judgments_path),
+            ],
+            env_overrides={"LAST30DAYS_DEFAULT_SEARCH": ""},
+        )
+
+    first = run_leg2()
+    assert first.returncode == 0, first.stderr
+    pending_path = tmp_path / discovery_handoff.PENDING_REPORT_FILENAME
+    first_payload = json.loads(pending_path.read_text(encoding="utf-8"))
+    second = run_leg2()
+    assert second.returncode == 0, second.stderr
+    second_payload = json.loads(pending_path.read_text(encoding="utf-8"))
+
+    assert first_payload["bundle_id"] == bundle_payload["bundle_id"]
+    assert set(first_payload["angle_inputs"]) <= set(keep)
+    # Deterministic: two mock resumes agree on every angle input.
+    assert first_payload["angle_inputs"] == second_payload["angle_inputs"]
+    assert "Renamed Mock Topic" in first.stdout
+    assert bundle_payload["bundle_id"] in first.stdout
+    assert "--discover --finalize" in first.stdout
+    assert not (tmp_path / "research.db").exists()

@@ -8,7 +8,7 @@ honest outcome is "nothing-solid" with the strongest weak signal named.
 
 from unittest import mock
 
-from lib import pipeline, rerank, schema
+from lib import discovery_handoff, pipeline, rerank, schema
 
 
 def _x_item(item_id: str, text: str, likes: int, *, date: str = "2026-07-09") -> dict:
@@ -589,3 +589,362 @@ def test_passes_discovery_floor_junk_params():
                  junk_shape=False, seed_source_count=1)
     assert floor(source_count=2, engagement_total=30, item_count=2,
                  junk_shape=False, seed_source_count=1)
+
+
+# --- U4 leg 2 resume: host judgments, slots, floor, fold ----------------------
+# The resume leg replays the SAME floor/fold/rank code path over judged rows:
+# host-junk rows never contend for enrichment slots, heuristic-junk fallback
+# rows keep the seed-corroboration rule, and every velocity/momentum figure is
+# scored against the bundle's momentum window - never the resume-time clock.
+
+
+def _seed_item(
+    item_id: str,
+    source: str,
+    title: str,
+    *,
+    points: int = 300,
+    comments: int = 40,
+    published_at: str = "2026-07-09",
+) -> schema.SourceItem:
+    engagement = (
+        {"score": points, "num_comments": comments}
+        if source == "reddit"
+        else {"points": points, "comments": comments}
+    )
+    return schema.SourceItem(
+        item_id=item_id,
+        source=source,
+        title=title,
+        body=title,
+        url=f"https://{source}.example/{item_id}",
+        published_at=published_at,
+        engagement=engagement,
+        snippet=f"Evidence about {title}",
+    )
+
+
+def _bundle_row(
+    nomination_id: str,
+    name: str,
+    items: list[schema.SourceItem],
+    *,
+    heuristic_junk: bool = False,
+) -> discovery_handoff.BundleNomination:
+    return discovery_handoff.BundleNomination(
+        nomination_id=nomination_id,
+        nomination=pipeline.Nomination(
+            name=name,
+            seed_score=50.0,
+            items=items,
+            summary=f"Summary of {name}",
+            junk_shape=heuristic_junk,
+            worthiness=None,
+        ),
+        cluster_id=f"c-{nomination_id}",
+        heuristic_name=name,
+        heuristic_junk=heuristic_junk,
+        sources=sorted({item.source for item in items}),
+        engagement_by_source={},
+    )
+
+
+def _resume_bundle(
+    rows: list[discovery_handoff.BundleNomination],
+    *,
+    tier: str = "deep",
+    to_date: str = "2026-07-10",
+) -> discovery_handoff.NominationsBundle:
+    return discovery_handoff.NominationsBundle(
+        schema_version=schema.DISCOVERY_NOMINATIONS_SCHEMA_VERSION,
+        bundle_id="cafef00dcafef00d",
+        generated_at=f"{to_date}T00:00:00Z",
+        from_date="2026-06-10",
+        to_date=to_date,
+        domain="AI agents",
+        tier=tier,
+        enrichment_source_boundary=None,
+        requested_sources=None,
+        lookback_days=30,
+        nominations=rows,
+    )
+
+
+def _judgment(name=None, junk=None, worthiness=None) -> discovery_handoff.HostJudgment:
+    return discovery_handoff.HostJudgment(name=name, junk=junk, worthiness=worthiness)
+
+
+def _enrich_spy(seen: dict):
+    def spy(nominations, **kwargs):
+        seen["nominations"] = list(nominations)
+        seen.update(kwargs)
+        return [pipeline.EnrichedTopic(nomination=n) for n in nominations]
+    return spy
+
+
+def test_resume_host_junk_never_takes_a_slot_next_candidate_does():
+    """AE4: a host-junk nomination is excluded from slot contention outright,
+    so the next blended candidate inherits its slot; a heuristic-junk fallback
+    row with a single seed source is skipped pre-enrichment (it structurally
+    cannot pass the floor's seed-corroboration rule)."""
+    rows = [
+        _bundle_row(f"n{index}", f"Story {chr(64 + index)}",
+                    [_seed_item(f"s{index}", "hackernews", f"Story {chr(64 + index)}",
+                                points=900 - 50 * index)])
+        for index in range(1, 8)  # n1..n7: one more than ENRICH_LIMIT
+    ]
+    rows.append(_bundle_row(
+        "n8", "Help me pick a framework",
+        [_seed_item("s8", "reddit", "Help me pick a framework", points=500)],
+        heuristic_junk=True,
+    ))
+    assert pipeline.ENRICH_LIMIT == 6
+    seen: dict = {}
+    judgments = {"n1": _judgment(junk=True)}
+    with mock.patch.object(pipeline, "enrich_nominations", side_effect=_enrich_spy(seen)):
+        pipeline.run_discover_resume(_resume_bundle(rows), judgments, config={})
+
+    enriched_names = [n.name for n in seen["nominations"]]
+    assert len(enriched_names) == pipeline.ENRICH_LIMIT
+    assert "Story A" not in enriched_names       # host-junk: no slot
+    assert "Story G" in enriched_names           # n7 takes the freed slot
+    assert "Help me pick a framework" not in enriched_names  # sub-floor junk fallback
+
+
+def test_resume_quiet_but_worthy_survives_the_cut():
+    """Relocated from the retired engine-judge suite, retargeted to the
+    judgments-file path: host worthiness blends into slot ranking BEFORE the
+    ENRICH_LIMIT cut, so a low-velocity worthiness-90 row survives while the
+    weakest of six high-velocity worthiness-10 rows is the one cut."""
+    rows = [
+        _bundle_row(f"n{index}", f"Viral story {chr(64 + index)}",
+                    [_seed_item(f"v{index}", "hackernews",
+                                f"Viral story {chr(64 + index)}",
+                                points=100 - index, comments=20)])
+        for index in range(1, 7)  # n1..n6 fill every slot on velocity alone
+    ]
+    rows.append(_bundle_row(
+        "n7", "Quiet maintainer burnout wave",
+        [_seed_item("q1", "hackernews", "Quiet maintainer burnout wave",
+                    points=45, comments=15)],
+    ))
+    judgments = {
+        f"n{index}": _judgment(worthiness=10) for index in range(1, 7)
+    }
+    judgments["n7"] = _judgment(worthiness=90)
+    seen: dict = {}
+    with mock.patch.object(pipeline, "enrich_nominations", side_effect=_enrich_spy(seen)):
+        pipeline.run_discover_resume(_resume_bundle(rows), judgments, config={})
+
+    enriched_names = [n.name for n in seen["nominations"]]
+    assert len(enriched_names) == pipeline.ENRICH_LIMIT
+    # The quiet-but-worthy row outranks every viral-but-junky one (blend
+    # multipliers span 0.5x-1.5x) and takes the top slot.
+    assert enriched_names[0] == "Quiet maintainer burnout wave"
+    # The weakest viral row is the one cut, not the quiet rescue.
+    assert "Viral story F" not in enriched_names
+
+
+def test_resume_judgments_omitting_row_falls_back_to_heuristics():
+    """AE2: a judgments file that omits a nomination is legal - the omitted
+    row keeps the bundle's heuristic name and junk flag, and the run
+    completes with both topics ranked."""
+    rows = [
+        _bundle_row("n1", "Kestrel avionics merger",
+                    [_seed_item("k1", "hackernews", "Kestrel avionics merger",
+                                points=900, comments=400)]),
+        _bundle_row("n2", "Sourdough robot bakery",
+                    [_seed_item("s1", "reddit", "Sourdough robot bakery",
+                                points=700, comments=300)]),
+    ]
+    judgments = {"n1": _judgment(name="Kestrel Merger Fallout", worthiness=80)}
+    topics_run: list[str] = []
+
+    def fake_run(*, topic, **_kwargs):
+        topics_run.append(topic)
+        raise RuntimeError("enrichment down")  # nomination-only is fine here
+
+    with mock.patch.object(pipeline, "run", side_effect=fake_run):
+        result = pipeline.run_discover_resume(_resume_bundle(rows), {}, config={})
+        report_heuristic_only = result.report
+        topics_run.clear()
+        result = pipeline.run_discover_resume(_resume_bundle(rows), judgments, config={})
+
+    report = result.report
+    assert report.outcome == "ok"
+    assert report_heuristic_only.outcome == "ok"
+    assert sorted(topics_run) == ["Kestrel Merger Fallout", "Sourdough robot bakery"]
+    names = [topic.name for topic in report.topics]
+    assert "Kestrel Merger Fallout" in names   # host name applied
+    assert "Sourdough robot bakery" in names   # omitted row: heuristic name
+    assert set(result.angle_inputs) == {"n1", "n2"}
+
+
+def test_resume_host_not_junk_clears_heuristic_junk_shape_at_floor():
+    """A host verdict junk=false overrides a junk heuristic shape: the row
+    reaches the floor with junk_shape=False, so the single-source engagement
+    bypass applies again."""
+    rows = [_bundle_row(
+        "n1", "Help me understand the Karvella doping ruling",
+        [_seed_item("s1", "reddit",
+                    "Help me understand the Karvella doping ruling",
+                    points=30, comments=400)],
+        heuristic_junk=True,
+    )]
+    judgments = {"n1": _judgment(name="Karvella doping ruling", junk=False)}
+    with mock.patch.object(
+        pipeline, "run", side_effect=RuntimeError("enrichment down"),
+    ):
+        result = pipeline.run_discover_resume(_resume_bundle(rows), judgments, config={})
+
+    report = result.report
+    assert report.outcome == "ok"
+    assert [topic.name for topic in report.topics] == ["Karvella doping ruling"]
+
+
+def test_resume_heuristic_junk_fallback_keeps_seed_corroboration_rule():
+    """A judgment-omitted junk-shaped row keeps its heuristic flag: with two
+    seed listing sources it earns a slot and clears the junk floor; the
+    single-seed-source twin never even enriches."""
+    title = "Help me understand the Marseille betting collapse"
+    corroborated = _bundle_row(
+        "n1", title,
+        [
+            _seed_item("s1", "reddit", title, points=40, comments=30),
+            _seed_item("s2", "hackernews", title, points=35, comments=20),
+        ],
+        heuristic_junk=True,
+    )
+    seen: dict = {}
+    with mock.patch.object(pipeline, "enrich_nominations", side_effect=_enrich_spy(seen)):
+        result = pipeline.run_discover_resume(
+            _resume_bundle([corroborated]), {}, config={},
+        )
+
+    assert [n.name for n in seen["nominations"]] == [title]
+    assert seen["nominations"][0].junk_shape is True  # heuristic flag survives
+    report = result.report
+    assert report.outcome == "ok"
+    assert [topic.name for topic in report.topics] == [title]
+
+
+def test_resume_zero_survivors_prefers_non_junk_weak_signal():
+    """Nothing-solid on the resume path: the strongest NON-junk floor failure
+    is named ahead of a higher-velocity host-junk exclusion, and no enrichment
+    slot is ever spent."""
+    rows = [
+        _bundle_row("n1", "Viral junk story",
+                    [_seed_item("s1", "hackernews", "Viral junk story", points=900)]),
+        _bundle_row("n2", "Quiet real story",
+                    [_seed_item("s2", "reddit", "Quiet real story",
+                                points=20, comments=6)]),
+    ]
+    judgments = {"n1": _judgment(junk=True)}
+    with mock.patch.object(
+        pipeline, "run", side_effect=RuntimeError("enrichment down"),
+    ):
+        result = pipeline.run_discover_resume(_resume_bundle(rows), judgments, config={})
+
+    report = result.report
+    assert report.topics == []
+    assert report.outcome == "nothing-solid"
+    assert report.weak_signal == "Quiet real story"
+    assert result.angle_inputs == {}
+    assert any("confidence floor" in warning for warning in report.warnings)
+
+
+def test_resume_all_host_junk_names_junk_weak_signal_and_skips_enrichment():
+    """Every row host-junked: the brief still names the strongest signal
+    (junk-tracked, never empty when failures exist) and enrichment never runs."""
+    rows = [
+        _bundle_row("n1", "Junk story one",
+                    [_seed_item("s1", "hackernews", "Junk story one", points=900)]),
+        _bundle_row("n2", "Junk story two",
+                    [_seed_item("s2", "reddit", "Junk story two", points=100)]),
+    ]
+    judgments = {"n1": _judgment(junk=True), "n2": _judgment(junk=True)}
+    with mock.patch.object(pipeline, "enrich_nominations") as enrich:
+        result = pipeline.run_discover_resume(_resume_bundle(rows), judgments, config={})
+
+    enrich.assert_not_called()
+    report = result.report
+    assert report.topics == []
+    assert report.outcome == "nothing-solid"
+    assert report.weak_signal == "Junk story one"
+
+
+def test_resume_velocity_and_momentum_pinned_to_bundle_window():
+    """Scenario 7: with a bundle whose to_date is NOT today, velocity and
+    momentum must be computed against the bundle window - identical to an
+    in-memory computation at that as_of date, and different from today's."""
+    items = [_seed_item("s1", "hackernews", "Window pinned story",
+                        points=900, comments=400, published_at="2026-07-09")]
+    rows = [_bundle_row("n1", "Window pinned story", items)]
+    with mock.patch.object(
+        pipeline, "run", side_effect=RuntimeError("enrichment down"),
+    ):
+        result = pipeline.run_discover_resume(
+            _resume_bundle(rows, to_date="2026-07-10"), {}, config={},
+        )
+
+    report = result.report
+    assert len(report.topics) == 1
+    topic = report.topics[0]
+    expected = round(rerank.discovery_velocity_score(items, as_of_date="2026-07-10"), 2)
+    assert topic.velocity_score == expected
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    at_today = round(rerank.discovery_velocity_score(items, as_of_date=today), 2)
+    assert topic.velocity_score != at_today
+    # Published 1 day before the bundle window's end: new-this-week by the
+    # bundle clock even though it is weeks old by the resume-time clock.
+    assert topic.momentum == "new-this-week"
+
+
+def test_resume_reuses_same_story_fold_and_velocity_ranks(capsys):
+    """The committed fold/rank path runs on leg 2 too: two judged survivors
+    sharing enriched evidence fold to the higher-velocity one, and the angle
+    inputs are keyed by the SURVIVING nomination id only."""
+    shared_comment = {
+        "text": "The merger filings quietly admit the unit was insolvent",
+        "score": 1635,
+        "author": "modelwatcher",
+    }
+    rows = [
+        _bundle_row("n1", KESTREL_TITLE,
+                    [_seed_item("k1", "hackernews", KESTREL_TITLE, points=900)]),
+        _bundle_row("n2", SOURDOUGH_TITLE,
+                    [_seed_item("s1", "hackernews", SOURDOUGH_TITLE, points=700)]),
+    ]
+
+    def fake_run(*, topic, **_kwargs):
+        strong = "Kestrel" in topic
+        return _fake_report(topic, [
+            _evidence_item(
+                f"{topic[:4]}-a", "reddit", topic,
+                "https://reddit.com/r/aero/comments/shared1",
+                score=900 if strong else 300,
+                comments=300 if strong else 100,
+                top_comments=[shared_comment],
+            ),
+            _evidence_item(
+                f"{topic[:4]}-b", "hackernews", topic,
+                "https://news.example.com/shared2",
+                score=500 if strong else 200,
+                comments=200 if strong else 80,
+            ),
+        ])
+
+    with mock.patch.object(pipeline, "run", side_effect=fake_run):
+        result = pipeline.run_discover_resume(_resume_bundle(rows), {}, config={})
+
+    report = result.report
+    assert report.outcome == "ok"
+    assert len(report.topics) == 1
+    assert report.topics[0].rank == 1
+    assert "Kestrel" in report.topics[0].name
+    assert list(result.angle_inputs) == ["n1"]
+    entry = result.angle_inputs["n1"]
+    assert set(entry) == {"name", "titles", "top_comment", "engagement"}
+    assert entry["name"] == report.topics[0].name
+    assert "folded duplicate story" in capsys.readouterr().err

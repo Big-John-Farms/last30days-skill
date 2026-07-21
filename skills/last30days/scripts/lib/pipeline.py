@@ -1237,6 +1237,180 @@ def nominate_nothing_solid_report(result: DiscoverNominateResult) -> schema.Disc
     )
 
 
+def _floor_survivor_records(
+    enriched_entries: list[EnrichedTopic],
+    *,
+    to_date: str,
+    topic_limit: int,
+) -> tuple[
+    list[dict[str, Any]],
+    tuple[float, str] | None,
+    tuple[float, str] | None,
+]:
+    """Apply the discovery confidence floor to enriched entries in order,
+    returning the survivor records plus the strongest non-junk and junk weak
+    signals among the failures.
+
+    Shared verbatim by ``run_discover`` (one-shot) and ``run_discover_resume``
+    (protocol leg 2) so floor semantics can never drift between the paths.
+    """
+    survivors: list[dict[str, Any]] = []
+    weak_signal: tuple[float, str] | None = None
+    junk_weak_signal: tuple[float, str] | None = None
+    for entry in enriched_entries:
+        nomination = entry.nomination
+        evidence_items = _enriched_evidence_items(entry)
+        sources = sorted({item.source for item in evidence_items})
+        native_total = sum(
+            rerank.discovery_engagement_total(item) for item in evidence_items
+        )
+        score = rerank.discovery_velocity_score(evidence_items, as_of_date=to_date)
+        if not rerank.passes_discovery_floor(
+            source_count=len(sources),
+            engagement_total=native_total,
+            item_count=len(evidence_items),
+            junk_shape=nomination.junk_shape,
+            # Junk corroboration counts distinct SEED listing sources, never
+            # the enriched corpus - a successful enrichment pass is
+            # multi-source for almost any topic, so it would never bind.
+            seed_source_count=len({item.source for item in nomination.items}),
+        ):
+            # Sub-floor evidence never ranks; remember what came closest so a
+            # nothing-solid brief can still name the strongest weak signal.
+            # Junk-shaped failures are tracked separately: the brief prefers
+            # the strongest NON-junk failure and names a junk one only when
+            # every failure is junk-shaped (never empty when failures exist).
+            if nomination.junk_shape:
+                if junk_weak_signal is None or score > junk_weak_signal[0]:
+                    junk_weak_signal = (score, nomination.name)
+            elif weak_signal is None or score > weak_signal[0]:
+                weak_signal = (score, nomination.name)
+            continue
+        if len(survivors) >= topic_limit:
+            break
+        source_phrase = ", ".join(sources[:-1]) + (
+            f" and {sources[-1]}" if len(sources) > 1 else (sources[0] if sources else "the listings")
+        )
+        noun = "evidence item" if entry.report is not None else "listing item"
+        why = (
+            f"{len(evidence_items)} {noun}{'s' if len(evidence_items) != 1 else ''} on "
+            f"{source_phrase} generated {native_total:,.0f} native interactions. "
+            f"{nomination.summary[:220]}"
+        )
+        top_comment = _best_community_comment(evidence_items) if entry.report is not None else None
+        # Stage-2 angle input: the survivor's strongest evidence, enriched
+        # corpus when the pipeline pass succeeded, seed items otherwise
+        # (evidence_items already resolves that).
+        top_titles = [
+            item.title.strip()
+            for item in sorted(
+                evidence_items,
+                key=rerank.discovery_engagement_total,
+                reverse=True,
+            )
+            if item.title and item.title.strip()
+        ][:3]
+        survivors.append({
+            "name": nomination.name,
+            "why": why,
+            "momentum": _discovery_momentum(evidence_items, to_date),
+            "velocity_score": round(score, 2),
+            "sources": sources,
+            "engagement_by_source": _discovery_engagement(evidence_items),
+            "evidence_urls": list(dict.fromkeys(item.url for item in evidence_items if item.url))[:5],
+            "top_comment": top_comment,
+            "titles": "; ".join(top_titles),
+            "engagement_phrase": f"{native_total:,.0f} native interactions across {source_phrase}",
+        })
+    return survivors, weak_signal, junk_weak_signal
+
+
+def _fold_same_story_records(survivors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Same-story fold + velocity ordering over floor-survivor records.
+
+    Floor survivors that share enriched evidence are the SAME story wearing
+    two judged names (the real-run failure: two topics quoting the identical
+    1,635-vote comment). Duplicates = identical non-None top comment OR >= 2
+    shared evidence URLs; the lower-velocity twin is dropped. Selection stays
+    seed-ordered upstream; this only prunes, then sorts by displayed velocity
+    (stable) so rank 1 is the highest velocity_score.
+    """
+    def _same_story(a: dict[str, Any], b: dict[str, Any]) -> bool:
+        if a["top_comment"] is not None and a["top_comment"] == b["top_comment"]:
+            return True
+        return len(set(a["evidence_urls"]) & set(b["evidence_urls"])) >= 2
+
+    folded: list[dict[str, Any]] = []
+    for record in survivors:
+        dup_index = next(
+            (index for index, kept in enumerate(folded) if _same_story(record, kept)),
+            None,
+        )
+        if dup_index is None:
+            folded.append(record)
+            continue
+        kept = folded[dup_index]
+        if record["velocity_score"] > kept["velocity_score"]:
+            folded[dup_index] = record
+            dropped_name, kept_name = kept["name"], record["name"]
+        else:
+            dropped_name, kept_name = record["name"], kept["name"]
+        log.source_log(
+            "Discover",
+            f"folded duplicate story {dropped_name!r} into {kept_name!r} (shared evidence)",
+            tty_only=False,
+        )
+
+    folded.sort(key=lambda record: record["velocity_score"], reverse=True)
+    return folded
+
+
+def _records_to_discovery_topics(
+    folded: list[dict[str, Any]],
+) -> list[schema.DiscoveryTopic]:
+    """Folded survivor records to ranked topics (ranks = 1-based positions)."""
+    return [
+        schema.DiscoveryTopic(
+            rank=position,
+            name=record["name"],
+            why_spiking=record["why"],
+            momentum=record["momentum"],
+            velocity_score=record["velocity_score"],
+            sources=record["sources"],
+            engagement_by_source=record["engagement_by_source"],
+            command=f'/last30days "{record["name"].replace(chr(34), chr(39))}"',
+            evidence_urls=record["evidence_urls"],
+            top_comment=record["top_comment"],
+            corroboration_count=len(record["sources"]),
+        )
+        for position, record in enumerate(folded, start=1)
+    ]
+
+
+def _discovery_report_warnings(
+    topics: list[schema.DiscoveryTopic],
+    outcome: str,
+    source_status: dict[str, schema.SourceOutcome],
+) -> list[str]:
+    """Coverage warnings shared by the one-shot and resume discovery paths.
+    The resume leg passes an empty ``source_status`` - it never re-sweeps, so
+    it has no degraded-feed signal to report."""
+    warnings: list[str] = []
+    if outcome == "nothing-solid":
+        warnings.append(
+            "No topic cleared the discovery confidence floor this window; "
+            "reporting nothing solid instead of ranked noise."
+        )
+    elif len(topics) < 5:
+        warnings.append("Fewer than five topic clusters cleared the confidence floor this window.")
+    if topics and all(len(topic.sources) == 1 for topic in topics):
+        warnings.append("Discovery evidence is single-source; configure Digg for broader confirmation.")
+    failed = _degraded_discovery_sources(source_status)
+    if failed:
+        warnings.append(f"Some discovery sources degraded: {', '.join(sorted(failed))}.")
+    return warnings
+
+
 def run_discover(
     *,
     domain: str,
@@ -1316,133 +1490,21 @@ def run_discover(
             EnrichedTopic(nomination=nomination) for nomination in nominations
         ]
 
-    survivors: list[dict[str, Any]] = []
-    weak_signal: tuple[float, str] | None = None
-    junk_weak_signal: tuple[float, str] | None = None
-    for entry in enriched_entries:
-        nomination = entry.nomination
-        evidence_items = _enriched_evidence_items(entry)
-        sources = sorted({item.source for item in evidence_items})
-        native_total = sum(
-            rerank.discovery_engagement_total(item) for item in evidence_items
-        )
-        score = rerank.discovery_velocity_score(evidence_items, as_of_date=to_date)
-        if not rerank.passes_discovery_floor(
-            source_count=len(sources),
-            engagement_total=native_total,
-            item_count=len(evidence_items),
-            junk_shape=nomination.junk_shape,
-            # Junk corroboration counts distinct SEED listing sources, never
-            # the enriched corpus - a successful enrichment pass is
-            # multi-source for almost any topic, so it would never bind.
-            seed_source_count=len({item.source for item in nomination.items}),
-        ):
-            # Sub-floor evidence never ranks; remember what came closest so a
-            # nothing-solid brief can still name the strongest weak signal.
-            # Junk-shaped failures are tracked separately: the brief prefers
-            # the strongest NON-junk failure and names a junk one only when
-            # every failure is junk-shaped (never empty when failures exist).
-            if nomination.junk_shape:
-                if junk_weak_signal is None or score > junk_weak_signal[0]:
-                    junk_weak_signal = (score, nomination.name)
-            elif weak_signal is None or score > weak_signal[0]:
-                weak_signal = (score, nomination.name)
-            continue
-        if len(survivors) >= topic_limit:
-            break
-        source_phrase = ", ".join(sources[:-1]) + (
-            f" and {sources[-1]}" if len(sources) > 1 else (sources[0] if sources else "the listings")
-        )
-        noun = "evidence item" if entry.report is not None else "listing item"
-        why = (
-            f"{len(evidence_items)} {noun}{'s' if len(evidence_items) != 1 else ''} on "
-            f"{source_phrase} generated {native_total:,.0f} native interactions. "
-            f"{nomination.summary[:220]}"
-        )
-        top_comment = _best_community_comment(evidence_items) if entry.report is not None else None
-        # Stage-2 angle input: the survivor's strongest evidence, enriched
-        # corpus when the pipeline pass succeeded, seed items otherwise
-        # (evidence_items already resolves that).
-        top_titles = [
-            item.title.strip()
-            for item in sorted(
-                evidence_items,
-                key=rerank.discovery_engagement_total,
-                reverse=True,
-            )
-            if item.title and item.title.strip()
-        ][:3]
-        survivors.append({
-            "name": nomination.name,
-            "why": why,
-            "momentum": _discovery_momentum(evidence_items, to_date),
-            "velocity_score": round(score, 2),
-            "sources": sources,
-            "engagement_by_source": _discovery_engagement(evidence_items),
-            "evidence_urls": list(dict.fromkeys(item.url for item in evidence_items if item.url))[:5],
-            "top_comment": top_comment,
-            "titles": "; ".join(top_titles),
-            "engagement_phrase": f"{native_total:,.0f} native interactions across {source_phrase}",
-        })
-
-    # Same-story fold: floor survivors that share enriched evidence are the
-    # SAME story wearing two judged names (the real-run failure: two topics
-    # quoting the identical 1,635-vote comment). Duplicates = identical
-    # non-None top comment OR >= 2 shared evidence URLs; the lower-velocity
-    # twin is dropped. Selection above stays seed-ordered; this only prunes.
-    def _same_story(a: dict[str, Any], b: dict[str, Any]) -> bool:
-        if a["top_comment"] is not None and a["top_comment"] == b["top_comment"]:
-            return True
-        return len(set(a["evidence_urls"]) & set(b["evidence_urls"])) >= 2
-
-    folded: list[dict[str, Any]] = []
-    for record in survivors:
-        dup_index = next(
-            (index for index, kept in enumerate(folded) if _same_story(record, kept)),
-            None,
-        )
-        if dup_index is None:
-            folded.append(record)
-            continue
-        kept = folded[dup_index]
-        if record["velocity_score"] > kept["velocity_score"]:
-            folded[dup_index] = record
-            dropped_name, kept_name = kept["name"], record["name"]
-        else:
-            dropped_name, kept_name = record["name"], kept["name"]
-        log.source_log(
-            "Discover",
-            f"folded duplicate story {dropped_name!r} into {kept_name!r} (shared evidence)",
-            tty_only=False,
-        )
-
-    # Presentation order follows displayed velocity (stable sort): rank 1 is
-    # the highest velocity_score, ranks equal 1-based list positions.
-    folded.sort(key=lambda record: record["velocity_score"], reverse=True)
-
-    topics: list[schema.DiscoveryTopic] = []
-    angle_entries: list[dict[str, str]] = []
-    for position, record in enumerate(folded, start=1):
-        topics.append(schema.DiscoveryTopic(
-            rank=position,
-            name=record["name"],
-            why_spiking=record["why"],
-            momentum=record["momentum"],
-            velocity_score=record["velocity_score"],
-            sources=record["sources"],
-            engagement_by_source=record["engagement_by_source"],
-            command=f'/last30days "{record["name"].replace(chr(34), chr(39))}"',
-            evidence_urls=record["evidence_urls"],
-            top_comment=record["top_comment"],
-            corroboration_count=len(record["sources"]),
-        ))
-        angle_entries.append({
+    survivors, weak_signal, junk_weak_signal = _floor_survivor_records(
+        enriched_entries, to_date=to_date, topic_limit=topic_limit,
+    )
+    folded = _fold_same_story_records(survivors)
+    topics = _records_to_discovery_topics(folded)
+    angle_entries = [
+        {
             "topic_id": f"topic-{position}",
             "name": record["name"],
             "titles": record["titles"],
             "top_comment": record["top_comment"] or "",
             "engagement": record["engagement_phrase"],
-        })
+        }
+        for position, record in enumerate(folded, start=1)
+    ]
 
     # Stage-2 angle pass: ONE batched call over the floor survivors turns
     # each surfaced topic into a podcast hook and an X-article hook, reusing
@@ -1472,20 +1534,6 @@ def run_discover(
 
     outcome = "ok" if topics else "nothing-solid"
 
-    warnings: list[str] = []
-    if outcome == "nothing-solid":
-        warnings.append(
-            "No topic cleared the discovery confidence floor this window; "
-            "reporting nothing solid instead of ranked noise."
-        )
-    elif len(topics) < 5:
-        warnings.append("Fewer than five topic clusters cleared the confidence floor this window.")
-    if topics and all(len(topic.sources) == 1 for topic in topics):
-        warnings.append("Discovery evidence is single-source; configure Digg for broader confirmation.")
-    failed = _degraded_discovery_sources(source_status)
-    if failed:
-        warnings.append(f"Some discovery sources degraded: {', '.join(sorted(failed))}.")
-
     return schema.DiscoveryReport(
         domain=plan.domain,
         range_from=from_date,
@@ -1494,10 +1542,221 @@ def run_discover(
         plan=plan,
         topics=topics,
         source_status=source_status,
-        warnings=warnings,
+        warnings=_discovery_report_warnings(topics, outcome, source_status),
         outcome=outcome,
         weak_signal=weak_signal[1] if weak_signal and not topics else None,
     )
+
+
+# Protocol leg 2 (resume) deep-tier enrichment bounds. The module-level
+# ENRICH_* constants above stay the one-shot --discover contract (quick depth,
+# 240s budget, 3 workers); a deep-tier bundle upgrades its per-topic sub-runs
+# to the default research depth with a wider wall-clock budget and one more
+# worker, because leg 2 is the protocol's only research pass. Shallow-tier
+# bundles keep the one-shot quick constants. Both tiers flow through
+# enrich_nominations' PARAMETERS - the constants themselves are never edited,
+# so neither tier can leak into the other path.
+RESUME_DEEP_ENRICH_DEPTH = "default"
+RESUME_DEEP_ENRICH_MAX_WORKERS = 4
+RESUME_DEEP_ENRICH_BUDGET_SECONDS = 450.0
+
+
+def _resume_enrich_budget_seconds(config: dict[str, Any]) -> float:
+    """Deep-tier batch budget: LAST30DAYS_ENRICH_BUDGET_SECONDS from the
+    RESOLVED config dict only (env.get_config already layers the process env
+    over the .env files) - never read from bare os.environ. Blank,
+    non-numeric, or non-positive values fall back to the 450s default."""
+    raw = config.get("LAST30DAYS_ENRICH_BUDGET_SECONDS")
+    if raw is None or str(raw).strip() == "":
+        return RESUME_DEEP_ENRICH_BUDGET_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return RESUME_DEEP_ENRICH_BUDGET_SECONDS
+    return value if value > 0 else RESUME_DEEP_ENRICH_BUDGET_SECONDS
+
+
+@dataclass(frozen=True)
+class DiscoverResumeResult:
+    """Leg 2 output of the host-judged discovery protocol: the floored,
+    folded, velocity-ranked report plus the per-topic angle inputs (keyed by
+    surviving nomination id) that the host writes leg-3 angles from.
+    ``report.source_status`` is empty by design - leg 2 resumes from the
+    bundle and never re-sweeps the listing feeds."""
+
+    report: schema.DiscoveryReport
+    angle_inputs: dict[str, dict[str, str]]
+
+
+def run_discover_resume(
+    bundle: Any,
+    judgments: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    mock: bool = False,
+) -> DiscoverResumeResult:
+    """Protocol leg 2: apply host judgments to the leg-1 bundle, enrich the
+    slot winners, and floor/fold/rank on the same code path as the one-shot
+    run.
+
+    ``bundle`` is a ``discovery_handoff.NominationsBundle`` and ``judgments``
+    the mapping ``discovery_handoff.read_judgments`` returns (annotated
+    loosely because discovery_handoff imports this module at load time).
+
+    Judgment application is per field: an absent host name falls back to the
+    bundle's heuristic name, an absent junk flag to the heuristic junk flag,
+    and absent worthiness to the neutral blend default (None -> 50 inside
+    ``rerank.judge_blended_score`` - the same treatment the judge-absent path
+    always used). Applied names are collision-resolved over the whole pool
+    before anything keys on them, and the applied name IS the enrichment
+    sub-run topic.
+
+    Slot selection: host-junk rows never contend for enrichment slots, and a
+    heuristic-junk fallback row with fewer than ``rerank.FLOOR_MIN_SOURCES``
+    distinct seed sources is skipped pre-enrichment (it structurally cannot
+    pass the floor's seed-corroboration rule). Both stay eligible to be the
+    junk-tracked weak signal of a nothing-solid brief, and the brief prefers
+    a non-junk weak signal exactly like the one-shot path. At the floor,
+    host-judged rows pass ``junk_shape=False`` (host-junk never earned a
+    slot) while heuristic-fallback rows keep their heuristic flag with the
+    existing seed-source corroboration.
+
+    Velocity, momentum, and the enrichment window all score against the
+    bundle's momentum window (from_date/to_date), never the resume-time
+    clock: the host may judge up to the handoff TTL after the sweep, and the
+    numbers must describe the window the sweep captured.
+    """
+    # Runtime-only import: discovery_handoff imports pipeline at module load,
+    # so the reverse import must happen at call time (no import-time cycle).
+    from . import discovery_handoff
+
+    to_date = bundle.to_date
+    verdicts = [
+        discovery_handoff.judgment_for(judgments, entry.nomination_id)
+        for entry in bundle.nominations
+    ]
+    applied_names = discovery_handoff.resolve_name_collisions([
+        (
+            entry.nomination,
+            verdict.name or entry.heuristic_name or entry.nomination.name,
+        )
+        for entry, verdict in zip(bundle.nominations, verdicts)
+    ])
+
+    ranked: list[tuple[float, str, Nomination]] = []
+    junk_weak_signal: tuple[float, str] | None = None
+    for entry, verdict, name in zip(bundle.nominations, verdicts, applied_names):
+        items = entry.nomination.items
+        velocity = rerank.discovery_velocity_score(items, as_of_date=to_date)
+        seed_source_count = len({item.source for item in items})
+        host_junk = verdict.junk is True
+        fallback_junk = verdict.junk is None and entry.heuristic_junk
+        if host_junk or (
+            fallback_junk and seed_source_count < rerank.FLOOR_MIN_SOURCES
+        ):
+            if junk_weak_signal is None or velocity > junk_weak_signal[0]:
+                junk_weak_signal = (velocity, name)
+            continue
+        worthiness = (
+            float(verdict.worthiness) if verdict.worthiness is not None else None
+        )
+        blended = rerank.judge_blended_score(velocity, worthiness)
+        ranked.append((
+            blended,
+            entry.nomination_id,
+            replace(
+                entry.nomination,
+                name=name,
+                seed_score=blended,
+                junk_shape=(
+                    False if verdict.junk is not None else entry.heuristic_junk
+                ),
+                worthiness=worthiness,
+            ),
+        ))
+
+    ranked.sort(key=lambda row: (-row[0], row[2].name.lower()))
+    selected = ranked[:ENRICH_LIMIT]
+    nominations = [nomination for _blended, _nomination_id, nomination in selected]
+
+    if bundle.tier == "shallow":
+        depth, max_workers, budget_seconds = (
+            ENRICH_DEPTH, ENRICH_MAX_WORKERS, ENRICH_BUDGET_SECONDS,
+        )
+    else:
+        depth = RESUME_DEEP_ENRICH_DEPTH
+        max_workers = RESUME_DEEP_ENRICH_MAX_WORKERS
+        budget_seconds = _resume_enrich_budget_seconds(config)
+
+    enriched_entries = enrich_nominations(
+        nominations,
+        config=config,
+        requested_sources=bundle.enrichment_source_boundary,
+        mock=mock,
+        depth=depth,
+        lookback_days=bundle.lookback_days,
+        as_of_date=to_date,
+        max_workers=max_workers,
+        budget_seconds=budget_seconds,
+    ) if nominations else []
+
+    # topic_limit mirrors the one-shot default cap (limit=10); the slot cut
+    # above already bounds the pool at ENRICH_LIMIT.
+    survivors, weak_signal, floor_junk_weak_signal = _floor_survivor_records(
+        enriched_entries, to_date=to_date, topic_limit=10,
+    )
+    if floor_junk_weak_signal is not None and (
+        junk_weak_signal is None
+        or floor_junk_weak_signal[0] > junk_weak_signal[0]
+    ):
+        junk_weak_signal = floor_junk_weak_signal
+    folded = _fold_same_story_records(survivors)
+    topics = _records_to_discovery_topics(folded)
+
+    nomination_id_by_name = {
+        nomination.name: nomination_id
+        for _blended, nomination_id, nomination in selected
+    }
+    angle_inputs = {
+        nomination_id_by_name[record["name"]]: {
+            "name": record["name"],
+            "titles": record["titles"],
+            "top_comment": record["top_comment"] or "",
+            "engagement": record["engagement_phrase"],
+        }
+        for record in folded
+    }
+
+    if weak_signal is None:
+        weak_signal = junk_weak_signal
+    outcome = "ok" if topics else "nothing-solid"
+    plan = schema.DiscoveryPlan(
+        domain=bundle.domain,
+        category=None,
+        subreddits=[],
+        sources=(
+            list(bundle.requested_sources)
+            if bundle.requested_sources
+            else sorted({
+                item.source
+                for entry in bundle.nominations
+                for item in entry.nomination.items
+            })
+        ),
+    )
+    report = schema.DiscoveryReport(
+        domain=bundle.domain,
+        range_from=bundle.from_date,
+        range_to=to_date,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        plan=plan,
+        topics=topics,
+        source_status={},
+        warnings=_discovery_report_warnings(topics, outcome, {}),
+        outcome=outcome,
+        weak_signal=weak_signal[1] if weak_signal and not topics else None,
+    )
+    return DiscoverResumeResult(report=report, angle_inputs=angle_inputs)
 
 
 def diagnose(

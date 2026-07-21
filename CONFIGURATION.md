@@ -452,6 +452,7 @@ Relevant tables: `topics`, `research_runs`, `findings`, `settings`. Schema: [`sc
 | Var | Effect |
 | --- | --- |
 | `LAST30DAYS_DISCOVERY_QUEUE` | Set to `off` to disable queue writes and card annotations. Any other value (or unset) keeps the queue on. Works shell-exported or in `.env`. |
+| `LAST30DAYS_ENRICH_BUDGET_SECONDS` | Wall-clock budget (seconds) for the deep-tier per-topic research batch on the discovery resume leg (`--discover --judgments <file>`). Default `450`; unset/invalid/non-positive values fall back to it. The one-shot `--discover` path keeps its fixed quick-tier 240s budget regardless. Works shell-exported or in `.env`. |
 
 Manage the queue from the engine CLI:
 
