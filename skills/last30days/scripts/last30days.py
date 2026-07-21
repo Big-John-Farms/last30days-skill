@@ -1294,6 +1294,129 @@ def _save_discovery_output(
     raise RuntimeError("Could not find a unique discovery output filename")
 
 
+def _annotate_and_record_discovery_queue(
+    report: schema.DiscoveryReport,
+    args: argparse.Namespace,
+    config: dict[str, object],
+) -> schema.DiscoveryReport:
+    """Stamp queue annotations onto report topics, then record this surfacing.
+
+    Order matters: annotations describe the queue state BEFORE this run, so
+    each topic is matched first and recorded second. The queue is on by
+    default; the resolved config value LAST30DAYS_DISCOVERY_QUEUE == "off"
+    (env var or .env, via env.get_config) disables it. Scoped runs
+    (--save-dir) write the scoped research.db, never the global one. Runs
+    synchronously after the pipeline returns - this writes disk, so the
+    abandon-on-timeout daemon-thread pattern is forbidden here.
+    """
+    queue_setting = str(config.get("LAST30DAYS_DISCOVERY_QUEUE") or "").strip().lower()
+    if queue_setting == "off" or not report.topics:
+        return report
+
+    import dataclasses
+
+    import store
+
+    run_ref = f"discover:{report.domain or 'trending'}:{report.generated_at}"
+    as_of = (report.generated_at or "")[:10] or report.range_to
+    annotated: list[schema.DiscoveryTopic] = []
+    with store.scoped_db(_scoped_store_db(args)):
+        store.init_db()
+        for topic in report.topics:
+            prior = store.match_discovery_topic(topic.name)
+            if prior:
+                topic = dataclasses.replace(
+                    topic,
+                    previously_surfaced_count=prior["surface_count"],
+                    last_surfaced=prior["last_surfaced"],
+                    covered=prior["status"] == "covered",
+                )
+            store.record_discovery_surfacing(
+                topic.name,
+                domain=report.domain,
+                run_ref=run_ref,
+                as_of=as_of,
+            )
+            annotated.append(topic)
+    return dataclasses.replace(report, topics=annotated)
+
+
+def _run_queue_list(args: argparse.Namespace, config: dict[str, object]) -> int:
+    """List uncovered surfaced topics from the persistent discovery queue."""
+    import store
+
+    db_path = _scoped_store_db(args)
+    if not Path(db_path or store.DB_PATH).exists():
+        print("Discovery queue is empty - no discovery run has recorded topics yet.")
+        return 0
+    with store.scoped_db(db_path):
+        rows = store.list_discovery_queue(status="surfaced")
+    if not rows:
+        print("Discovery queue is empty - every surfaced topic is marked covered.")
+        return 0
+
+    headers = ("name", "domain", "surface_count", "last_surfaced", "status")
+    table = [
+        (
+            str(row["name"]),
+            str(row["domain"] or "-"),
+            str(row["surface_count"]),
+            str(row["last_surfaced"]),
+            str(row["status"]),
+        )
+        for row in rows
+    ]
+    widths = [
+        max(len(headers[column]), *(len(row[column]) for row in table))
+        for column in range(len(headers))
+    ]
+    lines = [
+        "  ".join(header.ljust(widths[i]) for i, header in enumerate(headers)).rstrip(),
+        "  ".join("-" * widths[i] for i in range(len(headers))),
+    ]
+    lines.extend(
+        "  ".join(row[i].ljust(widths[i]) for i in range(len(headers))).rstrip()
+        for row in table
+    )
+    print("\n".join(lines))
+    return 0
+
+
+def _run_queue_cover(
+    args: argparse.Namespace,
+    config: dict[str, object],
+    name: str,
+) -> int:
+    """Mark a queued discovery topic covered; unknown names error loudly."""
+    import store
+
+    if not name:
+        sys.stderr.write(
+            "[last30days] queue cover requires a topic name: "
+            'queue cover "<topic name>".\n'
+        )
+        return 2
+    db_path = _scoped_store_db(args)
+    if not Path(db_path or store.DB_PATH).exists():
+        sys.stderr.write(
+            f"[last30days] No queued topic named {name!r}: the discovery queue "
+            "is empty (no discovery run has recorded topics yet).\n"
+        )
+        return 2
+    with store.scoped_db(db_path):
+        row = store.mark_discovery_covered(
+            name, as_of=datetime.date.today().isoformat()
+        )
+    if row is None:
+        sys.stderr.write(
+            f"[last30days] No queued topic named {name!r}. Covering requires "
+            "the exact topic name; run 'queue list' to see queued names.\n"
+        )
+        return 2
+    print(f"Marked covered: {row['name']} (covered {row['covered_at']})")
+    return 0
+
+
 def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
     domain = " ".join(str(args.discover or "").split())
     # Empty domain = global trending: sweep every river feed's hot list with no
@@ -1307,8 +1430,6 @@ def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
     if args.emit == "html" or args.publish_html:
         sys.stderr.write("[last30days] discovery mode does not support HTML publishing yet.\n")
         return 2
-    if args.store:
-        sys.stderr.write("[last30days] Warning: --store is not used by discovery mode.\n")
     if args.synthesis_file:
         sys.stderr.write("[last30days] Warning: --synthesis-file is not used by discovery mode.\n")
 
@@ -1357,6 +1478,13 @@ def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
     except ValueError as exc:
         sys.stderr.write(f"[last30days] {exc}\n")
         return 2
+
+    # Persistent topic queue: annotate this report from prior surfacings, then
+    # record this run's surfacings - BEFORE rendering/export so the Pipeline
+    # line and the JSON queue fields see the annotations. Mock runs stay 100%
+    # side-effect-free.
+    if not args.mock:
+        report = _annotate_and_record_discovery_queue(report, args, config)
 
     if args.emit == "json":
         payload = schema.to_dict(report) if args.json_profile == "raw" else schema.to_discovery_export(report)
@@ -1703,12 +1831,19 @@ def _config_policy_for_args(args: argparse.Namespace, topic: str, extra_argv: li
         or normalized_topic == "library search"
         or normalized_topic.startswith("library search ")
     )
+    # Queue commands are local SQLite reads/writes: like library commands they
+    # must never trigger browser-cookie extraction or Keychain prompts.
+    is_queue_command = (
+        normalized_topic == "queue list"
+        or normalized_topic == "queue cover"
+        or normalized_topic.startswith("queue cover ")
+    )
     is_cached_verification = bool(getattr(args, "verify_freshness", None)) and not normalized_topic
     if args.no_browser_cookies:
         browser_mode = "off"
     elif (
         args.diagnose or args.preflight or normalized_topic == "doctor"
-        or is_library_command or is_cached_verification
+        or is_library_command or is_queue_command or is_cached_verification
     ):
         # doctor is plan-only like --diagnose: it must never read cookies.
         # Cache-only freshness verification hits only point APIs (Polymarket,
@@ -2052,6 +2187,11 @@ def _main(
         return _run_library_feed(args, config)
     if topic.lower() == "library search" or topic.lower().startswith("library search "):
         return _run_library_search(args, config, topic[len("library search") :].strip())
+
+    if topic.lower() == "queue list":
+        return _run_queue_list(args, config)
+    if topic.lower() == "queue cover" or topic.lower().startswith("queue cover "):
+        return _run_queue_cover(args, config, topic[len("queue cover") :].strip())
 
     # Handle setup subcommand
     if topic.lower() == "setup":

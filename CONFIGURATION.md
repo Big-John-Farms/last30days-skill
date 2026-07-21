@@ -445,6 +445,27 @@ Adding `--store` to any run persists every finding to a SQLite database (default
 
 Relevant tables: `topics`, `research_runs`, `findings`, `settings`. Schema: [`scripts/store.py`](skills/last30days/scripts/store.py).
 
+### Discovery topic queue (`LAST30DAYS_DISCOVERY_QUEUE`)
+
+`--discover` runs remember what they surfaced (table `discovery_topics` in the same research.db). Re-surfaced topics get a `**Pipeline:**` line on their card ("surfaced 2nd time in 30 days", "marked covered 2026-07-14") so the discovery brief doubles as a podcast / X-article content pipeline. On by default for real runs; `--mock` runs never write. With `--save-dir`, queue rows land in that directory's scoped `research.db`, never the global one.
+
+| Var | Effect |
+| --- | --- |
+| `LAST30DAYS_DISCOVERY_QUEUE` | Set to `off` to disable queue writes and card annotations. Any other value (or unset) keeps the queue on. Works shell-exported or in `.env`. |
+
+Manage the queue from the engine CLI:
+
+```bash
+# Uncovered surfaced topics (name, domain, surface_count, last_surfaced, status)
+python3 skills/last30days/scripts/last30days.py queue list
+
+# Mark a topic done after you record the episode / publish the article.
+# Requires the exact topic name; unknown names exit 2 instead of no-opping.
+python3 skills/last30days/scripts/last30days.py queue cover "Gemma 4 chat templates"
+```
+
+Both respect `--save-dir` scoping.
+
 ### `watchlist.py` - recurring topics
 
 [`scripts/watchlist.py`](skills/last30days/scripts/watchlist.py) manages topics that should be researched on a schedule. Subcommands: `add`, `remove`, `list`, `run-one`, `run-all`, `config`. Built-in delivery to Slack incoming webhooks (`hooks.slack.com/...`) or any HTTPS endpoint, fired only when new findings appear.

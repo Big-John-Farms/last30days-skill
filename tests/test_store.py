@@ -848,6 +848,193 @@ def test_get_new_findings_filters_by_date(temp_db, sample_report):
 
     assert len(new_findings) == 4
 
+# === Tests for the discovery topic queue (migration 3, U6) ===
+
+
+def test_init_db_reaches_migration_3_with_discovery_topics_table(temp_db):
+    """A fresh database lands on migration 3 with the queue table present."""
+    conn = sqlite3.connect(str(temp_db))
+    version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+    table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='discovery_topics'"
+    ).fetchone()
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(discovery_topics)").fetchall()
+    }
+    conn.close()
+
+    assert version == 3
+    assert table is not None
+    assert {
+        "id", "name", "normalized_name", "entity_key", "domain",
+        "first_surfaced", "last_surfaced", "surface_count", "status",
+        "covered_at", "last_run_ref",
+    } <= columns
+
+
+def test_migration_2_db_upgrades_to_3_without_data_loss(tmp_path, monkeypatch):
+    """A database built at migration 2 gains the queue table without losing rows."""
+    db_path = tmp_path / "research.db"
+    monkeypatch.setattr(store, "_db_override", db_path)
+    full_migrations = store.MIGRATIONS
+
+    monkeypatch.setattr(store, "MIGRATIONS", {2: full_migrations[2]})
+    store.init_db()
+    topic = store.add_topic("Preexisting Topic")
+    run_id = store.record_run(topic["id"], source_mode="v3")
+    store.store_findings(run_id, topic["id"], [{
+        "source": "reddit",
+        "source_url": "https://reddit.com/preexisting",
+        "source_title": "Preexisting",
+        "content": "Content",
+    }])
+
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='discovery_topics'"
+    ).fetchone() is None
+    conn.close()
+
+    monkeypatch.setattr(store, "MIGRATIONS", full_migrations)
+    store.init_db()
+
+    conn = sqlite3.connect(str(db_path))
+    assert conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 3
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='discovery_topics'"
+    ).fetchone() is not None
+    assert conn.execute("SELECT COUNT(*) FROM topics").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 1
+    conn.close()
+
+
+def test_record_discovery_surfacing_inserts_fresh_row(temp_db):
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates",
+        domain="AI agents",
+        run_ref="discover:AI agents:2026-07-20T00:00:00+00:00",
+        as_of="2026-07-20",
+    )
+
+    assert row["name"] == "Gemma 4 chat templates"
+    assert row["normalized_name"] == "gemma 4 chat templates"
+    assert row["domain"] == "AI agents"
+    assert row["surface_count"] == 1
+    assert row["first_surfaced"] == "2026-07-20"
+    assert row["last_surfaced"] == "2026-07-20"
+    assert row["status"] == "surfaced"
+    assert row["covered_at"] is None
+    assert row["entity_key"]  # computed at write time from entity tokens
+
+
+def test_record_discovery_surfacing_resurfacing_increments_count(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+    # Same normalized identity: casefold, punctuation-stripped, whitespace-collapsed.
+    row = store.record_discovery_surfacing(
+        "  GEMMA 4  chat, templates! ", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["surface_count"] == 2
+    assert row["first_surfaced"] == "2026-07-13"
+    assert row["last_surfaced"] == "2026-07-20"
+    assert row["last_run_ref"] == "run-2"
+
+    conn = sqlite3.connect(str(temp_db))
+    assert conn.execute("SELECT COUNT(*) FROM discovery_topics").fetchone()[0] == 1
+    conn.close()
+
+
+def test_match_discovery_topic_exact_normalized_name(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-20",
+    )
+
+    match = store.match_discovery_topic("gemma 4 CHAT templates!")
+
+    assert match is not None
+    assert match["normalized_name"] == "gemma 4 chat templates"
+
+
+def test_match_discovery_topic_cross_matches_near_duplicates_without_merging(temp_db):
+    """Two angles on the same subject cross-match for annotation, but recording
+    both keeps both rows - matching NEVER merges."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    match = store.match_discovery_topic("Gemma 4 tool calling fixes")
+    assert match is not None
+    assert match["normalized_name"] == "gemma 4 chat templates"
+
+    store.record_discovery_surfacing(
+        "Gemma 4 tool calling fixes", domain="AI agents", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    conn = sqlite3.connect(str(temp_db))
+    rows = conn.execute(
+        "SELECT normalized_name, surface_count FROM discovery_topics ORDER BY id"
+    ).fetchall()
+    conn.close()
+    assert rows == [
+        ("gemma 4 chat templates", 1),
+        ("gemma 4 tool calling fixes", 1),
+    ]
+
+
+def test_match_discovery_topic_unrelated_names_do_not_match(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-20",
+    )
+
+    assert store.match_discovery_topic("OpenAI Agent SDK pricing") is None
+    assert store.match_discovery_topic("Rust async runtime debates") is None
+
+
+def test_match_discovery_topic_empty_queue_returns_none(temp_db):
+    assert store.match_discovery_topic("Anything at all") is None
+
+
+def test_mark_discovery_covered_by_exact_name(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    row = store.mark_discovery_covered("Gemma 4 chat templates", as_of="2026-07-20")
+
+    assert row is not None
+    assert row["status"] == "covered"
+    assert row["covered_at"] == "2026-07-20"
+
+
+def test_mark_discovery_covered_unknown_name_returns_none(temp_db):
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    # Exact normalized match required: a near-duplicate must NOT cover the row.
+    assert store.mark_discovery_covered("Gemma 4 tool calling fixes", as_of="2026-07-20") is None
+    assert store.mark_discovery_covered("No Such Topic", as_of="2026-07-20") is None
+
+
+def test_list_discovery_queue_orders_by_last_surfaced_and_filters_status(temp_db):
+    store.record_discovery_surfacing("Older topic", domain="d", run_ref="r1", as_of="2026-07-01")
+    store.record_discovery_surfacing("Newer topic", domain="d", run_ref="r2", as_of="2026-07-19")
+    store.record_discovery_surfacing("Covered topic", domain="d", run_ref="r3", as_of="2026-07-10")
+    store.mark_discovery_covered("Covered topic", as_of="2026-07-20")
+
+    all_rows = store.list_discovery_queue()
+    assert [r["name"] for r in all_rows] == ["Newer topic", "Covered topic", "Older topic"]
+
+    surfaced = store.list_discovery_queue(status="surfaced")
+    assert [r["name"] for r in surfaced] == ["Newer topic", "Older topic"]
+
+    covered = store.list_discovery_queue(status="covered")
+    assert [r["name"] for r in covered] == ["Covered topic"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

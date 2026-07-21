@@ -13,6 +13,7 @@ Database location: ~/.local/share/last30days/research.db
 import argparse
 import json
 import os
+import re
 import sqlite3
 import sys
 from contextlib import contextmanager
@@ -23,7 +24,7 @@ from typing import Any, Dict, Iterator, List, Optional
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from lib import schema
+from lib import entity_extract, schema
 
 DB_DIR = Path.home() / ".local" / "share" / "last30days"
 DB_PATH = DB_DIR / "research.db"
@@ -222,6 +223,24 @@ CREATE INDEX IF NOT EXISTS idx_finding_sightings_topic_seen
     ON finding_sightings(topic_id, seen_at);
 CREATE INDEX IF NOT EXISTS idx_finding_sightings_url
     ON finding_sightings(source_url);
+""",
+    3: """
+CREATE TABLE IF NOT EXISTS discovery_topics (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL UNIQUE,
+    entity_key TEXT,
+    domain TEXT,
+    first_surfaced TEXT NOT NULL,
+    last_surfaced TEXT NOT NULL,
+    surface_count INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'surfaced' CHECK(status IN ('surfaced','covered')),
+    covered_at TEXT,
+    last_run_ref TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovery_topics_status_surfaced
+    ON discovery_topics(status, last_surfaced);
 """,
 }
 
@@ -779,6 +798,177 @@ def delete_finding(finding_id: int):
 def dismiss_finding(finding_id: int):
     """Mark a finding as dismissed."""
     update_finding(finding_id, dismissed=1)
+
+
+# --- Discovery topic queue ---
+
+# Conservative floor for fuzzy queue matching (overlap coefficient of entity
+# tokens via entity_extract.entity_overlap). Tunable: raise toward 1.0 for
+# stricter matching, lower for looser. Matching is annotate-only - a fuzzy
+# match stamps prior-surfacing context onto an incoming topic but NEVER merges
+# queue rows, so a too-loose threshold can mislabel a card yet never lose data.
+DISCOVERY_QUEUE_OVERLAP_THRESHOLD = 0.6
+
+
+def _normalize_discovery_name(name: str) -> str:
+    """Queue identity: casefold, punctuation-stripped, whitespace-collapsed."""
+    return " ".join(re.sub(r"[^\w\s]", " ", name).casefold().split())
+
+
+def _discovery_entity_key(name: str) -> str:
+    """Sorted joined significant tokens, computed once at write time."""
+    return " ".join(sorted(entity_extract.extract_text_entities(name)))
+
+
+def _discovery_anchor_entities(name: str) -> set[str]:
+    """Anchor tokens for fuzzy matching: capitalized, all-caps, or
+    digit-bearing words minus stopwords (product/person/version anchors).
+
+    Generic lowercase words ("chat", "templates") are excluded so two angles
+    on the same subject ("Gemma 4 chat templates" / "Gemma 4 tool calling
+    fixes") cross-match while different subjects sharing filler words don't.
+    """
+    anchors = set()
+    for word in re.sub(r"[^\w\s]", " ", name).split():
+        lower = word.casefold()
+        if lower in entity_extract.ENTITY_STOPWORDS:
+            continue
+        if word[0].isupper() or word.isupper() or any(char.isdigit() for char in word):
+            anchors.add(lower)
+    return anchors
+
+
+def record_discovery_surfacing(
+    name: str,
+    domain: str = "",
+    run_ref: str = "",
+    as_of: str = "",
+) -> Dict[str, Any]:
+    """Upsert a queue row by normalized name.
+
+    A fresh topic inserts with surface_count 1; re-surfacing the same
+    normalized name increments the count and refreshes last_surfaced and
+    last_run_ref (first_surfaced never changes). Returns the resulting row.
+    """
+    init_db()
+    normalized = _normalize_discovery_name(name)
+    entity_key = _discovery_entity_key(name)
+    conn = _connect()
+    try:
+        conn.execute(
+            """INSERT INTO discovery_topics
+               (name, normalized_name, entity_key, domain, first_surfaced,
+                last_surfaced, surface_count, last_run_ref)
+               VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+               ON CONFLICT(normalized_name) DO UPDATE SET
+                   surface_count = surface_count + 1,
+                   last_surfaced = excluded.last_surfaced,
+                   last_run_ref = excluded.last_run_ref,
+                   domain = excluded.domain""",
+            (name, normalized, entity_key, domain, as_of, as_of, run_ref),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM discovery_topics WHERE normalized_name = ?",
+            (normalized,),
+        ).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def match_discovery_topic(name: str) -> Optional[Dict[str, Any]]:
+    """Find the queue row a topic name refers to, or None.
+
+    Exact normalized-name match wins; otherwise the best entity-overlap match
+    at or above DISCOVERY_QUEUE_OVERLAP_THRESHOLD. Overlap is the better of
+    the full entity_key token overlap and the anchor-token overlap (see
+    _discovery_anchor_entities) - full-token overlap alone dilutes the subject
+    anchor with generic words, so same-subject near-duplicates would never
+    clear a conservative floor. Matching NEVER merges rows: a fuzzy match only
+    annotates the incoming topic with the prior row's context.
+    """
+    init_db()
+    normalized = _normalize_discovery_name(name)
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM discovery_topics WHERE normalized_name = ?",
+            (normalized,),
+        ).fetchone()
+        if row:
+            return dict(row)
+
+        entities = entity_extract.extract_text_entities(name)
+        anchors = _discovery_anchor_entities(name)
+        if not entities and not anchors:
+            return None
+        best: Optional[sqlite3.Row] = None
+        best_overlap = 0.0
+        for candidate in conn.execute("SELECT * FROM discovery_topics").fetchall():
+            candidate_entities = set((candidate["entity_key"] or "").split())
+            overlap = max(
+                entity_extract.entity_overlap(entities, candidate_entities),
+                entity_extract.entity_overlap(
+                    anchors, _discovery_anchor_entities(candidate["name"])
+                ),
+            )
+            if overlap > best_overlap:
+                best, best_overlap = candidate, overlap
+        if best is not None and best_overlap >= DISCOVERY_QUEUE_OVERLAP_THRESHOLD:
+            return dict(best)
+        return None
+    finally:
+        conn.close()
+
+
+def list_discovery_queue(status: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List queue rows, newest surfacing first, optionally filtered by status."""
+    init_db()
+    conn = _connect()
+    try:
+        if status:
+            rows = conn.execute(
+                """SELECT * FROM discovery_topics WHERE status = ?
+                   ORDER BY last_surfaced DESC, id DESC""",
+                (status,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM discovery_topics ORDER BY last_surfaced DESC, id DESC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_discovery_covered(name: str, as_of: str) -> Optional[Dict[str, Any]]:
+    """Mark a queued topic covered by EXACT normalized name.
+
+    Returns the updated row, or None when no row matches - callers must error
+    loudly on None, never silently no-op. Fuzzy matching is deliberately not
+    offered here: covering mutates state, so it demands the exact name.
+    """
+    init_db()
+    normalized = _normalize_discovery_name(name)
+    conn = _connect()
+    try:
+        cursor = conn.execute(
+            """UPDATE discovery_topics
+               SET status = 'covered', covered_at = ?
+               WHERE normalized_name = ?""",
+            (as_of, normalized),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return None
+        row = conn.execute(
+            "SELECT * FROM discovery_topics WHERE normalized_name = ?",
+            (normalized,),
+        ).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
 
 
 # --- Cost Tracking ---
