@@ -947,6 +947,51 @@ def test_record_discovery_surfacing_resurfacing_increments_count(temp_db):
     conn.close()
 
 
+def test_record_discovery_surfacing_blank_domain_resurfacing_preserves_prior_domain(temp_db):
+    """A bare global-trending resurfacing (domain='') must not blank a domain
+    recorded by an earlier, domain-scoped surfacing of the same topic."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["domain"] == "AI agents"
+    assert row["surface_count"] == 2
+
+
+def test_record_discovery_surfacing_none_domain_resurfacing_preserves_prior_domain(temp_db):
+    """If the API is called with domain=None (bypassing the str default),
+    that must not bind NULL and blank a previously recorded domain either."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain=None, run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["domain"] == "AI agents"
+    assert row["surface_count"] == 2
+
+
+def test_record_discovery_surfacing_new_nonempty_domain_still_updates(temp_db):
+    """A resurfacing that supplies a NEW non-empty domain should still update
+    the stored domain - only a blank/None incoming domain preserves history."""
+    store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-13",
+    )
+
+    row = store.record_discovery_surfacing(
+        "Gemma 4 chat templates", domain="LLM tooling", run_ref="run-2", as_of="2026-07-20",
+    )
+
+    assert row["domain"] == "LLM tooling"
+    assert row["surface_count"] == 2
+
+
 def test_match_discovery_topic_exact_normalized_name(temp_db):
     store.record_discovery_surfacing(
         "Gemma 4 chat templates", domain="AI agents", run_ref="run-1", as_of="2026-07-20",

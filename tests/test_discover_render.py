@@ -231,6 +231,40 @@ def test_no_pipeline_line_for_fresh_topic():
     assert "**Pipeline:**" not in rendered
 
 
+# --- _ordinal (Pipeline card line regression guard) ------------------------
+
+
+def test_ordinal_teens_branch_always_th():
+    """10-20 (mod 100) are the '11st'-style regression risk: %10 alone would
+    misclassify 11/12/13 as 'st'/'nd'/'rd'. All of 10-13 and the 20 boundary
+    must render 'th'."""
+    cases = {10: "10th", 11: "11th", 12: "12th", 13: "13th", 20: "20th"}
+    for count, expected in cases.items():
+        assert render._ordinal(count) == expected
+
+
+def test_ordinal_regular_suffixes():
+    assert render._ordinal(2) == "2nd"
+    assert render._ordinal(3) == "3rd"
+    assert render._ordinal(21) == "21st"
+
+
+def test_ordinal_hundreds_teens_still_th():
+    """111 falls in the 10 <= n % 100 <= 20 band (111 % 100 == 11), so it must
+    render 'th', not 'st' from a naive %10 check."""
+    assert render._ordinal(111) == "111th"
+
+
+def test_pipeline_line_ordinal_teens_in_rendered_card():
+    """End-to-end: previously_surfaced_count=10 means this is appearance 11,
+    which must render 'surfaced 11th time', not 'surfaced 11st time'."""
+    report = _report(topics=[_topic(
+        1, "OpenAI Agent SDK", previously_surfaced_count=10,
+    )])
+    rendered = render.render_discovery(report)
+    assert "surfaced 11th time" in rendered
+
+
 def test_nothing_solid_output_stays_byte_identical():
     """The empty state predates U5 and must not grow angle or pipeline text."""
     report = _report(

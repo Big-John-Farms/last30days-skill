@@ -978,6 +978,54 @@ def test_queue_opt_out_via_env_file_seam(tmp_path, monkeypatch, capsys):
     assert not (save_dir / "research.db").exists()
 
 
+def test_discovery_queue_failure_never_crashes_a_finished_run(tmp_path, monkeypatch, capsys):
+    """P0: a broken research.db (locked, read-only, corrupt) must not destroy
+    a finished multi-minute pipeline run - the brief still renders (exit 0)
+    with a stderr warning, and queue fields keep their defaults."""
+    import sqlite3
+
+    import store
+
+    def _locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "record_discovery_surfacing", _locked)
+    save_dir = tmp_path / "client"
+    save_dir.mkdir()
+
+    assert _run_scoped_discover(save_dir) == 0
+    captured = capsys.readouterr()
+    assert "## 1. Gemma 4 chat templates" in captured.out
+    assert "**Pipeline:**" not in captured.out
+    assert "[last30days] Warning:" in captured.err
+    assert "database is locked" in captured.err
+
+
+def test_sibling_topics_in_same_run_do_not_cross_annotate(tmp_path, capsys):
+    """Annotations describe the queue state BEFORE this run: two same-anchor
+    siblings surfaced by ONE run must not fuzzy-match each other's rows and
+    render a false 'surfaced 2nd time' on first-ever topics."""
+    import sqlite3
+
+    save_dir = tmp_path / "client"
+    save_dir.mkdir()
+
+    assert _run_scoped_discover(
+        save_dir, names=("Gemma 4 chat templates", "Gemma 4 enterprise")
+    ) == 0
+    rendered = capsys.readouterr().out
+    assert "## 1. Gemma 4 chat templates" in rendered
+    assert "## 2. Gemma 4 enterprise" in rendered
+    assert "**Pipeline:**" not in rendered
+
+    conn = sqlite3.connect(save_dir / "research.db")
+    rows = conn.execute(
+        "SELECT name, surface_count FROM discovery_topics ORDER BY name"
+    ).fetchall()
+    conn.close()
+    assert rows == [("Gemma 4 chat templates", 1), ("Gemma 4 enterprise", 1)]
+
+
 def test_discovery_mock_run_writes_no_research_db(tmp_path):
     """--mock stays 100% side-effect-free: no queue writes, no research.db."""
     result = subprocess.run(
@@ -1023,6 +1071,25 @@ def test_queue_list_shows_uncovered_only_by_default(tmp_path, monkeypatch, capsy
     assert "OpenAI Agent SDK" not in out
     for column in ("name", "domain", "surface_count", "last_surfaced", "status"):
         assert column in out
+
+
+def test_queue_list_empty_db_reports_no_recorded_runs(tmp_path, monkeypatch, capsys):
+    """A db that exists but has zero discovery rows (e.g. created via --store
+    by a topic run) must not claim every topic is covered."""
+    import store
+
+    save_dir = tmp_path / "client"
+    save_dir.mkdir()
+    store.init_db(save_dir / "research.db")
+
+    monkeypatch.setattr(cli.env, "get_config", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        sys, "argv", ["last30days.py", "queue", "list", "--save-dir", str(save_dir)]
+    )
+    assert cli.main() == 0
+    out = capsys.readouterr().out
+    assert "no discovery run has recorded topics yet" in out
+    assert "marked covered" not in out
 
 
 def test_queue_cover_marks_topic_covered(tmp_path, monkeypatch, capsys):

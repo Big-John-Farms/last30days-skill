@@ -1322,22 +1322,28 @@ def _annotate_and_record_discovery_queue(
     annotated: list[schema.DiscoveryTopic] = []
     with store.scoped_db(_scoped_store_db(args)):
         store.init_db()
+        # Phase 1: match EVERY topic before recording ANY. Interleaving
+        # match+record in one loop lets topic N fuzzy-match a same-anchor
+        # sibling row this very run recorded seconds earlier, falsely
+        # annotating a first-ever topic as "surfaced 2nd time".
+        priors = [store.match_discovery_topic(topic.name) for topic in report.topics]
+        # Phase 2: record this run's surfacings.
         for topic in report.topics:
-            prior = store.match_discovery_topic(topic.name)
-            if prior:
-                topic = dataclasses.replace(
-                    topic,
-                    previously_surfaced_count=prior["surface_count"],
-                    last_surfaced=prior["last_surfaced"],
-                    covered=prior["status"] == "covered",
-                )
             store.record_discovery_surfacing(
                 topic.name,
                 domain=report.domain,
                 run_ref=run_ref,
                 as_of=as_of,
             )
-            annotated.append(topic)
+    for topic, prior in zip(report.topics, priors):
+        if prior:
+            topic = dataclasses.replace(
+                topic,
+                previously_surfaced_count=prior["surface_count"],
+                last_surfaced=prior["last_surfaced"],
+                covered=prior["status"] == "covered",
+            )
+        annotated.append(topic)
     return dataclasses.replace(report, topics=annotated)
 
 
@@ -1351,9 +1357,15 @@ def _run_queue_list(args: argparse.Namespace, config: dict[str, object]) -> int:
         return 0
     with store.scoped_db(db_path):
         rows = store.list_discovery_queue(status="surfaced")
-    if not rows:
-        print("Discovery queue is empty - every surfaced topic is marked covered.")
-        return 0
+        if not rows:
+            # An existing db with zero queue rows (e.g. created via --store)
+            # means no discovery run has recorded anything - only claim
+            # "every topic is covered" when covered rows actually exist.
+            if store.list_discovery_queue():
+                print("Discovery queue is empty - every surfaced topic is marked covered.")
+            else:
+                print("Discovery queue is empty - no discovery run has recorded topics yet.")
+            return 0
 
     headers = ("name", "domain", "surface_count", "last_surfaced", "status")
     table = [
@@ -1484,7 +1496,16 @@ def _run_discover(args: argparse.Namespace, config: dict[str, object]) -> int:
     # line and the JSON queue fields see the annotations. Mock runs stay 100%
     # side-effect-free.
     if not args.mock:
-        report = _annotate_and_record_discovery_queue(report, args, config)
+        try:
+            report = _annotate_and_record_discovery_queue(report, args, config)
+        except (sqlite3.Error, OSError) as exc:
+            # A broken queue db (locked, read-only dir, corrupt) must never
+            # destroy a finished multi-minute pipeline run: warn and render
+            # the report without queue annotations (fields keep defaults).
+            sys.stderr.write(
+                f"[last30days] Warning: discovery queue unavailable ({exc}); "
+                "continuing without queue annotations.\n"
+            )
 
     if args.emit == "json":
         payload = schema.to_dict(report) if args.json_profile == "raw" else schema.to_discovery_export(report)

@@ -850,8 +850,16 @@ def record_discovery_surfacing(
     A fresh topic inserts with surface_count 1; re-surfacing the same
     normalized name increments the count and refreshes last_surfaced and
     last_run_ref (first_surfaced never changes). Returns the resulting row.
+
+    A resurfacing with a blank domain (e.g. a global-trending sweep with no
+    domain) never blanks a domain recorded by an earlier, domain-scoped
+    surfacing - the stored domain only changes when the incoming domain is
+    non-empty. ``domain`` is normalized to "" here (never NULL bound) so the
+    column's storage convention stays consistent regardless of whether a
+    caller passes "" or None.
     """
     init_db()
+    domain = domain or ""
     normalized = _normalize_discovery_name(name)
     entity_key = _discovery_entity_key(name)
     conn = _connect()
@@ -865,7 +873,7 @@ def record_discovery_surfacing(
                    surface_count = surface_count + 1,
                    last_surfaced = excluded.last_surfaced,
                    last_run_ref = excluded.last_run_ref,
-                   domain = excluded.domain""",
+                   domain = CASE WHEN excluded.domain <> '' THEN excluded.domain ELSE domain END""",
             (name, normalized, entity_key, domain, as_of, as_of, run_ref),
         )
         conn.commit()
