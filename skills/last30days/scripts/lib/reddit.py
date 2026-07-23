@@ -453,6 +453,32 @@ def _dedupe_posts(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return unique
 
 
+_TIMEFRAME_ORDER = {"hour": 0, "day": 1, "week": 2, "month": 3, "year": 4, "all": 5}
+
+
+def _window_to_time_filter(from_date: str, to_date: str) -> str:
+    """Map a requested YYYY-MM-DD window onto Reddit's coarse `t` param.
+
+    Reddit filters server-side only at hour/day/week/month granularity. Pick the
+    smallest bucket that covers the window. Falls back to 'month' (previous
+    behaviour) if the dates don't parse.
+    """
+    try:
+        span = (time.mktime(time.strptime(to_date, "%Y-%m-%d"))
+                - time.mktime(time.strptime(from_date, "%Y-%m-%d"))) / 86400
+    except (ValueError, TypeError):
+        return "month"
+    if span <= 1:
+        return "day"
+    if span <= 7:
+        return "week"
+    if span <= 31:
+        return "month"
+    if span <= 366:
+        return "year"
+    return "all"
+
+
 def search_reddit(
     topic: str,
     from_date: str,
@@ -480,7 +506,13 @@ def search_reddit(
         return {"items": [], "error": "No SCRAPECREATORS_API_KEY configured"}
 
     config = DEPTH_CONFIG.get(depth, DEPTH_CONFIG["default"])
-    timeframe = config["timeframe"]
+    # Fetch window must track the requested date range, not just the depth
+    # default. Otherwise a --days 1 request fetches a month of relevance-
+    # sorted posts and Phase 5 discards everything outside 24h (0 on quiet
+    # days). Use the tighter of {window-derived, depth default}.
+    _depth_tf = config["timeframe"]
+    _window_tf = _window_to_time_filter(from_date, to_date)
+    timeframe = _window_tf if _TIMEFRAME_ORDER.get(_window_tf, 3) <= _TIMEFRAME_ORDER.get(_depth_tf, 3) else _depth_tf
     intent = infer_query_intent(topic)
 
     # === Phase 1: Query Expansion ===
