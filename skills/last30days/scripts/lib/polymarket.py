@@ -112,16 +112,26 @@ _NOISE_WORDS = frozenset({
     "springs", "heights", "ridge", "bridge", "harbor", "port", "station", "center",
     "square", "field", "forest", "garden", "tower", "school", "church", "camp",
     "ranch", "crossing", "shore", "rock", "summit", "falls", "grove", "haven",
-    # Generic tech terms that match too broadly on Polymarket
-    # "cli" -> any CLI tool market; "mcp" -> protocol markets; "ai" -> every AI market
-    "cli", "mcp", "protocol", "tool", "app", "code", "model", "ai", "api",
-    "software", "plugin", "skill", "agent", "bot", "search", "research",
+    # Generic tech terms — see _DOMAIN_WORDS below, which is folded in here
     # Generic prediction market terms
     "market", "odds", "prediction", "forecast", "chance", "probability",
     # Comparison-query conjunctions — should not count as informative filter tokens
     # when the topic is "X vs Y vs Z"
     "vs", "versus",
 })
+
+# Generic tech terms that match too broadly to be the sole signal for a NARROW
+# topic ("cli" -> any CLI tool market; "ai" -> every AI market), but which ARE
+# the subject when the topic is a domain sweep rather than one product. Kept
+# separate from the rest of _NOISE_WORDS — the directional/sports/place words
+# there exist to PREVENT false matches ("NFC West" vs a "Kanye West" search),
+# so they must never be used as a positive signal.
+_DOMAIN_WORDS = frozenset({
+    "cli", "mcp", "protocol", "tool", "app", "code", "model", "ai", "api",
+    "software", "plugin", "skill", "agent", "bot", "search", "research",
+})
+
+_NOISE_WORDS = _NOISE_WORDS | _DOMAIN_WORDS
 
 
 def _passes_topic_filter(topic: str, event_title: str) -> bool:
@@ -166,7 +176,28 @@ def _passes_topic_filter(topic: str, event_title: str) -> bool:
     # when the topic is "Mill.com food recycler" (3 informative words).
     min_matches = 2 if len(informative) >= 3 else 1
 
-    return match_count >= min_matches
+    if match_count >= min_matches:
+        return True
+
+    # Domain-word fallback. When the topic IS a domain (e.g. an AI-news sweep),
+    # the words carrying the subject — "ai", "model" — sit in _NOISE_WORDS, and
+    # the informative residue ("artificial", "intelligence") never appears in
+    # real market titles, which say "AI". That made the filter reject every AI
+    # market by construction. So if the informative words missed, fall back to
+    # the topic's own domain words. Narrow product topics ("Mill.com food
+    # recycler") contain no such words at all, so the fallback never fires for
+    # them and upstream's false-match guard is untouched.
+    domain_words = [w for w in core_words if w in _DOMAIN_WORDS]
+    if not domain_words:
+        return False
+
+    for word in domain_words:
+        if word in title_words:
+            return True
+        if len(word) >= 4 and word in title_lower:
+            return True
+
+    return False
 
 
 def _passes_any_informative_word(topic: str, event_title: str) -> bool:
@@ -191,6 +222,22 @@ def _passes_any_informative_word(topic: str, event_title: str) -> bool:
     title_words = set(title_lower.split())
 
     for word in informative:
+        if word in title_words:
+            return True
+        if len(word) >= 4 and word in title_lower:
+            return True
+
+    # Domain-word fallback — mirrors _passes_topic_filter. For a domain sweep
+    # ("AI frontier developments") the subject words "ai"/"model" sit in
+    # _NOISE_WORDS, so the informative residue ("frontier", "developments")
+    # never appears in real market titles and every AI market gets dropped
+    # here — undoing the parse-stage fix one stage later. Fall back to the
+    # topic's own domain words. Narrow product/comparison topics carry no
+    # _DOMAIN_WORDS, so the fallback never fires for them (behavior unchanged).
+    domain_words = [w for w in core_words if w in _DOMAIN_WORDS]
+    if not domain_words:
+        return False
+    for word in domain_words:
         if word in title_words:
             return True
         if len(word) >= 4 and word in title_lower:

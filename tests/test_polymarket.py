@@ -146,8 +146,13 @@ def test_passes_topic_filter_partial_match():
     """Test that at least one informative word must match."""
     # "AI" appears in both topic and title
     assert polymarket._passes_topic_filter("AI safety", "New AI Safety Conference") is True
-    # "models" doesn't appear, should fail
-    assert polymarket._passes_topic_filter("AI models", "New AI prediction") is False
+    # LOCAL DIVERGENCE from upstream: this asserted False, on the rule that a
+    # domain word ("ai") is too broad to be the sole match signal. That rule
+    # made domain sweeps impossible — an AI-news topic matched zero AI markets
+    # ever, because real titles say "AI" and never "artificial intelligence".
+    # _passes_topic_filter now falls back to _DOMAIN_WORDS when the informative
+    # words miss, so "AI models" does match an AI market.
+    assert polymarket._passes_topic_filter("AI models", "New AI prediction") is True
 
 
 def test_passes_topic_filter_all_noise_words():
