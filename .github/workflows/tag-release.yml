@@ -1,0 +1,58 @@
+name: Tag release
+
+# After a prepare-release PR merges to main, create the vX.Y.Z tag so
+# release.yml can build .skill / .mcpb artifacts and publish the GitHub Release.
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    # Only act on the release-prep commit shape produced by prepare-release.yml
+    # (or an equivalent manual chore(release) commit).
+    if: startsWith(github.event.head_commit.message, 'chore(release): bump version to ')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Create annotated tag
+        env:
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          VERSION="$(printf '%s\n' "${HEAD_MSG}" | head -n1 | sed -n 's/^chore(release): bump version to \([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+          if [ -z "${VERSION}" ]; then
+            echo "Could not parse version from commit message: ${HEAD_MSG}"
+            exit 1
+          fi
+          TAG="v${VERSION}"
+
+          PY_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          if [ "${PY_VERSION}" != "${VERSION}" ]; then
+            echo "Commit message version (${VERSION}) does not match pyproject.toml (${PY_VERSION})"
+            exit 1
+          fi
+
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists locally — nothing to do."
+            exit 0
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on origin — nothing to do."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          git push origin "refs/tags/${TAG}"
+          echo "Created and pushed ${TAG}"
