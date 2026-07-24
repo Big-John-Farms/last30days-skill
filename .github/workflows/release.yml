@@ -4,9 +4,20 @@ on:
   push:
     tags:
       - "v*"
+  # tag-release.yml dispatches this because GITHUB_TOKEN tag pushes do not
+  # start other workflows.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to release (e.g. v3.18.2)
+        required: true
+        type: string
 
 permissions: {}
 
+env:
+  # Tag push uses ref_name (vX.Y.Z); dispatch from tag-release passes inputs.tag.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   # Build the existing .skill artifact (Claude Code / Codex / Cursor install
@@ -22,6 +33,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -70,6 +82,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Set up Go
@@ -102,7 +115,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_VERSION: ${{ env.RELEASE_TAG }}
         run: |
           mkdir -p mcp/build
           go -C mcp build \
@@ -147,6 +160,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -159,7 +173,7 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: |
           gh release create "${RELEASE_TAG}" \
             dist/last30days.skill \

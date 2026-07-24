@@ -73,6 +73,20 @@ class TestChangelogWorkflow(unittest.TestCase):
         self.assertEqual(mod.next_version("3.18.1", "minor"), "3.19.0")
         self.assertEqual(mod.next_version("3.18.1", "major"), "4.0.0")
 
+    def test_main_refuses_equal_version_outside_dry_run(self) -> None:
+        mod = _load_prepare_release()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "pyproject.toml").write_text(
+                '[project]\nname = "last30days-skill"\nversion = "3.18.1"\n',
+                encoding="utf-8",
+            )
+            mod.ROOT = tmp_path
+            mod.PYPROJECT = tmp_path / "pyproject.toml"
+            with self.assertRaises(SystemExit) as ctx:
+                mod.main(["--version", "3.18.1"])
+            self.assertIn("Refusing to re-release", str(ctx.exception))
+
     def test_bump_all_updates_lockstep_surfaces(self) -> None:
         mod = _load_prepare_release()
         with tempfile.TemporaryDirectory() as tmp:

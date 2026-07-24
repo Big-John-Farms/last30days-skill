@@ -185,10 +185,16 @@ def main(argv: list[str] | None = None) -> int:
     current = read_current_version()
     version = args.version or next_version(current, args.bump)
     _parse_version(version)
-    if _parse_version(version) <= _parse_version(current) and args.version:
-        # Allow equal only for dry-run rebuild experiments; refuse downgrades.
-        if _parse_version(version) < _parse_version(current):
+    if args.version:
+        parsed_new = _parse_version(version)
+        parsed_cur = _parse_version(current)
+        if parsed_new < parsed_cur:
             raise SystemExit(f"Refusing to downgrade {current} → {version}")
+        if parsed_new == parsed_cur and not args.dry_run:
+            raise SystemExit(
+                f"Refusing to re-release {current}; pass --bump or a newer --version "
+                "(use --dry-run to preview towncrier output for the current version)"
+            )
 
     print(f"Current version: {current}")
     print(f"Next version:    {version}")
