@@ -106,13 +106,14 @@ class TestPluginContract(unittest.TestCase):
         self.assertIn("plugins", marketplace)
 
     def test_workflows_do_not_reference_removed_root_scripts_dir(self) -> None:
-        # The root-level scripts/ directory was removed; workflows must not
-        # reference it. Subdirectory scripts/ paths (skills/last30days/scripts/
-        # for the Code-skill build, mcp/scripts/ for the .mcpb build) are
-        # the legitimate replacements.
+        # The historical root-level scripts/ directory was removed; workflows must not
+        # reference a bare `scripts/` path. Allowed replacements:
+        # skills/last30days/scripts/ (engine), mcp/scripts/ (.mcpb), .github/scripts/
+        # (release automation).
         allowed_prefixes = (
             "skills/last30days/scripts/",
             "mcp/scripts/",
+            ".github/scripts/",
         )
         offenders = []
         for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
