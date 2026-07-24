@@ -62,6 +62,18 @@ jobs:
           fi
 
           if [ "${changed_changelog}" -eq 1 ]; then
+            # One-time towncrier adoption: replacing ## [Unreleased] with the
+            # start marker / notice is allowed. Adding release-note bullets
+            # (+### sections) is not.
+            cl_diff="$(git diff "${BASE_SHA}...${HEAD_SHA}" -- CHANGELOG.md || true)"
+            if printf '%s\n' "${cl_diff}" | grep -q 'towncrier release notes start' \
+              && ! printf '%s\n' "${cl_diff}" | grep -qE '^\+### '; then
+              echo "Allowing towncrier bootstrap CHANGELOG.md header change."
+              changed_changelog=0
+            fi
+          fi
+
+          if [ "${changed_changelog}" -eq 1 ]; then
             echo "::error::Do not edit CHANGELOG.md in feature PRs."
             echo "Add changelog.d/<n>.<type>.md instead (see changelog.d/README.md)."
             echo "Release PRs created via Actions → Prepare release use the 'release' label."
