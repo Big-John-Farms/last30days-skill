@@ -143,6 +143,34 @@ _SWEEP_RESIDUE = frozenset({
 _NOISE_WORDS = _NOISE_WORDS | _DOMAIN_WORDS
 
 
+def _domain_stem(word: str) -> str | None:
+    """Return the canonical domain token if ``word`` is a domain term or plural.
+
+    Exact-set membership alone treats ``models`` as a hard narrowing term even
+    though ``model`` is a domain word — which blocked soft AI sweeps and broke
+    ``AI models`` → ``New AI prediction``.
+    """
+    if word in _DOMAIN_WORDS:
+        return word
+    if word.endswith("ies") and len(word) > 4:
+        stem = word[:-3] + "y"
+        if stem in _DOMAIN_WORDS:
+            return stem
+    if len(word) > 3 and word.endswith("es") and word[:-2] in _DOMAIN_WORDS:
+        return word[:-2]
+    if len(word) > 2 and word.endswith("s") and word[:-1] in _DOMAIN_WORDS:
+        return word[:-1]
+    return None
+
+
+def _informative_words(core_words: list[str]) -> list[str]:
+    """Topic words that are neither noise nor (possibly plural) domain terms."""
+    return [
+        w for w in core_words
+        if w not in _NOISE_WORDS and _domain_stem(w) is None
+    ]
+
+
 def _domain_word_fallback_allows(core_words: list[str], informative: list[str],
                                  title_lower: str, title_words: set[str]) -> bool:
     """Allow domain-word title matches only for pure/soft domain sweeps.
@@ -154,11 +182,17 @@ def _domain_word_fallback_allows(core_words: list[str], informative: list[str],
     hard_informative = [w for w in informative if w not in _SWEEP_RESIDUE]
     if hard_informative:
         return False
-    domain_words = [w for w in core_words if w in _DOMAIN_WORDS]
-    if not domain_words:
+    domain_stems = []
+    seen: set[str] = set()
+    for w in core_words:
+        stem = _domain_stem(w)
+        if stem and stem not in seen:
+            seen.add(stem)
+            domain_stems.append(stem)
+    if not domain_stems:
         return False
-    for word in domain_words:
-        if word in title_words:
+    for word in domain_stems:
+        if word in title_words or f"{word}s" in title_words or f"{word}es" in title_words:
             return True
         if len(word) >= 4 and word in title_lower:
             return True
@@ -180,8 +214,8 @@ def _passes_topic_filter(topic: str, event_title: str) -> bool:
     if not core_words:
         return True  # No words to check against
 
-    # Split into informative vs generic
-    informative = [w for w in core_words if w not in _NOISE_WORDS]
+    # Split into informative vs generic (domain plurals count as domain, not hard)
+    informative = _informative_words(core_words)
 
     # If ALL words are generic, we can't meaningfully filter — keep everything
     if not informative:
@@ -228,7 +262,7 @@ def _passes_any_informative_word(topic: str, event_title: str) -> bool:
     core_words = [w for w in re.sub(r"[^\w\s]", " ", core).split() if len(w) > 1]
     if not core_words:
         return True
-    informative = [w for w in core_words if w not in _NOISE_WORDS]
+    informative = _informative_words(core_words)
     if not informative:
         return True
 

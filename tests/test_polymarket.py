@@ -197,6 +197,18 @@ def test_domain_fallback_keeps_soft_sweep_ai_markets():
     ) is True
 
 
+
+def test_domain_fallback_treats_plural_domain_terms_as_domain():
+    """Plural domain tokens (models) must not block soft AI sweeps."""
+    assert polymarket._passes_topic_filter(
+        "AI models frontier developments",
+        "Will AI beat humans at coding by 2027?",
+    ) is True
+    assert polymarket._passes_topic_filter(
+        "AI models", "New AI prediction"
+    ) is True
+
+
 def test_domain_fallback_blocked_when_hard_informative_misses():
     """Mixed topics must not accept unrelated markets via a shared domain token."""
     assert polymarket._passes_topic_filter(
