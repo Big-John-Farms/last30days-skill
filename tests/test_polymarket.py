@@ -189,6 +189,24 @@ def test_passes_topic_filter_two_word_still_needs_one():
     ) is True
 
 
+
+def test_domain_fallback_keeps_soft_sweep_ai_markets():
+    """Soft sweep residue may match via domain words (the #859 fix)."""
+    assert polymarket._passes_topic_filter(
+        "AI frontier developments", "Will AI models beat humans at coding?"
+    ) is True
+
+
+def test_domain_fallback_blocked_when_hard_informative_misses():
+    """Mixed topics must not accept unrelated markets via a shared domain token."""
+    assert polymarket._passes_topic_filter(
+        "MCP protocol benchmark", "Will the Kyoto Protocol survive?"
+    ) is False
+    assert polymarket._passes_any_informative_word(
+        "MCP protocol benchmark", "Will the Kyoto Protocol survive?"
+    ) is False
+
+
 def test_passes_topic_filter_multi_word_edge_exactly_three():
     """Topic with exactly 3 informative words, 1 match -> rejected."""
     assert polymarket._passes_topic_filter(

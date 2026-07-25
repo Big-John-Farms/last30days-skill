@@ -131,7 +131,38 @@ _DOMAIN_WORDS = frozenset({
     "software", "plugin", "skill", "agent", "bot", "search", "research",
 })
 
+# Soft residue left after stripping domain words from a sweep topic
+# ("AI frontier developments"). Domain-word fallback may fire when these are
+# the only informative leftovers. Distinctive terms like "benchmark" block it.
+_SWEEP_RESIDUE = frozenset({
+    "frontier", "developments", "development", "news", "trends", "trend",
+    "latest", "industry", "space", "ecosystem", "landscape", "overview",
+    "updates", "update", "future", "outlook", "sector", "field", "world",
+})
+
 _NOISE_WORDS = _NOISE_WORDS | _DOMAIN_WORDS
+
+
+def _domain_word_fallback_allows(core_words: list[str], informative: list[str],
+                                 title_lower: str, title_words: set[str]) -> bool:
+    """Allow domain-word title matches only for pure/soft domain sweeps.
+
+    Blocks mixed topics like \"MCP protocol benchmark\" from accepting a Kyoto
+    Protocol market via the shared domain token \"protocol\" when the distinctive
+    informative word (\"benchmark\") missed.
+    """
+    hard_informative = [w for w in informative if w not in _SWEEP_RESIDUE]
+    if hard_informative:
+        return False
+    domain_words = [w for w in core_words if w in _DOMAIN_WORDS]
+    if not domain_words:
+        return False
+    for word in domain_words:
+        if word in title_words:
+            return True
+        if len(word) >= 4 and word in title_lower:
+            return True
+    return False
 
 
 def _passes_topic_filter(topic: str, event_title: str) -> bool:
@@ -179,25 +210,8 @@ def _passes_topic_filter(topic: str, event_title: str) -> bool:
     if match_count >= min_matches:
         return True
 
-    # Domain-word fallback. When the topic IS a domain (e.g. an AI-news sweep),
-    # the words carrying the subject — "ai", "model" — sit in _NOISE_WORDS, and
-    # the informative residue ("artificial", "intelligence") never appears in
-    # real market titles, which say "AI". That made the filter reject every AI
-    # market by construction. So if the informative words missed, fall back to
-    # the topic's own domain words. Narrow product topics ("Mill.com food
-    # recycler") contain no such words at all, so the fallback never fires for
-    # them and upstream's false-match guard is untouched.
-    domain_words = [w for w in core_words if w in _DOMAIN_WORDS]
-    if not domain_words:
-        return False
-
-    for word in domain_words:
-        if word in title_words:
-            return True
-        if len(word) >= 4 and word in title_lower:
-            return True
-
-    return False
+    # Domain-word fallback for soft domain sweeps only (see helper).
+    return _domain_word_fallback_allows(core_words, informative, title_lower, title_words)
 
 
 def _passes_any_informative_word(topic: str, event_title: str) -> bool:
@@ -227,22 +241,7 @@ def _passes_any_informative_word(topic: str, event_title: str) -> bool:
         if len(word) >= 4 and word in title_lower:
             return True
 
-    # Domain-word fallback — mirrors _passes_topic_filter. For a domain sweep
-    # ("AI frontier developments") the subject words "ai"/"model" sit in
-    # _NOISE_WORDS, so the informative residue ("frontier", "developments")
-    # never appears in real market titles and every AI market gets dropped
-    # here — undoing the parse-stage fix one stage later. Fall back to the
-    # topic's own domain words. Narrow product/comparison topics carry no
-    # _DOMAIN_WORDS, so the fallback never fires for them (behavior unchanged).
-    domain_words = [w for w in core_words if w in _DOMAIN_WORDS]
-    if not domain_words:
-        return False
-    for word in domain_words:
-        if word in title_words:
-            return True
-        if len(word) >= 4 and word in title_lower:
-            return True
-    return False
+    return _domain_word_fallback_allows(core_words, informative, title_lower, title_words)
 
 
 def filter_items_against_topic(topic: str, items: List[Any]) -> List[Any]:
