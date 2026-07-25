@@ -262,3 +262,12 @@ class TestEnrichmentBudget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_window_to_time_filter_rounds_up_for_rolling_buckets():
+    """Calendar windows need the next Reddit rolling bucket (Greptile on #860)."""
+    from lib import reddit
+
+    assert reddit._window_to_time_filter("2026-07-23", "2026-07-24") == "week"
+    assert reddit._window_to_time_filter("2026-07-17", "2026-07-24") == "month"
+    assert reddit._window_to_time_filter("2026-06-24", "2026-07-24") == "year"

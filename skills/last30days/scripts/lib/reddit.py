@@ -459,9 +459,12 @@ _TIMEFRAME_ORDER = {"hour": 0, "day": 1, "week": 2, "month": 3, "year": 4, "all"
 def _window_to_time_filter(from_date: str, to_date: str) -> str:
     """Map a requested YYYY-MM-DD window onto Reddit's coarse `t` param.
 
-    Reddit filters server-side only at hour/day/week/month granularity. Pick the
-    smallest bucket that covers the window. Falls back to 'month' (previous
-    behaviour) if the dates don't parse.
+    Reddit's ``t=day|week|month`` buckets are rolling windows ending "now", not
+    calendar spans. A one-day request often covers yesterday→today, so ``t=day``
+    (last 24h) under-fetches yesterday morning and the later date filter cannot
+    recover those posts. Round up one bucket so the fetch covers the calendar
+    window; Phase 5 still trims to ``from_date``/``to_date``. Falls back to
+    ``month`` (previous behaviour) if the dates don't parse.
     """
     try:
         span = (time.mktime(time.strptime(to_date, "%Y-%m-%d"))
@@ -469,11 +472,11 @@ def _window_to_time_filter(from_date: str, to_date: str) -> str:
     except (ValueError, TypeError):
         return "month"
     if span <= 1:
-        return "day"
-    if span <= 7:
         return "week"
-    if span <= 31:
+    if span <= 7:
         return "month"
+    if span <= 31:
+        return "year"
     if span <= 366:
         return "year"
     return "all"
