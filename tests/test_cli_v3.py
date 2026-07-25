@@ -636,6 +636,107 @@ class CliV3Tests(unittest.TestCase):
         )
         self.assertFalse(main_call.kwargs.get("trustpilot_domain_is_hint"))
 
+    def test_trustpilot_domain_auto_activates_include_sources(self):
+        """Explicit --trustpilot-domain must activate Trustpilot even when
+        INCLUDE_SOURCES omits it (#873) — otherwise the flag silently no-ops."""
+        report = self.make_report(topic="Weber grills")
+        diag = {
+            "available_sources": ["tiktok", "instagram"],
+            "providers": {"google": True, "openai": False, "xai": False},
+            "x_backend": None,
+            "bird_installed": True,
+            "bird_authenticated": False,
+            "bird_username": None,
+            "native_web_backend": "brave",
+        }
+        config = {"INCLUDE_SOURCES": "tiktok,instagram"}
+        with mock.patch.object(cli.env, "get_config", return_value=config), \
+             mock.patch.object(cli.pipeline, "diagnose", return_value=diag), \
+             mock.patch.object(cli.pipeline, "run", return_value=report) as run_mock, \
+             mock.patch.object(cli, "emit_output", return_value="# rendered"), \
+             mock.patch.object(sys, "argv", [
+                 "last30days.py",
+                 "Weber grills",
+                 "--trustpilot-domain",
+                 "weber.co.uk",
+             ]):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = cli.main()
+        self.assertEqual(0, rc)
+        self.assertIn("trustpilot", config["INCLUDE_SOURCES"].lower())
+        self.assertIn("[Trustpilot] --trustpilot-domain=weber.co.uk activated", stderr.getvalue())
+        main_call = run_mock.call_args_list[0]
+        self.assertEqual(main_call.kwargs.get("trustpilot_domain"), "weber.co.uk")
+
+    def test_trustpilot_domain_auto_activates_with_search_filter(self):
+        """When --search omits trustpilot, the explicit domain flag must still
+        append it to requested_sources so the intersection filter cannot drop it."""
+        report = self.make_report(topic="Weber grills")
+        diag = {
+            "available_sources": ["tiktok", "instagram", "trustpilot"],
+            "providers": {"google": True, "openai": False, "xai": False},
+            "x_backend": None,
+            "bird_installed": True,
+            "bird_authenticated": False,
+            "bird_username": None,
+            "native_web_backend": "brave",
+        }
+        config = {"INCLUDE_SOURCES": "tiktok,instagram"}
+        with mock.patch.object(cli.env, "get_config", return_value=config), \
+             mock.patch.object(cli.pipeline, "diagnose", return_value=diag), \
+             mock.patch.object(cli.pipeline, "run", return_value=report) as run_mock, \
+             mock.patch.object(cli, "emit_output", return_value="# rendered"), \
+             mock.patch.object(sys, "argv", [
+                 "last30days.py",
+                 "Weber grills",
+                 "--search",
+                 "tiktok,instagram",
+                 "--trustpilot-domain",
+                 "weber.co.uk",
+             ]):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc = cli.main()
+        self.assertEqual(0, rc)
+        requested = run_mock.call_args_list[0].kwargs.get("requested_sources") or []
+        self.assertIn("trustpilot", requested)
+
+    def test_trustpilot_domain_respects_exclude_sources(self):
+        config = {"INCLUDE_SOURCES": "tiktok", "EXCLUDE_SOURCES": "trustpilot"}
+        requested = cli.activate_trustpilot_for_explicit_domain(
+            config, ["tiktok"], reason="--trustpilot-domain=weber.co.uk",
+        )
+        self.assertEqual(requested, ["tiktok"])
+        self.assertNotIn("trustpilot", config["INCLUDE_SOURCES"].lower())
+
+
+class ActivateTrustpilotHelperTests(unittest.TestCase):
+    def test_plan_has_explicit_trustpilot_domain(self):
+        self.assertTrue(cli.plan_has_explicit_trustpilot_domain({
+            "traeger": {"trustpilot_domain": "traeger.com"},
+        }))
+        self.assertFalse(cli.plan_has_explicit_trustpilot_domain({
+            "traeger": {"x_handle": "Traeger"},
+        }))
+        self.assertFalse(cli.plan_has_explicit_trustpilot_domain(None))
+
+    def test_activate_adds_include_and_requested(self):
+        config = {"INCLUDE_SOURCES": "tiktok,instagram"}
+        requested = cli.activate_trustpilot_for_explicit_domain(
+            config, ["tiktok", "instagram"], reason="--trustpilot-domain=x.com",
+        )
+        self.assertIn("trustpilot", config["INCLUDE_SOURCES"].lower())
+        self.assertEqual(requested, ["tiktok", "instagram", "trustpilot"])
+
+    def test_activate_noop_when_already_present(self):
+        config = {"INCLUDE_SOURCES": "tiktok,trustpilot"}
+        requested = cli.activate_trustpilot_for_explicit_domain(
+            config, ["trustpilot"], reason="--trustpilot-domain=x.com",
+        )
+        self.assertEqual(config["INCLUDE_SOURCES"], "tiktok,trustpilot")
+        self.assertEqual(requested, ["trustpilot"])
+
 
 if __name__ == "__main__":
     unittest.main()

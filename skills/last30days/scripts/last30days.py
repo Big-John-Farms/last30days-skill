@@ -117,6 +117,61 @@ def resolve_requested_sources(args_search: str | None, config: dict) -> list[str
     return None
 
 
+def plan_has_explicit_trustpilot_domain(comp_plan: dict | None) -> bool:
+    """True when any --competitors-plan entry pins a trustpilot_domain."""
+    if not comp_plan:
+        return False
+    for entry in comp_plan.values():
+        if not isinstance(entry, dict):
+            continue
+        domain = entry.get("trustpilot_domain")
+        if isinstance(domain, str) and domain.strip():
+            return True
+    return False
+
+
+def activate_trustpilot_for_explicit_domain(
+    config: dict,
+    requested_sources: list[str] | None,
+    *,
+    reason: str,
+) -> list[str] | None:
+    """Activate the opt-in Trustpilot source when the user pinned a domain.
+
+    Passing ``--trustpilot-domain`` (or a plan-level ``trustpilot_domain``) is
+    unambiguous intent — silently ignoring it when Trustpilot is not in
+    ``INCLUDE_SOURCES`` / ``--search`` is the #873 failure mode. Auto-resolve
+    hints must not call this helper.
+
+    ``EXCLUDE_SOURCES=trustpilot`` still wins. Mutates ``config`` in place and
+    returns the (possibly extended) ``requested_sources`` list.
+    """
+    excluded = {
+        token.strip().lower()
+        for token in str(config.get("EXCLUDE_SOURCES") or "").split(",")
+        if token.strip()
+    }
+    if "trustpilot" in excluded:
+        sys.stderr.write(
+            f"[Trustpilot] {reason} ignored: trustpilot is in EXCLUDE_SOURCES\n"
+        )
+        return requested_sources
+
+    include = str(config.get("INCLUDE_SOURCES") or "")
+    tokens = [token.strip() for token in include.split(",") if token.strip()]
+    if "trustpilot" not in {token.lower() for token in tokens}:
+        tokens.append("trustpilot")
+        config["INCLUDE_SOURCES"] = ",".join(tokens)
+        sys.stderr.write(
+            f"[Trustpilot] {reason} activated trustpilot source "
+            "(add to INCLUDE_SOURCES permanently to skip this auto-enable)\n"
+        )
+
+    if requested_sources is not None and "trustpilot" not in requested_sources:
+        requested_sources = [*requested_sources, "trustpilot"]
+    return requested_sources
+
+
 def slugify(value: str, max_length: int = 180) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     if len(slug) > max_length:
@@ -651,7 +706,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Use web search to discover subreddits/handles before planning (for platforms without WebSearch)")
     parser.add_argument("--github-user", help="GitHub username for person-mode search (e.g., steipete)")
     parser.add_argument("--github-repo", help="Comma-separated owner/repo for project-mode search (e.g., openclaw/openclaw,paperclipai/paperclip)")
-    parser.add_argument("--trustpilot-domain", help="Trustpilot review-page domain for the topic (e.g., www.thriftbooks.com). Used verbatim and bypasses the brand-shape gate; find it with `trustpilot-pp-cli search '<name>'`.")
+    parser.add_argument(
+        "--trustpilot-domain",
+        help=(
+            "Trustpilot review-page domain for the topic (e.g., www.thriftbooks.com). "
+            "Used verbatim, bypasses the brand-shape gate, and auto-activates the "
+            "opt-in Trustpilot source for this run (unless EXCLUDE_SOURCES=trustpilot). "
+            "Find the domain with `trustpilot-pp-cli search '<name>'`."
+        ),
+    )
     parser.add_argument(
         "--competitors",
         nargs="?",
@@ -2987,6 +3050,18 @@ def _main(
         return hosted.run_hosted(topic, depth, **hosted_kwargs)
 
     requested_sources = resolve_requested_sources(args.search, config)
+    # Explicit --trustpilot-domain is user intent: activate the opt-in source
+    # before diagnose/run so the flag cannot silently no-op (#873). Auto-resolve
+    # hints are applied later and must not call this path.
+    cli_trustpilot_domain = (
+        args.trustpilot_domain.strip() if args.trustpilot_domain else ""
+    )
+    if cli_trustpilot_domain:
+        requested_sources = activate_trustpilot_for_explicit_domain(
+            config,
+            requested_sources,
+            reason=f"--trustpilot-domain={cli_trustpilot_domain}",
+        )
     diag = pipeline.diagnose(config, requested_sources, safe=args.diagnose)
 
     if args.diagnose:
@@ -3127,6 +3202,18 @@ def _main(
         github_repos = [r.strip() for r in args.github_repo.split(",") if r.strip() and "/" in r.strip()] if args.github_repo else None
         trustpilot_domain = args.trustpilot_domain.strip() if args.trustpilot_domain else None
 
+        comp_enabled, comp_count, comp_explicit = resolve_competitors_args(args)
+        comp_plan = parse_competitors_plan(args.competitors_plan)
+
+        # Plan-level trustpilot_domain pins are the same user intent as the CLI
+        # flag (already activated above). Auto-resolve hints must not activate.
+        if plan_has_explicit_trustpilot_domain(comp_plan):
+            requested_sources = activate_trustpilot_for_explicit_domain(
+                config,
+                requested_sources,
+                reason="competitors-plan trustpilot_domain",
+            )
+
         # Only canonicalize when repos came from a user-supplied --github-repo flag.
         # When repos_from_auto_resolve is True, auto_resolve already ran
         # canonicalize_github_repos(cap=5) and ranked by relevance; re-running here
@@ -3151,9 +3238,6 @@ def _main(
             include = config.get("INCLUDE_SOURCES") or ""
             if "perplexity" not in include.lower():
                 config["INCLUDE_SOURCES"] = f"{include},perplexity" if include else "perplexity"
-
-        comp_enabled, comp_count, comp_explicit = resolve_competitors_args(args)
-        comp_plan = parse_competitors_plan(args.competitors_plan)
 
         # Polymarket disambiguation: if user passed --polymarket-keywords,
         # store on config so the polymarket adapter can filter matches.

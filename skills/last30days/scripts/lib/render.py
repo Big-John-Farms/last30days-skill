@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 from collections import Counter
 from datetime import date
 from urllib.parse import urlparse
@@ -1602,16 +1603,21 @@ def render_full(report: schema.Report) -> str:
             if item.container:
                 lines.append(f"  *{item.container}*")
             if item.snippet:
-                lines.append(f"  {item.snippet[:500]}")
+                lines.append(
+                    f"  {_format_untrusted_evidence(item.snippet, 500, continuation_indent='  ')}"
+                )
             # Top comments for Reddit, YouTube, TikTok, HackerNews.
             top_comments = item.metadata.get("top_comments", [])
             if top_comments and isinstance(top_comments[0], dict):
                 vote_label = _vote_label_for(item.source)
                 for tc in top_comments[:3]:
-                    excerpt = tc.get("excerpt", tc.get("text", ""))[:200]
+                    excerpt = tc.get("excerpt", tc.get("text", ""))
                     tc_score = tc.get("score", "")
                     attribution = _comment_attribution(item.source, tc.get("author"))
-                    lines.append(f"  Top comment {attribution} ({tc_score} {vote_label}): {excerpt}")
+                    lines.append(
+                        f"  Top comment {attribution} ({tc_score} {vote_label}): "
+                        f"{_format_untrusted_evidence(excerpt, 200, continuation_indent='  ')}"
+                    )
             # Digg: inline X-post quotes attached to the cluster.
             for post in _digg_posts_for(item, limit=3):
                 lines.append(f"  > {_format_digg_quote(post)}")
@@ -1620,18 +1626,24 @@ def render_full(report: schema.Report) -> str:
             if insights:
                 lines.append("  Insights:")
                 for ins in insights[:3]:
-                    lines.append(f"    - {ins[:200]}")
+                    lines.append(
+                        f"    - {_format_untrusted_evidence(ins, 200, continuation_indent='      ')}"
+                    )
             # Transcript highlights for YouTube
             highlights = item.metadata.get("transcript_highlights", [])
             if highlights:
                 lines.append("  Highlights (auto-generated transcript; may contain transcription errors):")
                 for hl in highlights[:5]:
-                    lines.append(f'    - "{hl[:200]}"')
+                    lines.append(
+                        f'    - "{_format_untrusted_evidence(hl, 200, continuation_indent="      ")}"'
+                    )
             # Full transcript snippet for YouTube
             transcript = item.metadata.get("transcript_snippet", "")
             if transcript and len(transcript) > 100:
                 lines.append(f"  <details><summary>Transcript ({len(transcript.split())} words; auto-generated — may contain transcription errors)</summary>")
-                lines.append(f"  {transcript[:5000]}")
+                lines.append(
+                    f"  {_format_untrusted_evidence(transcript, 5000, continuation_indent='  ')}"
+                )
                 lines.append("  </details>")
             # Polymarket outcome prices and market details
             outcome_prices = item.metadata.get("outcome_prices") or []
@@ -1741,7 +1753,10 @@ def render_context(report: schema.Report, cluster_limit: int = 6) -> str:
             ]
             lines.append(f"  - {' | '.join(detail_parts)}")
             if candidate.snippet:
-                lines.append(f"    Evidence: {_truncate(candidate.snippet, 180)}")
+                lines.append(
+                    f"    Evidence: "
+                    f"{_format_untrusted_evidence(candidate.snippet, 180, continuation_indent='      ')}"
+                )
     corpus_section = _render_corpus_section(report)
     if corpus_section:
         lines.extend(["", *corpus_section])
@@ -1815,7 +1830,9 @@ def render_brief(report: schema.Report, cluster_limit: int = 8) -> str:
             if not candidate:
                 continue
             if candidate.snippet:
-                lines.append(f"- {_truncate(candidate.snippet, 280)}")
+                lines.append(
+                    f"- {_format_untrusted_evidence(candidate.snippet, 280, continuation_indent='  ')}"
+                )
             explanation = _format_explanation(candidate)
             if explanation:
                 lines.append(f"  _Why: {explanation}_")
@@ -2020,24 +2037,29 @@ def _render_candidate(
     if explanation:
         lines.append(f"   - Why: {explanation}")
     if candidate.snippet:
-        lines.append(f"   - Evidence: {_truncate(candidate.snippet, 360)}")
+        lines.append(
+            f"   - Evidence: {_format_untrusted_evidence(candidate.snippet, 360)}"
+        )
     for tc in _top_comments_list(primary):
         excerpt = tc.get("excerpt") or tc.get("text") or ""
         score = tc.get("score", "")
         vote_label = _vote_label_for(primary.source) if primary else "upvotes"
         source = primary.source if primary else None
         attribution = _comment_attribution(source, tc.get("author"))
-        lines.append(f"   - {attribution} ({score} {vote_label}): {_truncate(excerpt.strip(), 240)}")
+        lines.append(
+            f"   - {attribution} ({score} {vote_label}): "
+            f"{_format_untrusted_evidence(excerpt.strip(), 240)}"
+        )
     for post in _digg_posts_for(primary):
         lines.append(f"   - {_format_digg_quote(post)}")
     insight = _comment_insight(primary)
     if insight:
-        lines.append(f"   - Insight: {_truncate(insight, 220)}")
+        lines.append(f"   - Insight: {_format_untrusted_evidence(insight, 220)}")
     highlights = _transcript_highlights(primary)
     if highlights:
         lines.append("   - Highlights (auto-generated transcript; may contain transcription errors):")
         for hl in highlights:
-            lines.append(f'     - "{_truncate(hl, 200)}"')
+            lines.append(f'     - "{_format_untrusted_evidence(hl, 200)}"')
     return lines
 
 
@@ -2965,7 +2987,10 @@ def _render_best_takes(
         crowd_tag = " +crowd" if crowd_boost >= 5.0 else ""
         score_tag = f"(fun:{candidate.fun_score:.0f}{crowd_tag})"
         reason = f" -- {candidate.fun_explanation}" if candidate.fun_explanation and candidate.fun_explanation != "heuristic-fallback" else ""
-        lines.append(f'- "{_truncate(text, 280)}" -- {attribution} {score_tag}{reason}')
+        lines.append(
+            f'- "{_format_untrusted_evidence(text, 280, continuation_indent="  ")}" '
+            f"-- {attribution} {score_tag}{reason}"
+        )
     return lines
 
 
@@ -3040,7 +3065,10 @@ def _render_top_comments(
         attribution = _comment_attribution(cand.source, tc.get("author"))
         url = tc.get("url") or cand.url or ""
         url_part = f" — {url}" if url else ""
-        lines.append(f'- "{_truncate(body, 240)}" — {attribution} ({score} {vote_label}){url_part}')
+        lines.append(
+            f'- "{_format_untrusted_evidence(body, 240, continuation_indent="  ")}" '
+            f"— {attribution} ({score} {vote_label}){url_part}"
+        )
     return lines
 
 
@@ -3049,3 +3077,44 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+_ATX_HEADING_PREFIX = re.compile(r"^(#{1,6})(\s|$)")
+
+
+def _escape_atx_heading_prefix(line: str) -> str:
+    """Neutralize leading ATX heading markers so scraped text cannot mint sections."""
+    stripped = line.lstrip()
+    if not stripped:
+        return line
+    leading = line[: len(line) - len(stripped)]
+    match = _ATX_HEADING_PREFIX.match(stripped)
+    if not match:
+        return line
+    hashes = match.group(1)
+    rest = stripped[len(hashes) :]
+    return f"{leading}{'\\#' * len(hashes)}{rest}"
+
+
+def _format_untrusted_evidence(
+    text: str,
+    limit: int,
+    *,
+    continuation_indent: str = "     ",
+) -> str:
+    """Truncate scraped text and keep it from injecting markdown structure.
+
+    Multi-line snippets previously broke out of the ``   - Evidence:`` indent
+    so a bare ``##`` from a jobs page became a sibling of engine section
+    headings inside the EVIDENCE FOR SYNTHESIS block (#874). Continuation
+    lines stay indented (CommonMark ATX headings need ≤3 leading spaces), and
+    leading ``#`` runs are escaped as defense in depth.
+    """
+    truncated = _truncate(text, limit)
+    if not truncated:
+        return truncated
+    lines = truncated.splitlines()
+    safe: list[str] = [_escape_atx_heading_prefix(lines[0])]
+    for line in lines[1:]:
+        safe.append(continuation_indent + _escape_atx_heading_prefix(line))
+    return "\n".join(safe)

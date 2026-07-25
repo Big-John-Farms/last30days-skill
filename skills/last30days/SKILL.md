@@ -857,7 +857,7 @@ Before running the engine, determine which flags apply to this topic and resolve
 | `--x-related={h1,h2,...}` | Step 0.5 (Section A below) | Topic has associated entities (founders, commentators, spouse, collaborators, media handles) |
 | `--github-user={user}` | Step 0.5b | Topic is a person who ships code (developer, engineer, CEO-who-codes, researcher) |
 | `--github-repo={owner/repo}` | Step 0.5c | Topic is a product / project / open-source tool |
-| `--trustpilot-domain={domain}` | Step 0.5d | Topic is a company / brand / service with a Trustpilot presence AND the run includes the Trustpilot source |
+| `--trustpilot-domain={domain}` | Step 0.5d | Topic is a company / brand / service with a Trustpilot presence (passing the flag also auto-activates the opt-in Trustpilot source for this run) |
 | `--subreddits={sub1,sub2,...}` | Step 0.55 | Always — almost every topic has active Reddit communities |
 | `--tiktok-hashtags={h1,h2,...}` | Step 0.55 | Always — inferred from topic |
 | `--tiktok-creators={c1,c2,...}` | Step 0.55 | Creator / influencer / brand topics |
@@ -992,9 +992,9 @@ Project-mode GitHub fetches live star counts, README snippets, latest releases, 
 
 Store: `RESOLVED_GITHUB_REPOS = {comma-separated owner/repo or empty}`
 
-### Step 0.5d: Resolve Trustpilot Domain (if topic is a company/brand and Trustpilot is active)
+### Step 0.5d: Resolve Trustpilot Domain (if topic is a company/brand)
 
-If the run includes the Trustpilot source (`INCLUDE_SOURCES=trustpilot` or an explicit `--search` list) and TOPIC is a company, brand, or service, resolve its Trustpilot review-page domain. Trustpilot pages are keyed by domain (`www.thriftbooks.com`), not company name — a bare name 404s.
+When TOPIC is a company, brand, or service and you want Trustpilot review evidence, resolve its Trustpilot review-page domain. Trustpilot pages are keyed by domain (`www.thriftbooks.com`), not company name — a bare name 404s. Passing `--trustpilot-domain` (or a per-entity `trustpilot_domain` in `--competitors-plan`) auto-activates the opt-in Trustpilot source for that run — you do not also need `INCLUDE_SOURCES=trustpilot`.
 
 **You usually already have it.** Step 0.55 item 6 (first-party positioning) fetches the official site — capture the bare hostname while you're there. When positioning wasn't fetched, one lookup covers it:
 
@@ -1004,13 +1004,13 @@ WebSearch("{TOPIC} official site")
 
 Pass to the CLI: `--trustpilot-domain={domain}` (e.g., `--trustpilot-domain=www.thriftbooks.com`)
 
-The flag is used verbatim and bypasses the engine's brand-shape gate, so it also unlocks Trustpilot for multi-word company names ("Stanley Steemer carpet cleaning"). For comparisons, put a per-entity `trustpilot_domain` in each PEER entity's `--competitors-plan` entry; the MAIN topic's domain must ride the outer `--trustpilot-domain` flag (the engine does not read a main-topic entry out of the plan).
+The flag is used verbatim, bypasses the engine's brand-shape gate, and auto-activates Trustpilot for the run, so it also unlocks Trustpilot for multi-word company names ("Stanley Steemer carpet cleaning"). For comparisons, put a per-entity `trustpilot_domain` in each PEER entity's `--competitors-plan` entry; the MAIN topic's domain must ride the outer `--trustpilot-domain` flag (the engine does not read a main-topic entry out of the plan).
 
-**A miss is not fatal.** When the flag is absent, the engine resolves name → domain itself via the CLI's search (and headless `--auto-resolve` runs fill a hint the engine verifies). Resolve the flag when the domain is already in hand or the company name is ambiguous (lookalike or same-named companies) — an explicit domain is the only way to guarantee the right company.
+**A miss is not fatal.** When the flag is absent, the engine resolves name → domain itself via the CLI's search **only when Trustpilot is already active** (`INCLUDE_SOURCES=trustpilot` or `--search` includes it); headless `--auto-resolve` fills a hint the engine verifies, but that hint alone does not activate the source. Resolve the flag when the domain is already in hand or the company name is ambiguous (lookalike or same-named companies) — an explicit domain is the only way to guarantee the right company *and* turn the source on.
 
 **Skip this step if:**
-- The Trustpilot source is not active for this run
 - TOPIC is a person, event, or abstract concept (no company reviews to fetch)
+- You intentionally want Trustpilot off for this run (`EXCLUDE_SOURCES=trustpilot`)
 
 Store: `RESOLVED_TRUSTPILOT_DOMAIN = {domain or empty}`
 
@@ -1264,7 +1264,7 @@ Per-entity lookup types to resolve:
 2. **Project GitHub repo** - `owner/repo` format (e.g., `openai/openai-python`)
 3. **Founder/maintainer X handle** - the person or team behind the project
 4. **Relevant subreddits** - project-specific subreddits (e.g., `r/openclaw`) AND general-category subreddits (e.g., `r/LocalLLaMA`)
-5. **Trustpilot domain** (only when the Trustpilot source is active and the entity is a company/brand/service) - the entity's Trustpilot review-page domain per Step 0.5d; peers carry it as `trustpilot_domain` in their `--competitors-plan` entry, the main topic via the outer `--trustpilot-domain` flag
+5. **Trustpilot domain** (when the entity is a company/brand/service and you want review evidence) - the entity's Trustpilot review-page domain per Step 0.5d; peers carry it as `trustpilot_domain` in their `--competitors-plan` entry, the main topic via the outer `--trustpilot-domain` flag (either pin auto-activates Trustpilot for the run)
 
 Example batching for "OpenClaw vs Hermes vs Paperclip":
 
@@ -1461,7 +1461,7 @@ Then add to the engine command:
 - `--ig-creators={RESOLVED_IG_CREATORS}` (from Step 0.55)
 - `--github-user={RESOLVED_GITHUB_USER}` (from Step 0.5b, person topics only)
 - `--github-repo={RESOLVED_GITHUB_REPOS}` (from Step 0.5c, product/project topics only)
-- `--trustpilot-domain={RESOLVED_TRUSTPILOT_DOMAIN}` (from Step 0.5d, company/brand topics when the Trustpilot source is active)
+- `--trustpilot-domain={RESOLVED_TRUSTPILOT_DOMAIN}` (from Step 0.5d, company/brand topics; the flag also auto-activates Trustpilot)
 - Omit any flag where the value was not resolved (empty).
 
 **If you skipped Steps 0.55 and 0.75 (no WebSearch -- OpenClaw, Codex, etc.), add:**
