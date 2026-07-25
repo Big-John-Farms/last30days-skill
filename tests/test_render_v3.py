@@ -1190,6 +1190,65 @@ class TranscriptCaveatTests(unittest.TestCase):
         )
 
 
+class TestUntrustedEvidenceSanitization(unittest.TestCase):
+    """Scraped markdown must not mint structural ## headings in evidence (#874)."""
+
+    def test_format_untrusted_evidence_indents_and_escapes_headings(self):
+        raw = (
+            "Sales Operations Key Account Manager at Traeger Grills · JobsRadar\n"
+            "\n"
+            "Jobs› Companies› Traeger Grills\n"
+            "\n"
+            "## About this Sales Operations Key Account Manager role at Traeger Grills\n"
+            "\n"
+            "Traeger Grills · Onsite · Salt Lake City, UT"
+        )
+        formatted = render._format_untrusted_evidence(raw, 360)
+        self.assertNotRegex(formatted, r"(?m)^## ")
+        self.assertIn(r"\#\# About this Sales Operations", formatted)
+        # Continuation lines stay under the Evidence bullet indent.
+        for line in formatted.splitlines()[1:]:
+            self.assertTrue(line.startswith("     ") or line == "     ")
+
+    def test_render_candidate_evidence_has_no_column_zero_heading(self):
+        item = schema.SourceItem(
+            item_id="j1",
+            source="jobs",
+            title="Sales Operations Key Account Manager",
+            body="body",
+            url="https://jobs-radar.com/job/example",
+            published_at="2026-07-01",
+            date_confidence="high",
+            engagement={},
+            snippet=(
+                "Sales Operations role\n\n"
+                "## About this Sales Operations Key Account Manager role at Traeger Grills\n"
+                "Welcome To The Traegerhood"
+            ),
+        )
+        candidate = schema.Candidate(
+            candidate_id="c1",
+            item_id=item.item_id,
+            source="jobs",
+            title=item.title,
+            url=item.url,
+            snippet=item.snippet,
+            subquery_labels=["primary"],
+            native_ranks={"jobs": 1},
+            local_relevance=1.0,
+            freshness=1,
+            engagement=1,
+            source_quality=1.0,
+            rrf_score=1.0,
+            sources=["jobs"],
+            source_items=[item],
+        )
+        text = "\n".join(render._render_candidate(candidate, "1."))
+        self.assertIn("   - Evidence:", text)
+        self.assertNotRegex(text, r"(?m)^## ")
+        self.assertIn(r"\#\# About this Sales Operations", text)
+
+
 if __name__ == "__main__":
     unittest.main()
 
