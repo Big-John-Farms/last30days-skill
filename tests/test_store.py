@@ -1204,6 +1204,48 @@ def test_list_discovery_queue_orders_by_last_surfaced_and_filters_status(temp_db
     assert [r["name"] for r in covered] == ["Covered topic"]
 
 
+def test_store_findings_none_engagement_on_update_does_not_crash(temp_db):
+    """Regression: store_findings must not TypeError when an update-path finding
+    carries engagement_score=None.
+
+    .get("engagement_score", 0) only substitutes 0 for an *absent* key, so a
+    present-but-None value reached max(None, existing) on the update branch.
+    store_findings accepts arbitrary List[Dict[str, Any]] callers, so the
+    boundary must stay null-safe (engagement_score is float | None in schema.py).
+    """
+    topic_id = store.add_topic("None Engagement Topic")["id"]
+    url = "https://example.com/none-engagement"
+    base = {
+        "source": "reddit",
+        "source_url": url,
+        "source_title": "T",
+        "author": "",
+        "content": "",
+        "summary": "",
+        "relevance_score": 0.5,
+    }
+
+    # First sighting carries a real engagement score.
+    run1 = store.record_run(topic_id, source_mode="test", status="running")
+    store.store_findings(run1, topic_id, [{**base, "engagement_score": 5.0}])
+
+    # Re-sighting the same URL with engagement_score=None takes the UPDATE branch;
+    # before the fix this raised TypeError from max(None, 5.0).
+    run2 = store.record_run(topic_id, source_mode="test", status="running")
+    counts = store.store_findings(run2, topic_id, [{**base, "engagement_score": None}])
+    assert counts["updated"] == 1
+
+    con = sqlite3.connect(str(temp_db))
+    try:
+        stored = con.execute(
+            "SELECT engagement_score FROM findings WHERE source_url = ?", (url,)
+        ).fetchone()[0]
+    finally:
+        con.close()
+    # max(None -> 0, existing 5.0) keeps the higher real score.
+    assert stored == 5.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
