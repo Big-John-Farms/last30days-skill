@@ -90,6 +90,34 @@ class TestChangelogWorkflow(unittest.TestCase):
         ):
             self.assertTrue((workflows / name).is_file(), msg=name)
 
+    def test_tag_release_workflow_yaml_parses(self) -> None:
+        """Bare ``chore(release):`` in an unquoted ``if:`` breaks Actions YAML.
+
+        GitHub then reports the run as failed with zero jobs on every push to
+        main. The expression must be double-quoted; prefer ``contains`` so
+        merge-commit messages still match.
+        """
+        path = ROOT / ".github" / "workflows" / "tag-release.yml"
+        text = path.read_text(encoding="utf-8")
+        try:
+            import yaml  # type: ignore[import-untyped]
+        except ImportError:  # pragma: no cover - PyYAML not a project dep
+            yaml = None
+        if yaml is not None:
+            yaml.safe_load(text)
+        self.assertRegex(
+            text,
+            r'(?m)^\s+if:\s+"contains\(github\.event\.head_commit\.message, '
+            r"'chore\(release\): bump version to '\)\"\s*$",
+        )
+        # VERSION parse must scan the full message (merge commits put the
+        # chore line in the body, not on line 1).
+        self.assertIn(
+            "sed -n 's/^chore(release): bump version to",
+            text,
+        )
+        self.assertNotIn("| head -n1 | sed -n", text)
+
     def test_changelog_guard_run_blocks_stay_indented(self) -> None:
         """Column-0 lines inside ``run: |`` break Actions YAML parsing."""
         path = ROOT / ".github" / "workflows" / "changelog-guard.yml"
