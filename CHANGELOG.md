@@ -32,10 +32,6 @@ This project uses [towncrier](https://towncrier.readthedocs.io/). Upcoming notes
 - X search via xurl pins app-only bearer auth so OAuth1-signed multi-word queries no longer 401. ([#855](https://github.com/mvanhorn/last30days-skill/pull/855))
 - Bird X retries normalize cleanly and empty result sets stay empty instead of erroring. ([#840](https://github.com/mvanhorn/last30days-skill/pull/840))
 
-### Added
-
-- SerpApi can now serve as a paid web-search backend with `SERPAPI_API_KEY`; `--web-backend=serpapi` pins it, and auto-detect tries it between Serper and Parallel.
-
 ## [3.18.0] - 2026-07-21
 
 ### Changed
