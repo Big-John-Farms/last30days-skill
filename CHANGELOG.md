@@ -9,6 +9,22 @@ This project uses [towncrier](https://towncrier.readthedocs.io/). Upcoming notes
 
 <!-- towncrier release notes start -->
 
+## [3.18.3] - 2026-07-25
+
+### Fixed
+
+- Top Community Comments ranking blends thread relevance with vote strength and applies the relevance floor only when enough on-topic candidates exist. ([#701](https://github.com/mvanhorn/last30days-skill/issues/701))
+- Chromium cookie extraction now searches every browser profile for a matching cookie set, and reuses the Keychain/AES key across profiles in one scan. ([#725](https://github.com/mvanhorn/last30days-skill/issues/725))
+- Synthesis contract is echoed at the top of the evidence envelope so hosts that truncate stdout still see the "synthesize, don't dump" directive. ([#727](https://github.com/mvanhorn/last30days-skill/issues/727))
+- `store_findings` no longer raises `TypeError` when a re-sighted finding carries `engagement_score: None`. ([#796](https://github.com/mvanhorn/last30days-skill/issues/796))
+- Explicit --plan payloads with an invalid schema now exit with a field-specific error instead of silently running a deterministic plan. ([#841](https://github.com/mvanhorn/last30days-skill/issues/841))
+- Company-topic runs no longer auto-add the `jobs` source when an explicit `--search` / `requested_sources` filter is set; `--hiring-signals` still forces jobs. ([#842](https://github.com/mvanhorn/last30days-skill/issues/842))
+- Report footer path now matches the collision-safe path actually reserved by save_output. ([#850](https://github.com/mvanhorn/last30days-skill/issues/850))
+- YouTube ScrapeCreators transcript rescue is logged instead of being masked as a hard failure. ([#851](https://github.com/mvanhorn/last30days-skill/issues/851))
+- Polymarket domain-sweep topics no longer drop every market after noise-word stripping removes terms like "ai". ([#859](https://github.com/mvanhorn/last30days-skill/issues/859))
+- Reddit fetch windows now track the requested date range so short `--days` runs no longer pull a depth-default month and discard everything outside the window. ([#860](https://github.com/mvanhorn/last30days-skill/issues/860))
+
+
 ## [3.18.2] - 2026-07-25
 
 ### Added
