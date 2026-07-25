@@ -15,6 +15,7 @@ from . import (
     hiring_signals,
     library_index,
     registers,
+    relevance,
     schema,
     signals,
     skill_meta,
@@ -3015,8 +3016,18 @@ def _render_top_comments(
     seen: set[str] = set()
     scored: list[tuple[float, schema.Candidate, schema.SourceItem, dict, str]] = []
     candidate_pool = report.ranked_candidates if candidates is None else candidates
+    floor_candidates = [
+        cand for cand in candidate_pool
+        if _best_take_relevance_ok(cand)
+        and (cand.local_relevance or 0.0) >= relevance.RELEVANCE_FLOOR
+    ]
+    apply_relevance_floor = len(floor_candidates) >= relevance.MIN_ON_TOPIC
     for cand in candidate_pool:
         if not _best_take_relevance_ok(cand):
+            continue
+        # Skip comments from off-topic threads when enough candidates clear the
+        # floor; sparse niche topics still surface their best comments (#641).
+        if apply_relevance_floor and (cand.local_relevance or 0.0) < relevance.RELEVANCE_FLOOR:
             continue
         for item in cand.source_items:
             # Pass min_score=0 here: the cross-platform list deliberately does
@@ -3034,7 +3045,10 @@ def _render_top_comments(
                 if key in seen:
                     continue
                 seen.add(key)
-                strength = signals.normalized_comment_vote(cand.source, tc.get("score"))
+                # Blend vote strength (60%) with thread relevance (40%) so comments
+                # from on-topic threads rank above off-topic viral comments.
+                vote_strength = signals.normalized_comment_vote(cand.source, tc.get("score"))
+                strength = 0.6 * vote_strength + 0.4 * (cand.local_relevance or 0.0)
                 scored.append((strength, cand, item, tc, body))
     if len(scored) < 2:
         return []
