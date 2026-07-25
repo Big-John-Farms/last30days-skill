@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# fmt: off
 # ruff: noqa: E402
 """last30days CLI."""
 
@@ -15,6 +16,7 @@ import signal
 import sqlite3
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 MIN_PYTHON = (3, 12)
@@ -222,6 +224,7 @@ def save_output(
     json_profile: str = "agent",
     register: str = "default",
     private: bool | None = None,
+    render_fn: Callable[[Path], str] | None = None,
 ) -> Path:
     from datetime import datetime
     path = Path(save_dir).expanduser().resolve()
@@ -237,21 +240,24 @@ def save_output(
         candidates.append(path / f"{slug}-{raw_label}{suffix_part}-{date_str}-{i}.{extension}")
     # Markdown saves keep the complete debug artifact. JSON and HTML preserve
     # their requested wire format so file extensions match their content.
-    if rendered_content is not None:
-        content = rendered_content
-    elif emit in {"json", "html"}:
-        content = emit_output(
-            report,
-            emit,
-            synthesis_md=synthesis_md,
-            json_profile=json_profile,
-            register=register,
-        )
-    else:
-        content = render.render_full(report)
+    # When render_fn is supplied, content is produced after O_EXCL allocates
+    # the candidate. This lets the footer cite the file actually written
+    # without racing a separate filesystem probe.
+    if render_fn is None:
+        if rendered_content is not None:
+            static_content = rendered_content
+        elif emit in {"json", "html"}:
+            static_content = emit_output(
+                report,
+                emit,
+                synthesis_md=synthesis_md,
+                json_profile=json_profile,
+                register=register,
+            )
+        else:
+            static_content = render.render_full(report)
     private_corpus = _report_has_private_corpus(report) or bool(private)
     _ensure_output_directory(path, private=private_corpus)
-    encoded = content.encode("utf-8")
     for candidate in candidates:
         try:
             fd = os.open(
@@ -261,8 +267,18 @@ def save_output(
             )
         except FileExistsError:
             continue
-        with os.fdopen(fd, "wb") as f:
-            f.write(encoded)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                content = render_fn(candidate) if render_fn is not None else static_content
+                f.write(content.encode("utf-8"))
+        except BaseException:
+            # Deferred rendering happens after the candidate is reserved. Do
+            # not leave an empty or partial report if rendering or writing fails.
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         if candidate.suffix.lower() == ".md":
             try:
                 from lib import library, library_index
@@ -2263,6 +2279,32 @@ def _render_save_and_print(
         sys.stderr.flush()
     if args.save_dir:
         # Save the main topic's raw file (single-entity or comparison main).
+        # Bind the render to the path save_output actually allocates so the
+        # saved report and stdout agree even when collision fallback is used.
+        def _render_with_actual_path(actual_path: Path) -> str:
+            nonlocal rendered
+            display = compute_output_path_display(str(actual_path))
+            if entity_reports:
+                rendered = emit_comparison_output(
+                    entity_reports,
+                    args.emit,
+                    fun_level=fun_level,
+                    save_path=display,
+                    synthesis_md=synthesis_md,
+                    json_profile=args.json_profile,
+                )
+            else:
+                rendered = emit_output(
+                    report,
+                    args.emit,
+                    fun_level=fun_level,
+                    save_path=display,
+                    synthesis_md=synthesis_md,
+                    json_profile=args.json_profile,
+                    register=audience.name,
+                )
+            return rendered
+
         save_path = save_output(
             report,
             args.emit,
@@ -2270,10 +2312,10 @@ def _render_save_and_print(
             suffix=args.save_suffix or "",
             synthesis_md=synthesis_md,
             topic_override=comparison_topic(entity_reports) if is_comparison_html else None,
-            rendered_content=rendered if is_comparison_html else None,
             json_profile=args.json_profile,
             register=audience.name,
             private=private_saved_format,
+            render_fn=_render_with_actual_path,
         )
         if args.emit == "html":
             publish_companion_paths.append(save_path)
