@@ -77,18 +77,15 @@ class TestTopCommentsRelevanceGate:
             local_relevance=0.05,  # below RELEVANCE_FLOOR=0.1
             top_comments=[{"body": "viral off-topic comment nine thousand votes", "score": 9000}],
         )
-        # Two on-topic comments so the len(scored) >= 2 guard passes
-        on_topic_a = _candidate(
-            url="https://example.com/ontopic-a",
-            local_relevance=0.7,
-            top_comments=[{"body": "directly about the topic first comment", "score": 50}],
-        )
-        on_topic_b = _candidate(
-            url="https://example.com/ontopic-b",
-            local_relevance=0.7,
-            top_comments=[{"body": "directly about the topic second comment", "score": 30}],
-        )
-        report = _make_report(off_topic, on_topic_a, on_topic_b)
+        on_topic = [
+            _candidate(
+                url=f"https://example.com/ontopic-{idx}",
+                local_relevance=0.7,
+                top_comments=[{"body": f"directly about the topic comment {idx}", "score": 50 - idx}],
+            )
+            for idx in range(5)
+        ]
+        report = _make_report(off_topic, *on_topic)
         lines = render._render_top_comments(report)
         combined = "\n".join(lines)
         assert "viral off-topic comment" not in combined
@@ -119,6 +116,50 @@ class TestTopCommentsRelevanceGate:
         lines = render._render_top_comments(report)
         combined = "\n".join(lines)
         assert combined.index("On-topic comment") < combined.index("Viral off-topic")
+
+    def test_sparse_topics_keep_comments_when_floor_would_remove_everything(self):
+        """Sparse niche topics should still surface comments below the soft relevance floor."""
+        low_relevance_a = _candidate(
+            url="https://example.com/sparse-a",
+            local_relevance=0.08,
+            top_comments=[{"body": "Sparse topic comment still relevant enough to show", "score": 70}],
+        )
+        low_relevance_b = _candidate(
+            url="https://example.com/sparse-b",
+            local_relevance=0.07,
+            top_comments=[{"body": "Another sparse topic comment below floor", "score": 50}],
+        )
+        low_relevance_c = _candidate(
+            url="https://example.com/sparse-c",
+            local_relevance=0.05,
+            top_comments=[{"body": "Third sparse topic comment below floor", "score": 30}],
+        )
+        report = _make_report(low_relevance_a, low_relevance_b, low_relevance_c)
+
+        lines = render._render_top_comments(report)
+        combined = "\n".join(lines)
+
+        assert "Sparse topic comment" in combined
+        assert "Another sparse topic comment" in combined
+
+    def test_maximally_viral_low_relevance_comment_loses_to_on_topic_comment(self):
+        """A clamped 5000-vote comment should still lose to a highly relevant 50-vote one."""
+        viral_low_relevance = _candidate(
+            url="https://example.com/max-viral",
+            local_relevance=0.12,
+            top_comments=[{"body": "Maximally viral but barely related comment", "score": 5000}],
+        )
+        on_topic = _candidate(
+            url="https://example.com/on-topic-boundary",
+            local_relevance=0.90,
+            top_comments=[{"body": "Highly relevant lower voted boundary comment", "score": 50}],
+        )
+        report = _make_report(viral_low_relevance, on_topic)
+
+        lines = render._render_top_comments(report)
+        combined = "\n".join(lines)
+
+        assert combined.index("Highly relevant") < combined.index("Maximally viral")
 
     def test_no_duplicate_comments(self):
         """Same comment body must appear at most once even if two candidates share the text."""
