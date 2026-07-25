@@ -3018,7 +3018,8 @@ def _render_top_comments(
     candidate_pool = report.ranked_candidates if candidates is None else candidates
     floor_candidates = [
         cand for cand in candidate_pool
-        if (cand.local_relevance or 0.0) >= relevance.RELEVANCE_FLOOR
+        if _best_take_relevance_ok(cand)
+        and (cand.local_relevance or 0.0) >= relevance.RELEVANCE_FLOOR
     ]
     apply_relevance_floor = len(floor_candidates) >= relevance.MIN_ON_TOPIC
     for cand in candidate_pool:
