@@ -1,1 +1,0 @@
-Release preparation now builds CHANGELOG.md from changelog.d fragments via towncrier and bumps every plugin/marketplace lockstep version surface through an automated Prepare release workflow (no more shared Unreleased edits).

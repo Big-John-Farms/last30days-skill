@@ -9,6 +9,18 @@ This project uses [towncrier](https://towncrier.readthedocs.io/). Upcoming notes
 
 <!-- towncrier release notes start -->
 
+## [3.18.2] - 2026-07-25
+
+### Added
+
+- Release preparation now builds CHANGELOG.md from changelog.d fragments via towncrier and bumps every plugin/marketplace lockstep version surface through an automated Prepare release workflow (no more shared Unreleased edits).
+
+### Fixed
+
+- `--trustpilot-domain` (and plan-level `trustpilot_domain`) now auto-activates the opt-in Trustpilot source for the run instead of silently no-oping when `INCLUDE_SOURCES` / `--search` omit it. ([#873](https://github.com/mvanhorn/last30days-skill/issues/873))
+- Scraped evidence text can no longer inject structural `##` markdown headings into the EVIDENCE FOR SYNTHESIS block — continuation lines stay indented and leading ATX markers are escaped. ([#874](https://github.com/mvanhorn/last30days-skill/issues/874))
+
+
 ## [3.18.1] - 2026-07-24
 
 ### Fixed
