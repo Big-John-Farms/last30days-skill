@@ -57,6 +57,67 @@ class TestChangelogWorkflow(unittest.TestCase):
         ):
             self.assertTrue((workflows / name).is_file(), msg=name)
 
+    def test_changelog_guard_run_blocks_stay_indented(self) -> None:
+        """Column-0 lines inside ``run: |`` break Actions YAML parsing."""
+        path = ROOT / ".github" / "workflows" / "changelog-guard.yml"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        in_run = False
+        run_indent = 0
+        for lineno, line in enumerate(lines, 1):
+            match = re.match(r"^(\s*)run:\s*\|\s*$", line)
+            if match:
+                in_run = True
+                run_indent = len(match.group(1))
+                continue
+            if not in_run or not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            if indent <= run_indent:
+                in_run = False
+                continue
+            self.assertGreater(
+                indent,
+                run_indent,
+                msg=f"{path}:{lineno} must stay indented inside run: |",
+            )
+
+    def test_read_manifest_version_helper(self) -> None:
+        script = ROOT / ".github" / "scripts" / "read_manifest_version.py"
+        self.assertTrue(script.is_file())
+        spec = importlib.util.spec_from_file_location("read_manifest_version", script)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(
+            mod.version_from("pyproject.toml", 'version = "3.18.1"\n'),
+            "3.18.1",
+        )
+        self.assertEqual(
+            mod.version_from("skills/last30days/SKILL.md", 'version: "3.18.1"\n'),
+            "3.18.1",
+        )
+        self.assertEqual(
+            mod.version_from(
+                "uv.lock",
+                '[[package]]\nname = "last30days-skill"\nversion = "3.18.1"\n',
+            ),
+            "3.18.1",
+        )
+        self.assertEqual(
+            mod.version_from(
+                ".claude-plugin/plugin.json",
+                json.dumps({"version": "3.18.1"}),
+            ),
+            "3.18.1",
+        )
+        self.assertEqual(
+            mod.version_from(
+                ".claude-plugin/marketplace.json",
+                json.dumps({"plugins": [{"version": "3.18.1"}]}),
+            ),
+            "3.18.1",
+        )
+
     def test_pr_template_has_agent_and_relationship_sections(self) -> None:
         text = (ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(
             encoding="utf-8"
