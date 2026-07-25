@@ -146,8 +146,13 @@ def test_passes_topic_filter_partial_match():
     """Test that at least one informative word must match."""
     # "AI" appears in both topic and title
     assert polymarket._passes_topic_filter("AI safety", "New AI Safety Conference") is True
-    # "models" doesn't appear, should fail
-    assert polymarket._passes_topic_filter("AI models", "New AI prediction") is False
+    # LOCAL DIVERGENCE from upstream: this asserted False, on the rule that a
+    # domain word ("ai") is too broad to be the sole match signal. That rule
+    # made domain sweeps impossible — an AI-news topic matched zero AI markets
+    # ever, because real titles say "AI" and never "artificial intelligence".
+    # _passes_topic_filter now falls back to _DOMAIN_WORDS when the informative
+    # words miss, so "AI models" does match an AI market.
+    assert polymarket._passes_topic_filter("AI models", "New AI prediction") is True
 
 
 def test_passes_topic_filter_all_noise_words():
@@ -182,6 +187,36 @@ def test_passes_topic_filter_two_word_still_needs_one():
     assert polymarket._passes_topic_filter(
         "Kanye West", "Kanye divorce settlement"
     ) is True
+
+
+
+def test_domain_fallback_keeps_soft_sweep_ai_markets():
+    """Soft sweep residue may match via domain words (the #859 fix)."""
+    assert polymarket._passes_topic_filter(
+        "AI frontier developments", "Will AI models beat humans at coding?"
+    ) is True
+
+
+
+def test_domain_fallback_treats_plural_domain_terms_as_domain():
+    """Plural domain tokens (models) must not block soft AI sweeps."""
+    assert polymarket._passes_topic_filter(
+        "AI models frontier developments",
+        "Will AI beat humans at coding by 2027?",
+    ) is True
+    assert polymarket._passes_topic_filter(
+        "AI models", "New AI prediction"
+    ) is True
+
+
+def test_domain_fallback_blocked_when_hard_informative_misses():
+    """Mixed topics must not accept unrelated markets via a shared domain token."""
+    assert polymarket._passes_topic_filter(
+        "MCP protocol benchmark", "Will the Kyoto Protocol survive?"
+    ) is False
+    assert polymarket._passes_any_informative_word(
+        "MCP protocol benchmark", "Will the Kyoto Protocol survive?"
+    ) is False
 
 
 def test_passes_topic_filter_multi_word_edge_exactly_three():
