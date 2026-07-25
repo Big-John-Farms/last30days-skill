@@ -488,6 +488,62 @@ class OutputEnvelopeTests(unittest.TestCase):
         )
 
 
+class SynthesisDirectiveSurvivesTruncationTests(unittest.TestCase):
+    """Issue #726: a host that truncates the engine's stdout (`| head -N`,
+    timeout-backgrounding, scrollback caps) used to lose the synthesis
+    instructions entirely, because the only strong directive lived at the
+    `# END OF last30days CANONICAL OUTPUT` boundary AFTER the whole evidence
+    block. Left holding only raw `### N.` clusters with no directive, the host
+    dumps them — the LAW 6 failure mode. A concise synthesis contract must
+    therefore ALSO appear at the TOP of the evidence, in the region that
+    survives head-truncation.
+    """
+
+    def _head_before_clusters(self, text: str) -> str:
+        # Everything a `engine | head -N` capture keeps when N lands inside the
+        # evidence block: the badge, metadata, and the directive must live here.
+        return text[: text.index("## Ranked Evidence Clusters")]
+
+    def test_synthesis_contract_present_before_evidence_block(self):
+        head = self._head_before_clusters(render.render_compact(sample_report()))
+        self.assertIn("SYNTHESIS CONTRACT", head)
+
+    def test_early_directive_restates_what_i_learned_and_dump_self_check(self):
+        head = self._head_before_clusters(render.render_compact(sample_report()))
+        # LAW 2 target shape...
+        self.assertIn("What I learned:", head)
+        # ...and the concrete "do not emit the cluster headings" self-check, so
+        # the directive is actionable without the tail boundary.
+        self.assertIn("### N.", head)
+        self.assertIn("PASS-THROUGH FOOTER", head)
+
+    def test_early_directive_sits_inside_evidence_envelope(self):
+        # It is a model instruction, not user output, so it belongs in the
+        # read-don't-emit zone (after the open comment, before the close).
+        text = render.render_compact(sample_report())
+        open_idx = text.index("<!-- EVIDENCE FOR SYNTHESIS:")
+        close_idx = text.index("<!-- END EVIDENCE FOR SYNTHESIS -->")
+        marker = text.index("SYNTHESIS CONTRACT")
+        self.assertLess(open_idx, marker)
+        self.assertLess(marker, close_idx)
+
+    def test_comparison_render_also_carries_early_directive(self):
+        report = sample_report()
+        text = render.render_comparison_multi([("Topic A", report), ("Topic B", report)])
+        self.assertIn("SYNTHESIS CONTRACT", text)
+        # Survive head-truncation: the directive must precede the FIRST entity
+        # evidence cluster heading (H3 in the comparison path), not merely the
+        # envelope close tag — that is the real point a `| head -N` capture cuts.
+        self.assertLess(
+            text.index("SYNTHESIS CONTRACT"),
+            text.index("### Ranked Evidence Clusters"),
+        )
+        self.assertLess(
+            text.index("SYNTHESIS CONTRACT"),
+            text.index("<!-- END EVIDENCE FOR SYNTHESIS -->"),
+        )
+
+
 class RenderTopCommentsTests(unittest.TestCase):
     """Tests for the top-3 comments rendering in compact cluster view."""
 

@@ -732,6 +732,8 @@ def render_compact(
     # block below) vs "synthesize from" (this block).
     lines.append("<!-- EVIDENCE FOR SYNTHESIS: read this, do not emit verbatim. Transform into `What I learned:` prose per LAW 2. -->")
     lines.append("")
+    # Echo the synthesis contract early so it survives tail truncation (#726).
+    lines.extend(_render_synthesis_directive())
     visible_clusters = evidence_report.clusters[:cluster_limit]
     solid_clusters = _clusters_clearing_relevance_floor(
         evidence_report,
@@ -1032,6 +1034,36 @@ def _append_html_footer(lines: list[str], report: schema.Report, save_path: str 
     lines.append("<!-- END PASS-THROUGH FOOTER -->")
 
 
+def _render_synthesis_directive() -> list[str]:
+    """Echo the synthesis contract at the TOP of the evidence envelope.
+
+    Added 2026-06-30 for issue #726 (Grok Build v0.2.67 emitted only logs and
+    raw evidence clusters instead of the canonical synthesis). Root cause: the
+    strong directive only lived in `_render_canonical_boundary` — the very END
+    of stdout, AFTER the whole evidence block and footer. Hosts that truncate
+    the tail (`engine | head -N`, timeout-backgrounding that captures partial
+    output, scrollback caps) keep the badge and the `### N.` clusters but never
+    reach the instruction that says "synthesize, don't dump", so they fall into
+    the LAW 6 failure mode and emit the raw evidence.
+
+    This block restates the contract in the head region that survives
+    truncation. It lives INSIDE the EVIDENCE FOR SYNTHESIS envelope (a model
+    instruction, not user output), mirroring how the DEGRADED RUN WARNING is
+    positioned early so the pass-through contract still carries it.
+    """
+    return [
+        "> **SYNTHESIS CONTRACT — read before emitting anything.** Everything below this",
+        "> line, up to where this evidence envelope closes, is raw evidence for you to",
+        "> READ, not text to emit. Transform it into `What I learned:` prose paragraphs",
+        "> per LAW 2. Do NOT pass the `### N.` evidence clusters or the stats and",
+        "> source-coverage blocks through verbatim. The ONLY block you emit verbatim is",
+        "> the PASS-THROUGH FOOTER (the emoji tree) lower down. The full contract repeats",
+        "> at the end-of-output boundary near the bottom; if your captured output was",
+        "> truncated and never reached it, this contract still binds.",
+        "",
+    ]
+
+
 def _render_canonical_boundary() -> list[str]:
     """Emit the explicit END-OF-CANONICAL-OUTPUT boundary.
 
@@ -1317,6 +1349,8 @@ def render_comparison_multi(
         "`What I learned:` prose per LAW 2. Each entity has its own evidence subsection. -->"
     )
     lines.append("")
+    # Echo the synthesis contract early so it survives tail truncation (#726).
+    lines.extend(_render_synthesis_directive())
 
     resolved_block = _render_resolved_entities_block(entity_reports)
     if resolved_block:
