@@ -93,6 +93,7 @@ ALLOWED_INTENTS = {
     "prediction",
 }
 ALLOWED_CLUSTER_MODES = {"none", "story", "workflow", "market", "debate"}
+
 QUICK_SOURCE_PRIORITY = {
     "factual": ["hackernews", "reddit", "x", "xquik", "youtube"],
     "product": ["jobs", "youtube", "reddit", "x", "xquik", "tiktok"],
@@ -156,6 +157,55 @@ SOURCE_CAPABILITIES = {
     "jobs": {"jobs", "company_signal", "link"},
     "corpus": {"reference", "analysis"},
 }
+
+
+def validate_external_plan(raw: dict) -> None:
+    """Validate explicit-plan structure before permissive sanitization.
+
+    Enum-like metadata stays permissive because direct pipeline callers rely on
+    the sanitizer to canonicalize those values.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("top-level plan must be an object")
+    for field in ("intent", "freshness_mode", "cluster_mode", "subqueries"):
+        if field not in raw:
+            raise ValueError(f"missing required field '{field}'")
+    for field in ("intent", "freshness_mode", "cluster_mode"):
+        if not isinstance(raw[field], str) or not raw[field].strip():
+            raise ValueError(f"field '{field}' must be a non-empty string")
+
+    source_weights = raw.get("source_weights")
+    if source_weights is not None and not isinstance(source_weights, dict):
+        raise ValueError("field 'source_weights' must be an object when provided")
+    for source, weight in (source_weights or {}).items():
+        if (
+            not isinstance(source, str)
+            or not source.strip()
+            or isinstance(weight, bool)
+            or not isinstance(weight, (int, float))
+        ):
+            raise ValueError("field 'source_weights' must map source names to numbers")
+    subqueries = raw["subqueries"]
+    if not isinstance(subqueries, list) or not subqueries:
+        raise ValueError("field 'subqueries' must be a non-empty array")
+    for index, subquery in enumerate(subqueries):
+        if not isinstance(subquery, dict):
+            raise ValueError(f"subqueries[{index}] must be an object")
+        for field in ("search_query", "ranking_query"):
+            if not isinstance(subquery.get(field), str) or not subquery[field].strip():
+                raise ValueError(f"subqueries[{index}].{field} must be a non-empty string")
+        sources = subquery.get("sources")
+        if not isinstance(sources, list) or not sources or not all(
+            isinstance(source, str) and source.strip() for source in sources
+        ):
+            raise ValueError(f"subqueries[{index}].sources must be a non-empty string array")
+        weight = subquery.get("weight")
+        if weight is not None and (
+            isinstance(weight, bool) or not isinstance(weight, (int, float))
+        ):
+            raise ValueError(f"subqueries[{index}].weight must be a number when provided")
+
+
 DEFAULT_INTENT_CAPABILITIES = {
     "comparison": {"discussion", "video", "web", "reference", "social", "link", "market"},
     "how_to": {"discussion", "video", "web", "reference", "link"},

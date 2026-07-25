@@ -54,6 +54,16 @@ class PipelineV3Tests(unittest.TestCase):
         self.assertIn("grounding", report.items_by_source)
         self.assertEqual("gemini", report.provider_runtime.reasoning_provider)
 
+    def test_empty_explicit_plan_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "intent"):
+            pipeline.run(
+                topic="test topic",
+                config={"LAST30DAYS_REASONING_PROVIDER": "gemini"},
+                depth="quick",
+                external_plan={},
+                mock=True,
+            )
+
     def test_planner_trace_always_fires_on_mock_run(self):
         """Unit 5: The unified planner trace emits one summary line plus one
         line per subquery on every run, regardless of --debug. 2026-04-19

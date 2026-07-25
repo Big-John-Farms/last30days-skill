@@ -91,6 +91,27 @@ class CliV3Tests(unittest.TestCase):
         self.assertEqual(2, result.returncode, result.stderr)
         self.assertIn("Invalid --plan JSON", result.stderr)
 
+    def test_invalid_plan_structure_exits_nonzero_without_fallback(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "skills/last30days/scripts/last30days.py",
+                "test topic",
+                "--mock",
+                "--emit=json",
+                "--plan",
+                json.dumps({"queries": {"web": ["Berlin"]}}),
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertIn("Invalid --plan schema", result.stderr)
+        self.assertNotIn("fallback-plan", result.stderr)
+
     def test_parse_search_flag_normalizes_aliases_and_dedupes(self):
         self.assertEqual(
             ["grounding", "reddit", "hackernews"],

@@ -1970,9 +1970,10 @@ def run(
     if hiring_signals_mode and not planner_requested_sources:
         planner_requested_sources = ["jobs"]
 
-    if external_plan:
+    if external_plan is not None:
         # External plan provided (e.g., from Claude Code via --plan flag).
-        # Parse it through the same sanitizer to validate structure.
+        # Explicit input is a contract: validate it before permissive sanitization.
+        planner.validate_external_plan(external_plan)
         plan = planner._sanitize_plan(
             external_plan, topic, available, planner_requested_sources, depth,
         )

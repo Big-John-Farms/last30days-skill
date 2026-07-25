@@ -3202,6 +3202,12 @@ def _main(
                 # and burning a paid run the user did not ask for. Mirrors the
                 # --plan file-read branch above and parse_competitors_plan.
                 raise SystemExit(2)
+            from lib import planner as _plan_validator
+            try:
+                _plan_validator.validate_external_plan(external_plan)
+            except ValueError as exc:
+                sys.stderr.write(f"[Planner] Invalid --plan schema: {exc}.\n")
+                raise SystemExit(2)
 
         # Auto-resolve: use web search to discover subreddits/handles before planning.
         # This is the engine-side equivalent of SKILL.md Steps 0.55/0.75 for platforms
