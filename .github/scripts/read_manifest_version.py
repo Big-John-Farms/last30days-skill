@@ -28,11 +28,13 @@ def version_from(path: str, text: str) -> str:
             text,
         )
         return match.group(1) if match else ""
-    if path.endswith("marketplace.json"):
+    try:
         data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid JSON in {path}: {exc}") from exc
+    if path.endswith("marketplace.json"):
         plugins = data.get("plugins") or []
         return plugins[0].get("version", "") if plugins else ""
-    data = json.loads(text)
     return data.get("version", "") or ""
 
 

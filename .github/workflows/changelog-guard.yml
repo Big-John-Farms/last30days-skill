@@ -82,9 +82,10 @@ jobs:
           version_at() {
             local ref="$1"
             local path="$2"
-            git show "${ref}:${path}" 2>/dev/null \
-              | python3 .github/scripts/read_manifest_version.py "${path}" \
-              || true
+            # Fail closed: do not swallow helper/parse errors with || true.
+            # Callers only invoke this after git cat-file confirms the blob.
+            git show "${ref}:${path}" \
+              | python3 .github/scripts/read_manifest_version.py "${path}"
           }
 
           VERSION_PATHS=(
