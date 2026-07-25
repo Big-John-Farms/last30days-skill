@@ -12,6 +12,39 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _assert_run_blocks_indented(text: str, *, label: str) -> None:
+    """Fail if a ``run: |`` block contains under-indented (esp. column-0) lines.
+
+    A prior bug treated indent <= run_indent as "end of block" and skipped the
+    assertion, so column-0 Python inside the scalar never failed the test.
+    """
+    in_run = False
+    run_indent = 0
+    for lineno, line in enumerate(text.splitlines(), 1):
+        match = re.match(r"^(\s*)run:\s*\|\s*$", line)
+        if match:
+            in_run = True
+            run_indent = len(match.group(1))
+            continue
+        if not in_run or not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent > run_indent:
+            continue
+        # Valid block end: a YAML key or list item at/above the run: indent.
+        # Column-0 (or any non-key dedent) is the Actions parse failure.
+        looks_like_yaml = bool(
+            re.match(r"^\s*(- )?[A-Za-z_][\w-]*\s*:", line)
+            or re.match(r"^\s*-\s+\S", line)
+        )
+        if indent == 0 or not looks_like_yaml:
+            raise AssertionError(
+                f"{label}:{lineno} under-indented inside run: | "
+                f"(indent={indent}, run_indent={run_indent}): {line!r}"
+            )
+        in_run = False
+
+
 def _load_prepare_release():
     path = ROOT / ".github" / "scripts" / "prepare_release.py"
     spec = importlib.util.spec_from_file_location("prepare_release", path)
@@ -56,6 +89,66 @@ class TestChangelogWorkflow(unittest.TestCase):
             "changelog-guard.yml",
         ):
             self.assertTrue((workflows / name).is_file(), msg=name)
+
+    def test_changelog_guard_run_blocks_stay_indented(self) -> None:
+        """Column-0 lines inside ``run: |`` break Actions YAML parsing."""
+        path = ROOT / ".github" / "workflows" / "changelog-guard.yml"
+        _assert_run_blocks_indented(
+            path.read_text(encoding="utf-8"),
+            label=str(path),
+        )
+
+    def test_run_block_indent_checker_rejects_column_zero(self) -> None:
+        malformed = (
+            "jobs:\n"
+            "  guard:\n"
+            "    steps:\n"
+            "      - name: Enforce\n"
+            "        run: |\n"
+            "          set -euo pipefail\n"
+            "import json\n"
+        )
+        with self.assertRaises(AssertionError):
+            _assert_run_blocks_indented(malformed, label="synthetic")
+
+    def test_read_manifest_version_helper(self) -> None:
+        script = ROOT / ".github" / "scripts" / "read_manifest_version.py"
+        self.assertTrue(script.is_file())
+        spec = importlib.util.spec_from_file_location("read_manifest_version", script)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(
+            mod.version_from("pyproject.toml", 'version = "3.18.1"\n'),
+            "3.18.1",
+        )
+        self.assertEqual(
+            mod.version_from("skills/last30days/SKILL.md", 'version: "3.18.1"\n'),
+            "3.18.1",
+        )
+        self.assertEqual(
+            mod.version_from(
+                "uv.lock",
+                '[[package]]\nname = "last30days-skill"\nversion = "3.18.1"\n',
+            ),
+            "3.18.1",
+        )
+        self.assertEqual(
+            mod.version_from(
+                ".claude-plugin/plugin.json",
+                json.dumps({"version": "3.18.1"}),
+            ),
+            "3.18.1",
+        )
+        self.assertEqual(
+            mod.version_from(
+                ".claude-plugin/marketplace.json",
+                json.dumps({"plugins": [{"version": "3.18.1"}]}),
+            ),
+            "3.18.1",
+        )
+        with self.assertRaises(SystemExit):
+            mod.version_from(".claude-plugin/plugin.json", "{not-json")
 
     def test_pr_template_has_agent_and_relationship_sections(self) -> None:
         text = (ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(

@@ -76,33 +76,16 @@ jobs:
             exit 1
           fi
 
+          # Keep version parsing in .github/scripts/ — a prior inline
+          # python3 -c block used column-0 source and made Actions refuse
+          # to parse this workflow (every run failed with empty jobs).
           version_at() {
             local ref="$1"
             local path="$2"
-            git show "${ref}:${path}" 2>/dev/null | PATH_ARG="${path}" python3 -c '
-import json, os, re, sys
-path = os.environ["PATH_ARG"]
-text = sys.stdin.read()
-if path.endswith("pyproject.toml"):
-    m = re.search(r"(?m)^version\s*=\s*\"([^\"]+)\"\s*$", text)
-    print(m.group(1) if m else "")
-elif path.endswith("SKILL.md"):
-    m = re.search(r"(?m)^version:\s*\"([^\"]+)\"\s*$", text)
-    print(m.group(1) if m else "")
-elif path.endswith("uv.lock"):
-    m = re.search(
-        r"(?ms)^\[\[package\]\]\nname = \"last30days-skill\"\nversion = \"([^\"]+)\"",
-        text,
-    )
-    print(m.group(1) if m else "")
-elif path.endswith("marketplace.json"):
-    data = json.loads(text)
-    plugins = data.get("plugins") or []
-    print(plugins[0].get("version", "") if plugins else "")
-else:
-    data = json.loads(text)
-    print(data.get("version", ""))
-'
+            # Fail closed: do not swallow helper/parse errors with || true.
+            # Callers only invoke this after git cat-file confirms the blob.
+            git show "${ref}:${path}" \
+              | python3 .github/scripts/read_manifest_version.py "${path}"
           }
 
           VERSION_PATHS=(
