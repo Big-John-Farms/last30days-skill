@@ -186,6 +186,26 @@ class CliV3Tests(unittest.TestCase):
         self.assertEqual(["biosecurity", "ai", "agents"], args.topic)
         self.assertEqual([], extra)
 
+    def test_build_parser_accepts_web_backend_keyless(self):
+        """Regression for #905: CONFIGURATION.md documents --web-backend=keyless
+        to force the zero-key floor, but the choices list rejected it."""
+        parser = cli.build_parser()
+        args, extra = parser.parse_known_args(["--web-backend", "keyless", "biosecurity"])
+        self.assertEqual("keyless", args.web_backend)
+        self.assertEqual([], extra)
+
+    def test_build_parser_still_accepts_other_web_backend_values(self):
+        parser = cli.build_parser()
+        for value in ("auto", "brave", "exa", "serper", "parallel", "none"):
+            args, extra = parser.parse_known_args(["--web-backend", value, "biosecurity"])
+            self.assertEqual(value, args.web_backend)
+            self.assertEqual([], extra)
+
+    def test_build_parser_rejects_invalid_web_backend(self):
+        parser = cli.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_known_args(["--web-backend", "bogus", "biosecurity"])
+
     def test_build_parser_accepts_explicit_output_file(self):
         parser = cli.build_parser()
         args, extra = parser.parse_known_args(

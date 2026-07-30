@@ -1641,6 +1641,75 @@ def render_comparison_multi_context(
     return "\n".join(lines).strip() + "\n"
 
 
+_SAFE_MARKDOWN_LINK_SCHEMES = ("http", "https")
+_MARKDOWN_LINK_UNSAFE_CHARS = ("(", ")", "[", "]", "\\", "<", ">", "`")
+_MARKDOWN_PLAIN_TEXT_ESCAPES = re.compile(r"([\\`*_{}\[\]()#+\-.!|~:])")
+
+
+def _sanitize_url_for_single_line_output(url: str) -> str:
+    """Collapse embedded newlines/carriage-returns out of an untrusted URL.
+
+    A URL is not supposed to contain raw line breaks; a source-controlled
+    value that does could otherwise inject fabricated report structure
+    (fake headings, list items) into the saved single-line output --
+    whether or not it ends up wrapped in markdown link syntax. Applied
+    before either the link-safety check or the plain-text fallback below,
+    so this closes the injection at the root rather than only for links.
+    """
+    return "".join(
+        " "
+        if ch.isspace() or ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F
+        else ch
+        for ch in url
+    )
+
+
+def _escape_markdown_plain_text(value: str) -> str:
+    """Make untrusted text inert in Markdown without hiding its contents."""
+    value = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _MARKDOWN_PLAIN_TEXT_ESCAPES.sub(r"\\\1", value)
+
+
+def _markdown_url_link(url: str) -> str:
+    """Render ``url`` as a markdown link when it's safe to, else escaped text.
+
+    Source URLs are untrusted API responses, not authored content: `(`/`)`/
+    `[`/`]` would corrupt markdown link syntax, a backslash can escape
+    adjacent markdown delimiters, and an unrestricted scheme (e.g.
+    ``javascript:``) would become an active link with none of the safety
+    filtering ``html_render.py`` already applies via
+    ``html.escape(url, quote=True)``. Falls back to escaped plain text so
+    rejected input cannot remain active Markdown or raw HTML.
+    """
+    if not url:
+        return ""
+    sanitized_url = _sanitize_url_for_single_line_output(url)
+    if not sanitized_url.strip():
+        return ""
+
+    has_whitespace_or_control = any(
+        ch.isspace() or ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F
+        for ch in url
+    )
+    safe_destination = False
+    if not has_whitespace_or_control and not any(
+        ch in sanitized_url for ch in _MARKDOWN_LINK_UNSAFE_CHARS
+    ):
+        try:
+            parsed = urlparse(sanitized_url)
+            _ = parsed.port
+            safe_destination = (
+                parsed.scheme.lower() in _SAFE_MARKDOWN_LINK_SCHEMES
+                and bool(parsed.netloc and parsed.hostname)
+            )
+        except ValueError:
+            safe_destination = False
+
+    if safe_destination:
+        return f"[{sanitized_url}]({sanitized_url})"
+    return _escape_markdown_plain_text(sanitized_url)
+
+
 def render_full(report: schema.Report) -> str:
     """Full data dump: ALL clusters + ALL items by source. For saved files and debugging."""
     evidence_report = schema.without_sources(report, {"corpus"})
@@ -1735,7 +1804,9 @@ def render_full(report: schema.Report) -> str:
             )
             lines.append(f"  {item.title}")
             if item.url:
-                lines.append(f"  {item.url}")
+                rendered_url = _markdown_url_link(item.url)
+                if rendered_url:
+                    lines.append(f"  {rendered_url}")
             if item.container:
                 lines.append(f"  *{item.container}*")
             if item.snippet:
@@ -2208,8 +2279,11 @@ def _render_candidate(
         f"{prefix} [{schema.candidate_source_label(candidate)}] {candidate.title}"
         + (_candidate_freshness_flag(report, candidate.candidate_id) if report else ""),
         f"   - {details}",
-        f"   - URL: {candidate.url}",
     ]
+    if candidate.url:
+        rendered_url = _markdown_url_link(candidate.url)
+        if rendered_url:
+            lines.append(f"   - URL: {rendered_url}")
     corroboration = _format_corroboration(candidate)
     if corroboration:
         lines.append(f"   - {corroboration}")
