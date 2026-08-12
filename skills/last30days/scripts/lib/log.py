@@ -3,10 +3,12 @@
 import os
 import sys
 
+from . import env
+
 
 def is_debug() -> bool:
     val = os.environ.get("LAST30DAYS_DEBUG", "")
-    return val.lower() in ("1", "true", "yes", "on")
+    return val.lower() in env._DEBUG_TRUE_VALUES
 
 
 def debug(msg: str) -> None:

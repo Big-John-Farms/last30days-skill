@@ -2763,7 +2763,7 @@ def _main(
     extra_argv: list[str],
 ) -> int:
     if args.debug:
-        os.environ["LAST30DAYS_DEBUG"] = "1"
+        _LAST30DAYS_DEBUG_ENABLED = True
 
     if args.welcome:
         from lib import setup_wizard

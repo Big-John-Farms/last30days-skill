@@ -200,7 +200,7 @@ KEY_PRESENCE_VARS = (
     "GEMINI_API_KEY",
     "OPENROUTER_API_KEY",
     "PERPLEXITY_API_KEY",
-    "GITHUB_TOKEN",
+    env.GITHUB_TOKEN_KEY,
     "TRUTHSOCIAL_TOKEN",
     "BSKY_APP_PASSWORD",
 )
@@ -486,7 +486,7 @@ def _polymarket_record(config):
 
 
 def _github_record(config):
-    authed = bool(config.get("GITHUB_TOKEN") or env.read_secret_env("GITHUB_TOKEN") or shutil.which("gh"))
+    authed = bool(config.get(env.GITHUB_TOKEN_KEY) or env.read_secret_env(env.GITHUB_TOKEN_KEY) or shutil.which("gh"))
     detail = (
         "authenticated tier (GITHUB_TOKEN or gh CLI)"
         if authed

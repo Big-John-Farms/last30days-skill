@@ -50,7 +50,7 @@ def _resolve_token(token: Optional[str] = None) -> Optional[str]:
     """Resolve GitHub auth token from argument, env, or gh CLI."""
     if token:
         return token
-    env_token = env.read_secret_env("GITHUB_TOKEN")
+    env_token = env.read_secret_env(env.GITHUB_TOKEN_KEY)
     if env_token:
         return env_token
     # Fallback: try gh CLI

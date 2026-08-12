@@ -1767,7 +1767,7 @@ def diagnose(
         "native_web_backend": native_web_backend,
         "native_search": env.is_native_search(config),
         "has_scrapecreators": bool(config.get("SCRAPECREATORS_API_KEY")),
-        "has_github": bool(config.get("GITHUB_TOKEN") or which("gh")),
+        "has_github": bool(config.get(env.GITHUB_TOKEN_KEY) or which("gh")),
         # safe=True (doctor/--diagnose/--preflight) must stay network-free:
         # answer X availability from local evidence only. x_pending is
         # precomputed by diagnose() to avoid double evaluation.
@@ -2089,7 +2089,7 @@ def run(
         try:
             project_items = github.search_github_project(
                 github_repos, from_date, to_date,
-                depth=depth, token=config.get("GITHUB_TOKEN"),
+                depth=depth, token=config.get(env.GITHUB_TOKEN_KEY),
             )
             if project_items:
                 normalized = _normalize_score_dedupe(
@@ -2113,7 +2113,7 @@ def run(
         try:
             person_items = github.search_github_person(
                 github_user, from_date, to_date,
-                depth=depth, token=config.get("GITHUB_TOKEN"),
+                depth=depth, token=config.get(env.GITHUB_TOKEN_KEY),
             )
             if person_items:
                 normalized = _normalize_score_dedupe(
@@ -2474,7 +2474,7 @@ def run(
             collected_star_map: dict[str, int] = {}
             github.enrich_candidates_with_stars(
                 ranked_candidates,
-                token=config.get("GITHUB_TOKEN"),
+                token=config.get(env.GITHUB_TOKEN_KEY),
                 already_enriched=_github_enriched_repos,
                 collect_map=collected_star_map,
             )
@@ -3940,7 +3940,7 @@ def _retrieve_stream_impl(
         # Resolve once at the pipeline boundary so search and enrich
         # share the result; otherwise each call would re-run the env
         # lookup and gh-CLI subprocess fallback (up to 5s timeout each).
-        token = github.resolve_token(config.get("GITHUB_TOKEN"))
+        token = github.resolve_token(config.get(env.GITHUB_TOKEN_KEY))
         response = github.search_github(subquery.search_query, from_date, to_date, depth=depth, token=token)
         items = github.parse_github_response(response)
         # Note: an unauth rate-limit (response["error"]) is expected on the
