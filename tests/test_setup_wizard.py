@@ -833,3 +833,89 @@ class TestSetupSubcommand:
         args = parser.parse_args(["AI", "video", "tools"])
         topic = " ".join(args.topic) if args.topic else None
         assert topic.strip().lower() != "setup"
+
+
+class TestBrightDataStatusHonesty:
+    """U5/R11: setup must never claim active unless the engine gate passes."""
+
+    def _patched(self, *, installed, credentialed, off_path=None):
+        available = installed and credentialed
+        return (
+            patch.object(setup_wizard.brightdata, "is_installed", return_value=installed),
+            patch.object(setup_wizard.brightdata, "has_credentials", return_value=credentialed),
+            patch.object(setup_wizard.brightdata, "is_available", return_value=available),
+            patch.object(setup_wizard, "_brightdata_off_path_binary", return_value=off_path),
+        )
+
+    def test_on_path_and_credentialed_reports_engine_active(self):
+        a, b, c, d = self._patched(installed=True, credentialed=True)
+        with a, b, c, d:
+            status = setup_wizard.brightdata_status({})
+        assert status["action"] == "already_installed"
+        assert status["authenticated"] is True
+        assert status["engine_active"] is True
+
+    def test_on_path_without_credentials_is_not_active_and_names_login(self):
+        a, b, c, d = self._patched(installed=True, credentialed=False)
+        with a, b, c, d:
+            status = setup_wizard.brightdata_status({})
+        assert status["action"] == "already_installed"
+        assert status["authenticated"] is False
+        assert status["engine_active"] is False
+        assert "brightdata login" in status["hint"]
+
+    def test_off_path_binary_is_reported_with_its_path(self):
+        """The Hermes/OpenClaw failure mode: on disk, invisible to the engine."""
+        a, b, c, d = self._patched(
+            installed=False, credentialed=True, off_path="/Users/x/.npm-global/bin/brightdata"
+        )
+        with a, b, c, d:
+            status = setup_wizard.brightdata_status({})
+        assert status["action"] == "installed_off_path"
+        assert status["engine_active"] is False
+        assert status["path"] == "/Users/x/.npm-global/bin/brightdata"
+        assert "PATH" in status["hint"]
+
+    def test_absent_binary_recommends_but_never_installs(self):
+        a, b, c, d = self._patched(installed=False, credentialed=False)
+        with a, b, c, d, patch.object(setup_wizard.subprocess, "run") as run:
+            status = setup_wizard.brightdata_status({})
+        assert status["action"] == "not_installed"
+        assert status["engine_active"] is False
+        run.assert_not_called()
+
+    def test_brightdata_is_excluded_from_auto_installed_pp_sources(self):
+        slugs = {slug for _, slug, _ in setup_wizard.PP_DEFAULT_SOURCES}
+        assert "brightdata" not in slugs
+
+
+class TestBrightDataSetupSurface:
+    """The three states must be visible somewhere, or the honesty is moot."""
+
+    def _text(self, status):
+        return setup_wizard.get_setup_status_text({
+            "cookies_found": {}, "ytdlp_installed": True,
+            "ytdlp_action": "already_installed", "digg_installed": True,
+            "digg_action": "already_installed", "pp_sources": {},
+            "brightdata": status, "env_written": False,
+        })
+
+    def test_active_state_is_reported(self):
+        text = self._text({"action": "already_installed", "engine_active": True})
+        assert "Bright Data CLI ready" in text
+
+    def test_installed_but_not_logged_in_names_the_fix(self):
+        text = self._text({"action": "already_installed", "engine_active": False})
+        assert "brightdata login" in text
+
+    def test_off_path_reports_the_path_and_the_fix(self):
+        text = self._text({
+            "action": "installed_off_path", "engine_active": False,
+            "path": "/Users/x/.npm-global/bin/brightdata",
+        })
+        assert "/Users/x/.npm-global/bin/brightdata" in text
+        assert "PATH" in text
+
+    def test_absent_offers_the_install_command_without_running_it(self):
+        text = self._text({"action": "not_installed", "engine_active": False})
+        assert "npm i -g @brightdata/cli" in text
