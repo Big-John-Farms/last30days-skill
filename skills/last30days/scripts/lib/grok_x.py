@@ -26,6 +26,7 @@ snowflake timestamp before it is allowed into the item flow — see
 fabricated post carries a plausible handle and a numeric id by construction.
 """
 
+import json
 import os
 import re
 import shutil
@@ -102,9 +103,24 @@ _AUTH_STORE = Path.home() / ".grok" / "auth.json"
 # shape is the vendor's to change. Mirrors xurl_x's marker scan.
 _TOKEN_STORE_MARKERS = ("refresh_token", "access_token", "auth_mode", '"key"')
 
-AUTH_OK = "ok"            # token store present with stored credentials
+AUTH_OK = "ok"            # token store present with non-expired credentials
+AUTH_EXPIRED = "expired"  # credentials present but access_token expires_at is past
 AUTH_MISSING = "missing"  # no token store, or no credentials stored in it
 AUTH_ERROR = "error"      # token store exists but could not be read
+
+# Markers that indicate the Grok session was revoked mid-run (refresh failed).
+# When these appear in grok CLI stderr/stdout, the run should fall back once
+# and not retry grok in that run. Distinct from "never signed in" since a prior
+# run may have succeeded with the same auth.json.
+_AUTH_REVOKED_MARKERS = (
+    "not signed in",
+    "not logged in",
+    "invalid_grant",
+    "refresh token has been revoked",
+    "session expired",
+    "authentication failed",
+    "unauthorized",
+)
 
 _availability_cache: Optional[bool] = None
 
@@ -129,30 +145,97 @@ def token_store_path() -> Path:
     return _AUTH_STORE
 
 
-def stored_auth_status() -> Tuple[str, str]:
+def _find_expires_at(obj: Any) -> Optional[str]:
+    """Recursively find expires_at in a nested dict/list structure.
+
+    The Grok auth.json is keyed by issuer and principal; this finds expires_at
+    anywhere in the tree without assuming the structure.
+    """
+    if isinstance(obj, dict):
+        if "expires_at" in obj:
+            return obj["expires_at"]
+        for v in obj.values():
+            found = _find_expires_at(v)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_expires_at(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _parse_expires_at(raw: str) -> Optional[datetime]:
+    """Parse an ISO 8601 expires_at timestamp."""
+    if not raw:
+        return None
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except (TypeError, ValueError):
+        return None
+
+
+def stored_auth_status() -> Tuple[str, str, Optional[datetime]]:
     """Local-only auth check: filesystem read, no subprocess, no network.
 
     This is the doctor / --diagnose / --preflight surface. It must never spawn
     a process: the whole-doctor-path test patches ``subprocess.run`` to raise,
     and shelling out to `grok` here would fail it.
+
+    Returns (status, detail, expires_at). The expires_at datetime is None when
+    not parseable or not present. Status is:
+    - AUTH_OK: credentials present and not expired (or no expires_at to check)
+    - AUTH_EXPIRED: credentials present but expires_at is in the past
+    - AUTH_MISSING: no token store or no credential markers
+    - AUTH_ERROR: token store exists but could not be read
     """
     path = token_store_path()
     try:
         if not path.exists():
-            return AUTH_MISSING, f"no Grok credential store at {path}"
+            return AUTH_MISSING, f"no Grok credential store at {path}", None
         raw = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        return AUTH_ERROR, f"{type(exc).__name__}: {exc}"
-    if any(marker in raw for marker in _TOKEN_STORE_MARKERS):
-        # Deliberately reports the path only. Never echo store contents: the
-        # file holds an access key and refresh token, and doctor output is
-        # routinely pasted into issue reports.
-        return AUTH_OK, f"stored Grok credentials found in {path}"
-    return AUTH_MISSING, f"Grok credential store at {path} has no stored credentials"
+        return AUTH_ERROR, f"{type(exc).__name__}: {exc}", None
+
+    if not any(marker in raw for marker in _TOKEN_STORE_MARKERS):
+        return AUTH_MISSING, f"Grok credential store at {path} has no stored credentials", None
+
+    expires_at: Optional[datetime] = None
+    try:
+        data = json.loads(raw)
+        expires_str = _find_expires_at(data)
+        expires_at = _parse_expires_at(expires_str) if expires_str else None
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    if expires_at is not None:
+        now = datetime.now(timezone.utc)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < now:
+            return (
+                AUTH_EXPIRED,
+                f"Grok session expired at {expires_at.isoformat()} "
+                f"(refresh may restore it; if revoked, run `grok login --device-auth`)",
+                expires_at,
+            )
+
+    return AUTH_OK, f"stored Grok credentials found in {path}", expires_at
 
 
 def has_stored_auth() -> bool:
-    return binary_path() is not None and stored_auth_status()[0] == AUTH_OK
+    """True when grok binary is on PATH and credentials are stored.
+
+    NOTE: This returns True even when AUTH_EXPIRED, because the refresh_token
+    might still work. The caller (is_available) decides whether to attempt
+    grok anyway. Doctor uses the status directly to show the degraded state.
+    """
+    if binary_path() is None:
+        return False
+    status = stored_auth_status()[0]
+    return status in (AUTH_OK, AUTH_EXPIRED)
 
 
 def is_available() -> bool:
@@ -164,9 +247,18 @@ def is_available() -> bool:
 
 
 def _is_available_uncached() -> bool:
+    """Research-time availability check.
+
+    Returns True when grok is on PATH and credentials exist, even if
+    AUTH_EXPIRED. Rationale: expires_at being in the past does not prove the
+    refresh_token is dead. The CLI will attempt OIDC refresh at run time and
+    might succeed. Only a runtime failure ("Not signed in", invalid_grant)
+    proves the session is truly revoked.
+    """
     if binary_path() is None:
         return False
-    return stored_auth_status()[0] == AUTH_OK
+    status = stored_auth_status()[0]
+    return status in (AUTH_OK, AUTH_EXPIRED)
 
 
 def _subprocess_env(home: str) -> Dict[str, str]:
@@ -516,14 +608,46 @@ could not run, say so plainly and report no post blocks. Do not supply posts
 from your own knowledge."""
 
 
+def is_auth_revoked_error(error: str) -> bool:
+    """True when the error indicates the Grok session was revoked mid-run.
+
+    Distinct from "never signed in": the user may have had a working session
+    that expired or was revoked (e.g., OIDC refresh returned invalid_grant).
+    """
+    if not error:
+        return False
+    text = error.lower()
+    return any(marker in text for marker in _AUTH_REVOKED_MARKERS)
+
+
+def classify_run_failure(detail: str) -> str:
+    """Classify a grok run failure into a health state.
+
+    Used by the pipeline to report typed outcomes (AUTH_FAILED vs generic
+    ERROR) so doctor and the host can surface the right fix.
+    """
+    from . import health
+
+    if not detail:
+        return health.ERROR
+    text = detail.lower()
+    if any(marker in text for marker in _AUTH_REVOKED_MARKERS):
+        return health.AUTH_FAILED
+    if "timed out" in text or "timeout" in text:
+        return health.TIMEOUT
+    return health.ERROR
+
+
 def _invoke(prompt: str, timeout: int) -> Dict[str, Any]:
-    """Run `grok` once. Never raises; every failure returns {'error': str}."""
+    """Run `grok` once. Never raises; every failure returns {'error': str}.
+
+    When the error indicates auth revocation (refresh token rejected, not
+    signed in, etc.), the response also carries 'auth_revoked': True so
+    callers can fall back without retrying grok.
+    """
     binary = binary_path()
     if binary is None:
         return {"error": "grok CLI not found on PATH"}
-    # Isolated working directory: the child has tool permissions bypassed and
-    # its context carries untrusted post text, so give it an empty directory
-    # rather than the user's repository to act in.
     try:
         with tempfile.TemporaryDirectory(prefix="last30days-grok-") as workdir:
             child_home = _stage_child_home(workdir)
@@ -546,7 +670,11 @@ def _invoke(prompt: str, timeout: int) -> Dict[str, Any]:
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()[:300]
-        return {"error": f"grok CLI exited {result.returncode}: {detail}"}
+        error_msg = f"grok CLI exited {result.returncode}: {detail}"
+        response: Dict[str, Any] = {"error": error_msg}
+        if is_auth_revoked_error(detail):
+            response["auth_revoked"] = True
+        return response
     return {"text": result.stdout or ""}
 
 
@@ -561,13 +689,16 @@ def _run_query(
     attempts: int = 2,
     relevance_topic: str = "",
     deadline: Optional[float] = None,
-) -> Tuple[List[Dict[str, Any]], str]:
+) -> Tuple[List[Dict[str, Any]], str, bool]:
     """Run one query, retrying only when the response looks fabricated.
 
     A clean empty result is NOT retried: an empty window is a common, correct
     outcome (especially for the mention lane on a low-profile handle and for
     the name lane's engagement floor), and re-issuing a byte-identical prompt
     doubles latency and Grok-plan spend to get the same answer.
+
+    Returns (items, error, auth_revoked). When auth_revoked is True, the caller
+    should not retry grok in this run.
     """
     timeout = _TIMEOUT_SECONDS.get(depth, _TIMEOUT_SECONDS["default"])
     prompt = _PROMPT.format(tool=tool, query=query, limit=min(limit, _MAX_LIMIT_PER_CALL))
@@ -575,17 +706,15 @@ def _run_query(
     for attempt in range(1, attempts + 1):
         if deadline is not None:
             remaining = deadline - time.monotonic()
-            # Never start a call that cannot finish inside the shared budget.
-            # A floor here (max(15, ...)) would let the last call overrun the
-            # documented ceiling by up to that floor, since the lanes run
-            # synchronously with no outer timeout to catch it.
             if remaining < _MIN_USEFUL_CALL_SECONDS:
-                return [], last_error or "X lane budget exhausted"
+                return [], last_error or "X lane budget exhausted", False
             timeout = min(timeout, int(remaining))
         _log(f"searching: {query}" + (f" (attempt {attempt})" if attempt > 1 else ""))
         response = _invoke(prompt, timeout)
         if response.get("error"):
             last_error = response["error"]
+            if response.get("auth_revoked"):
+                return [], last_error, True
             continue
         items = parse_x_response(
             response,
@@ -594,13 +723,12 @@ def _run_query(
             to_date=to_date,
         )
         if items:
-            return items, ""
+            return items, "", False
         reason = _LAST_REJECTION.get("reason", "")
         if not any(marker in reason for marker in _RETRYABLE_REJECTIONS):
-            # Clean empty result: the search ran and found nothing.
-            return [], ""
+            return [], "", False
         last_error = reason or "no verified in-window posts returned"
-    return [], last_error
+    return [], last_error, False
 
 
 def search_x(
@@ -620,6 +748,10 @@ def search_x(
     failure. A completed run that found nothing returns an empty list with no
     error, matching bird and xquik -- reporting "no results" as a hard failure
     would make an empty window look like a broken backend.
+
+    When the Grok session is revoked mid-run (refresh token rejected),
+    'auth_revoked': True is set so the pipeline can fall back without retrying
+    grok and can surface the correct fix to the user.
     """
     target = DEPTH_CONFIG.get(depth, DEPTH_CONFIG["default"])
     calls = max(1, min(_MAX_FANOUT_CALLS, -(-target // _MAX_LIMIT_PER_CALL)))
@@ -627,12 +759,16 @@ def search_x(
     seen: set = set()
     last_error = ""
     invocation_failed = False
+    auth_revoked = False
     for mode_query in _fanout_queries(topic, from_date, to_date, calls):
-        items, error = _run_query(mode_query, from_date, to_date, depth=depth,
-                                  relevance_topic=topic)
+        items, error, revoked = _run_query(mode_query, from_date, to_date, depth=depth,
+                                           relevance_topic=topic)
+        if revoked:
+            auth_revoked = True
+            last_error = error or "Grok session expired or was revoked"
+            break
         if error and not items:
             last_error = error
-            # Distinguish "the CLI failed" from "the search found nothing".
             if "not found" in error or "timed out" in error or "exited" in error:
                 invocation_failed = True
         for item in items:
@@ -645,7 +781,12 @@ def search_x(
     for index, item in enumerate(collected, start=1):
         item["id"] = f"GK{index}"
     if collected:
-        return {"items": collected[:target]}
+        result: Dict[str, Any] = {"items": collected[:target]}
+        if auth_revoked:
+            result["auth_revoked"] = True
+        return result
+    if auth_revoked:
+        return {"items": [], "error": last_error, "auth_revoked": True}
     if invocation_failed:
         return {"items": [], "error": last_error}
     return {"items": []}
@@ -659,13 +800,16 @@ def search_handles(
     *,
     count_per: int = 8,
     deadline: Optional[float] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], bool]:
     """BY lane: posts authored by each handle.
 
     ``topic`` is used for relevance ranking only and is never ANDed into the
     query -- doing so was a prior defect that emptied the lane.
+
+    Returns (items, auth_revoked) so the pipeline can record AUTH_FAILED.
     """
     collected: List[Dict[str, Any]] = []
+    auth_revoked = False
     for handle in handles:
         if deadline is not None and time.monotonic() >= deadline:
             _log("lane budget exhausted; skipping remaining handles")
@@ -673,18 +817,20 @@ def search_handles(
         clean = _clean_handle(handle)
         if not clean:
             continue
-        items, _ = _run_query(
+        items, _, revoked = _run_query(
             f"from:{clean} since:{from_date} until:{to_date}",
             from_date, to_date, limit=count_per, relevance_topic=topic,
             attempts=1, deadline=deadline,
         )
-        # Enforce the author constraint client-side: operator fidelity is not
-        # guaranteed. A measured `from:` query returned a different account.
+        if revoked:
+            _log("Grok session revoked; stopping lane")
+            auth_revoked = True
+            break
         collected.extend(
             i for i in items
             if i["author_handle"].lower() == clean.lower()
         )
-    return collected
+    return collected, auth_revoked
 
 
 def search_mentions(
@@ -695,9 +841,13 @@ def search_mentions(
     topic: str = "",
     count_per: int = 5,
     deadline: Optional[float] = None,
-) -> List[Dict[str, Any]]:
-    """ABOUT lane (mention form): posts @-mentioning each handle."""
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """ABOUT lane (mention form): posts @-mentioning each handle.
+
+    Returns (items, auth_revoked) so the pipeline can record AUTH_FAILED.
+    """
     collected: List[Dict[str, Any]] = []
+    auth_revoked = False
     for handle in handles:
         if deadline is not None and time.monotonic() >= deadline:
             _log("lane budget exhausted; skipping remaining handles")
@@ -705,18 +855,20 @@ def search_mentions(
         clean = _clean_handle(handle)
         if not clean:
             continue
-        items, _ = _run_query(
+        items, _, revoked = _run_query(
             f"@{clean} -from:{clean} since:{from_date} until:{to_date}",
             from_date, to_date, limit=count_per, relevance_topic=topic,
             attempts=1, deadline=deadline,
         )
-        # Enforce the exclusion client-side too: a measured run carrying
-        # `-from:X` still returned a post authored by X.
+        if revoked:
+            _log("Grok session revoked; stopping lane")
+            auth_revoked = True
+            break
         collected.extend(
             i for i in items
             if i["author_handle"].lower() != clean.lower()
         )
-    return collected
+    return collected, auth_revoked
 
 
 def search_name(
@@ -728,7 +880,7 @@ def search_name(
     count_per: int = 8,
     min_faves: int = 2,
     deadline: Optional[float] = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], bool]:
     """ABOUT lane (name form): posts naming the subject in plain text.
 
     Not redundant with the mention lane and not a fallback for it. Most talk
@@ -736,12 +888,12 @@ def search_name(
     lunch box from Costco", not "@Bentgo lunch box from Costco". A modest
     engagement floor applies here only, because a bare name query is the
     widest and noisiest of the three lanes.
+
+    Returns (items, auth_revoked) so the pipeline can record AUTH_FAILED.
     """
     name = (name or "").strip()
     if not name:
-        return []
-    # Mirror bird_x.build_topic_query's guard: an unbalanced quote reads as an
-    # unterminated phrase and matches nothing.
+        return [], False
     if name.count('"') % 2:
         name = name.replace('"', " ").strip()
     phrase = f'"{name}"' if " " in name else name
@@ -755,8 +907,10 @@ def search_name(
         [phrase, excludes, f"min_faves:{min_faves}", f"since:{from_date}", f"until:{to_date}"]
         if part
     )
-    items, _ = _run_query(
+    items, _, revoked = _run_query(
         query, from_date, to_date, limit=count_per, attempts=1, deadline=deadline,
     )
+    if revoked:
+        _log("Grok session revoked")
     blocked = {c.lower() for c in (_clean_handle(h) for h in (exclude_handles or [])) if c}
-    return [i for i in items if i["author_handle"].lower() not in blocked]
+    return [i for i in items if i["author_handle"].lower() not in blocked], revoked

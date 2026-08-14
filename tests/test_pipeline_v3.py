@@ -684,6 +684,217 @@ class TestXBackendChainAndFailover(unittest.TestCase):
         self.assertNotIn("xquik", avail)
 
 
+class TestMixedResultRevocation(unittest.TestCase):
+    """Mixed-result revocation: when grok returns items AND an error, preserve both."""
+
+    @patch("lib.env.x_backend_chain", return_value=["grok"])
+    def test_items_with_auth_error_surfaces_error(self, _chain):
+        """Grok returns some items but then auth is revoked → error is surfaced."""
+        sq = schema.SubQuery(label="primary", search_query="q", ranking_query="q?", sources=["x"])
+
+        def fake_fetch(backend, *a, **k):
+            if backend == "grok":
+                # Mixed result: got some items, but also hit auth revocation
+                return (
+                    [{"id": "G1", "url": "https://x.com/a/status/1"}],
+                    "grok: grok session expired or was revoked",
+                )
+            return ([], "")
+
+        with patch("lib.pipeline._fetch_x_backend", side_effect=fake_fetch):
+            items, artifact = pipeline._retrieve_stream(
+                topic="q", subquery=sq, source="x", config={}, depth="default",
+                date_range=("2026-05-19", "2026-06-18"), runtime=_make_runtime(None), mock=False,
+            )
+        self.assertEqual(1, len(items))
+        # The artifact should have _source_outcome with the error info
+        outcome = artifact.get("_source_outcome", {})
+        self.assertIn("grok session expired", outcome.get("detail", "").lower())
+        # State should be AUTH_FAILED since the error contains auth markers
+        self.assertEqual(schema.AUTH_FAILED, outcome.get("state"))
+
+    @patch("lib.env.x_backend_chain", return_value=["grok", "bird"])
+    def test_fallback_after_auth_failed_keeps_auth_failed_state(self, _chain):
+        """Grok auth fails → bird succeeds → state is AUTH_FAILED (not OK).
+
+        The user needs re-login guidance for grok even though fallback served items.
+        """
+        sq = schema.SubQuery(label="primary", search_query="q", ranking_query="q?", sources=["x"])
+
+        def fake_fetch(backend, *a, **k):
+            if backend == "grok":
+                return ([], "grok: grok session expired or was revoked")
+            if backend == "bird":
+                return ([{"id": "B1", "url": "https://x.com/a/status/1"}], "")
+            return ([], "")
+
+        with patch("lib.pipeline._fetch_x_backend", side_effect=fake_fetch):
+            items, artifact = pipeline._retrieve_stream(
+                topic="q", subquery=sq, source="x", config={}, depth="default",
+                date_range=("2026-05-19", "2026-06-18"), runtime=_make_runtime(None), mock=False,
+            )
+        self.assertEqual(1, len(items))
+        outcome = artifact.get("_source_outcome", {})
+        # State should be AUTH_FAILED so user gets re-login guidance
+        self.assertEqual(schema.AUTH_FAILED, outcome.get("state"))
+        self.assertIn("re-login", outcome.get("detail", "").lower())
+
+    @patch("lib.env.x_backend_chain", return_value=["grok", "bird"])
+    def test_fallback_after_non_auth_error_is_ok(self, _chain):
+        """Grok fails with non-auth error → bird succeeds → state is OK."""
+        sq = schema.SubQuery(label="primary", search_query="q", ranking_query="q?", sources=["x"])
+
+        def fake_fetch(backend, *a, **k):
+            if backend == "grok":
+                return ([], "grok: network timeout")
+            if backend == "bird":
+                return ([{"id": "B1", "url": "https://x.com/a/status/1"}], "")
+            return ([], "")
+
+        with patch("lib.pipeline._fetch_x_backend", side_effect=fake_fetch):
+            items, artifact = pipeline._retrieve_stream(
+                topic="q", subquery=sq, source="x", config={}, depth="default",
+                date_range=("2026-05-19", "2026-06-18"), runtime=_make_runtime(None), mock=False,
+            )
+        self.assertEqual(1, len(items))
+        outcome = artifact.get("_source_outcome", {})
+        # Non-auth error followed by fallback success is OK
+        self.assertEqual("ok", outcome.get("state"))
+
+    @patch("lib.env.x_backend_chain", return_value=["bird", "grok"])
+    def test_prior_non_auth_then_current_auth_fail_yields_auth_failed(self, _chain):
+        """Bird non-auth fail → Grok items + revocation → AUTH_FAILED, items kept.
+
+        If an earlier backend fails for a non-auth reason and the current backend
+        returns items plus an auth revocation error, the outcome must be AUTH_FAILED
+        (not OK) so the user gets re-login guidance.
+        """
+        sq = schema.SubQuery(label="primary", search_query="q", ranking_query="q?", sources=["x"])
+
+        def fake_fetch(backend, *a, **k):
+            if backend == "bird":
+                # Bird fails with a non-auth error
+                return ([], "bird: network timeout")
+            if backend == "grok":
+                # Grok returns items but also signals auth revocation
+                return (
+                    [{"id": "G1", "url": "https://x.com/a/status/1"}],
+                    "grok: grok session expired or was revoked",
+                )
+            return ([], "")
+
+        with patch("lib.pipeline._fetch_x_backend", side_effect=fake_fetch):
+            items, artifact = pipeline._retrieve_stream(
+                topic="q", subquery=sq, source="x", config={}, depth="default",
+                date_range=("2026-05-19", "2026-06-18"), runtime=_make_runtime(None), mock=False,
+            )
+        # Items should be preserved
+        self.assertEqual(1, len(items))
+        outcome = artifact.get("_source_outcome", {})
+        # State must be AUTH_FAILED, not OK
+        self.assertEqual(schema.AUTH_FAILED, outcome.get("state"))
+        # Re-login guidance must be present
+        self.assertIn("re-login", outcome.get("detail", "").lower())
+
+    @patch("lib.env.x_backend_chain", return_value=["grok", "bird"])
+    def test_not_logged_in_triggers_auth_failed_fallback(self, _chain):
+        """Grok 'not logged in' → bird fallback → AUTH_FAILED state preserved.
+
+        The 'not logged in' message from Grok is a recognized revocation marker.
+        If Grok fails with this message and bird fallback succeeds, the outcome
+        must be AUTH_FAILED so the user gets re-login guidance.
+        """
+        sq = schema.SubQuery(label="primary", search_query="q", ranking_query="q?", sources=["x"])
+
+        def fake_fetch(backend, *a, **k):
+            if backend == "grok":
+                # Grok fails with 'not logged in' error
+                return ([], "grok: not logged in")
+            if backend == "bird":
+                return ([{"id": "B1", "url": "https://x.com/a/status/1"}], "")
+            return ([], "")
+
+        with patch("lib.pipeline._fetch_x_backend", side_effect=fake_fetch):
+            items, artifact = pipeline._retrieve_stream(
+                topic="q", subquery=sq, source="x", config={}, depth="default",
+                date_range=("2026-05-19", "2026-06-18"), runtime=_make_runtime(None), mock=False,
+            )
+        self.assertEqual(1, len(items))
+        outcome = artifact.get("_source_outcome", {})
+        # State must be AUTH_FAILED because 'not logged in' is an auth marker
+        self.assertEqual(schema.AUTH_FAILED, outcome.get("state"))
+        self.assertIn("re-login", outcome.get("detail", "").lower())
+
+
+class TestRetrievalBundleAuthPreservation(unittest.TestCase):
+    """AUTH_FAILED state must be preserved through add_items.
+
+    When a lane records AUTH_FAILED before items are added, the state
+    must not be downgraded to PARTIAL by subsequent add_items calls.
+    """
+
+    def test_add_items_preserves_auth_failed_state(self):
+        """add_items should preserve AUTH_FAILED state, not downgrade to PARTIAL."""
+        bundle = schema.RetrievalBundle()
+        bundle.mark_attempted("x")
+        # First: record auth failure (no items yet)
+        bundle.record_failure("x", schema.AUTH_FAILED, "grok session expired", attempted=True)
+        # At this point, state should be AUTH_FAILED
+        self.assertEqual(schema.AUTH_FAILED, bundle.source_status["x"].state)
+
+        # Now add items
+        items = [_make_source_item("x", "X1", "https://x.com/a/status/1")]
+        bundle.add_items("primary", "x", items)
+
+        # State must still be AUTH_FAILED, not PARTIAL
+        self.assertEqual(schema.AUTH_FAILED, bundle.source_status["x"].state)
+        # Detail should be preserved
+        self.assertEqual("grok session expired", bundle.source_status["x"].detail)
+        # Items should be recorded
+        self.assertEqual(1, len(bundle.items_by_source["x"]))
+
+    def test_add_items_keeps_partial_for_non_auth_failures(self):
+        """For non-auth failures, add_items should still produce PARTIAL."""
+        bundle = schema.RetrievalBundle()
+        bundle.mark_attempted("x")
+        # Record a non-auth failure
+        bundle.record_failure("x", health.TIMEOUT, "request timed out", attempted=True)
+        self.assertEqual(health.TIMEOUT, bundle.source_status["x"].state)
+
+        # Add items
+        items = [_make_source_item("x", "X1", "https://x.com/a/status/1")]
+        bundle.add_items("primary", "x", items)
+
+        # State should become PARTIAL (not TIMEOUT)
+        self.assertEqual(schema.PARTIAL, bundle.source_status["x"].state)
+        # Detail should be preserved
+        self.assertEqual("request timed out", bundle.source_status["x"].detail)
+
+    def test_record_failure_preserves_auth_failed_when_items_exist(self):
+        """record_failure should preserve AUTH_FAILED even when items already exist.
+
+        When Phase 1 has already collected X posts and a supplemental Grok lane
+        reports revocation, record_failure must not convert AUTH_FAILED to PARTIAL.
+        """
+        bundle = schema.RetrievalBundle()
+        bundle.mark_attempted("x")
+
+        # Phase 1 already collected items
+        phase1_items = [_make_source_item("x", "X1", "https://x.com/a/status/1")]
+        bundle.add_items("primary", "x", phase1_items)
+        self.assertEqual(health.OK, bundle.source_status["x"].state)
+
+        # Supplemental lane reports auth failure
+        bundle.record_failure("x", schema.AUTH_FAILED, "grok session revoked", attempted=True)
+
+        # State must be AUTH_FAILED, not PARTIAL
+        self.assertEqual(schema.AUTH_FAILED, bundle.source_status["x"].state)
+        # Detail should be set
+        self.assertEqual("grok session revoked", bundle.source_status["x"].detail)
+        # Items should still be there
+        self.assertEqual(1, len(bundle.items_by_source["x"]))
+
+
 class TestSupplementalSearches(unittest.TestCase):
     """R1: Phase 2 entity drilling should be wired into the pipeline."""
 

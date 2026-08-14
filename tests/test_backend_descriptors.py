@@ -56,6 +56,7 @@ def _x_env(
     node_status=health.OK,
     grok_installed=False,
     grok_authed=False,
+    grok_expired=False,
 ):
     """Context managers configuring the X-chain probe environment.
 
@@ -63,20 +64,38 @@ def _x_env(
     network check (``is_available``) and the doctor-path local evidence
     (``stored_auth_status``/``has_stored_auth``) — a real machine where the
     user logged in has both.
+
+    ``grok_expired`` simulates an expired session: AUTH_EXPIRED status, but
+    has_stored_auth/is_available still return True (refresh may work).
     """
+    from datetime import datetime, timezone, timedelta
     stored = (
         (xurl_x.AUTH_OK, "stored OAuth credentials found in ~/.xurl")
         if xurl_authed
         else (xurl_x.AUTH_MISSING, "no token store at ~/.xurl")
     )
-    # grok defaults to absent so an existing X test never resolves it against
-    # the developer's own machine. Both grok surfaces are filesystem-only, so
-    # one flag drives them consistently.
-    grok_stored = (
-        (grok_x.AUTH_OK, "stored Grok credentials found in ~/.grok/auth.json")
-        if grok_authed
-        else (grok_x.AUTH_MISSING, "no Grok credential store at ~/.grok/auth.json")
-    )
+    if grok_expired:
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+        grok_stored = (
+            grok_x.AUTH_EXPIRED,
+            f"Grok session expired at {past.isoformat()}",
+            past,
+        )
+        grok_available = grok_installed
+    elif grok_authed:
+        grok_stored = (
+            grok_x.AUTH_OK,
+            "stored Grok credentials found in ~/.grok/auth.json",
+            None,
+        )
+        grok_available = grok_installed
+    else:
+        grok_stored = (
+            grok_x.AUTH_MISSING,
+            "no Grok credential store at ~/.grok/auth.json",
+            None,
+        )
+        grok_available = False
     return (
         mock.patch("lib.bird_x.is_bird_installed", return_value=bird_installed),
         mock.patch("lib.bird_x.set_credentials", lambda *a, **k: None),
@@ -92,9 +111,9 @@ def _x_env(
         mock.patch("lib.grok_x.stored_auth_status", return_value=grok_stored),
         mock.patch(
             "lib.grok_x.has_stored_auth",
-            return_value=grok_installed and grok_authed,
+            return_value=grok_installed and (grok_authed or grok_expired),
         ),
-        mock.patch("lib.grok_x.is_available", return_value=grok_installed and grok_authed),
+        mock.patch("lib.grok_x.is_available", return_value=grok_available),
         mock.patch("lib.health.probe_dependency", _probe_dep({"node": node_status})),
         mock.patch("lib.xurl_x.stored_auth_status", return_value=stored),
         mock.patch(
@@ -264,6 +283,75 @@ class TestXPrediction:
         bird = next(f for f in res.findings if f.name == "bird")
         assert bird.status == health.BROKEN
         assert "node" in bird.prescription.lower()
+
+    def test_grok_expired_is_degraded_not_ok(self):
+        """Expired grok session -> DEGRADED tier (warn), not OK."""
+        res = _resolve_x({}, grok_installed=True, grok_expired=True)
+        grok = next(f for f in res.findings if f.name == "grok")
+        assert grok.status == health.DEGRADED
+        assert grok.usable  # DEGRADED is still usable (refresh may work)
+        assert "expired" in grok.detail.lower()
+        assert "grok login" in grok.prescription.lower()
+        # The chain resolution should still pick grok (degraded is usable).
+        assert res.active_backend == "grok"
+        assert res.tier == backends.TIER_WARN
+
+    def test_grok_expired_with_fallback_picks_fallback(self):
+        """When grok is expired AND a better backend is OK, pick the OK one."""
+        config = {"AUTH_TOKEN": "dummy-token", "CT0": "dummy-ct0"}
+        res = _resolve_x(config, grok_installed=True, grok_expired=True, bird_installed=True)
+        # Bird is OK, grok is DEGRADED. OK wins over DEGRADED.
+        assert res.active_backend == "bird"
+        assert res.tier == backends.TIER_OK
+
+    def test_grok_future_expires_at_is_ok(self):
+        """Grok with future expires_at reports OK."""
+        res = _resolve_x({}, grok_installed=True, grok_authed=True)
+        grok = next(f for f in res.findings if f.name == "grok")
+        assert grok.status == health.OK
+        assert "not live-verified" in grok.detail
+
+
+# ---------------------------------------------------------------------------
+# Grok session expiry: three states
+# ---------------------------------------------------------------------------
+
+class TestGrokExpiryStates:
+    """Test the three grok auth states from the plan:
+    1. No grok CLI -> silent fallback
+    2. CLI installed, never logged in -> silent fallback
+    3. CLI installed, WAS logged in, session dead -> DEGRADED with expiry info
+    """
+
+    def test_no_grok_cli_is_missing(self):
+        """No grok CLI -> MISSING status, no extra failure noise."""
+        res = _resolve_x({}, grok_installed=False)
+        grok = next(f for f in res.findings if f.name == "grok")
+        assert grok.status == health.MISSING
+        assert "not found on PATH" in grok.detail
+
+    def test_grok_installed_never_logged_in_is_missing(self):
+        """CLI installed but never logged in -> MISSING with login hint."""
+        res = _resolve_x({}, grok_installed=True, grok_authed=False)
+        grok = next(f for f in res.findings if f.name == "grok")
+        assert grok.status == health.MISSING
+        assert "not signed in" in grok.detail
+        assert "grok login" in grok.prescription
+
+    def test_grok_session_expired_is_degraded_with_expiry(self):
+        """Session expired -> DEGRADED with timestamp and refresh hint."""
+        res = _resolve_x({}, grok_installed=True, grok_expired=True)
+        grok = next(f for f in res.findings if f.name == "grok")
+        assert grok.status == health.DEGRADED
+        assert "expired" in grok.detail.lower()
+        # The detail should include the expiry timestamp and hint
+        assert "refresh" in grok.detail.lower() or "login" in grok.prescription.lower()
+
+    def test_grok_healthy_session_is_ok(self):
+        """Non-expired credentials -> OK."""
+        res = _resolve_x({}, grok_installed=True, grok_authed=True)
+        grok = next(f for f in res.findings if f.name == "grok")
+        assert grok.status == health.OK
 
 
 # ---------------------------------------------------------------------------

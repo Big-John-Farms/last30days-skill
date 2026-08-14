@@ -269,10 +269,6 @@ def _probe_grok(config: Dict[str, Any]) -> BackendFinding:
 
     requires = "grok CLI installed + signed in (no X credential)"
     if which("grok") is None:
-        # Installed-but-off-PATH is a distinct outcome with a distinct fix:
-        # telling the user to install again fixes nothing. Confirmed real --
-        # the official installer places the binary at ~/.grok/bin/grok, which
-        # an agent subprocess PATH often omits.
         off_path = health._off_path_binary("grok")
         if off_path is not None:
             return BackendFinding(
@@ -292,13 +288,25 @@ def _probe_grok(config: Dict[str, Any]) -> BackendFinding:
                 "then run `grok login`"
             ),
         )
-    store_status, store_detail = grok_x.stored_auth_status()
+    store_status, store_detail, expires_at = grok_x.stored_auth_status()
     if store_status == grok_x.AUTH_OK:
         return BackendFinding(
             name="grok",
             status=health.OK,
             requires=requires,
             detail=f"{store_detail} (not live-verified until a run)",
+        )
+    if store_status == grok_x.AUTH_EXPIRED:
+        expiry_str = expires_at.isoformat() if expires_at else "unknown"
+        return BackendFinding(
+            name="grok",
+            status=health.DEGRADED,
+            requires=requires,
+            detail=(
+                f"Grok session expired at {expiry_str}; "
+                "refresh happens at run time (if revoked, run `grok login --device-auth`)"
+            ),
+            prescription="grok login --device-auth",
         )
     if store_status == grok_x.AUTH_ERROR:
         return BackendFinding(

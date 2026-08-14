@@ -240,8 +240,9 @@ def test_non_execution_is_retried(monkeypatch):
 
     monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
     monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
-    items, error = grok_x._run_query("steipete", *WINDOW)
+    items, error, auth_revoked = grok_x._run_query("steipete", *WINDOW)
     assert calls["n"] == 2, "a provenance rejection must be retried once"
+    assert not auth_revoked
     assert len(items) == 1 and not error
 
 
@@ -259,8 +260,9 @@ def test_stored_auth_status_makes_no_subprocess_or_network(monkeypatch):
 
 def test_stored_auth_status_reports_missing_store(monkeypatch, tmp_path):
     monkeypatch.setattr(grok_x, "token_store_path", lambda: tmp_path / "nope.json")
-    status, detail = grok_x.stored_auth_status()
+    status, detail, expires_at = grok_x.stored_auth_status()
     assert status == grok_x.AUTH_MISSING and "nope.json" in detail
+    assert expires_at is None
 
 
 def test_stored_auth_status_detects_credentials(monkeypatch, tmp_path):
@@ -275,7 +277,7 @@ def test_stored_auth_status_never_echoes_store_contents(monkeypatch, tmp_path):
     store = tmp_path / "auth.json"
     store.write_text('{"key": "SUPER-SECRET-VALUE", "refresh_token": "ALSO-SECRET"}')
     monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
-    _, detail = grok_x.stored_auth_status()
+    _, detail, _ = grok_x.stored_auth_status()
     assert "SUPER-SECRET-VALUE" not in detail and "ALSO-SECRET" not in detail
 
 
@@ -289,6 +291,129 @@ def test_unreadable_store_is_an_error(monkeypatch, tmp_path):
     monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
     monkeypatch.setattr(type(store), "read_text", boom, raising=False)
     assert grok_x.stored_auth_status()[0] == grok_x.AUTH_ERROR
+
+
+# --- expires_at parsing -----------------------------------------------------
+
+def test_stored_auth_status_future_expires_at_is_ok(monkeypatch, tmp_path):
+    """Credentials with expires_at in the future report AUTH_OK."""
+    from datetime import datetime, timezone, timedelta
+    future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    store = tmp_path / "auth.json"
+    store.write_text(f'{{"iss": {{"refresh_token": "tok", "expires_at": "{future}"}}}}')
+    monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
+    status, detail, expires_at = grok_x.stored_auth_status()
+    assert status == grok_x.AUTH_OK
+    assert expires_at is not None
+
+
+def test_stored_auth_status_past_expires_at_is_expired(monkeypatch, tmp_path):
+    """Credentials with expires_at in the past report AUTH_EXPIRED, not AUTH_OK."""
+    from datetime import datetime, timezone, timedelta
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    store = tmp_path / "auth.json"
+    store.write_text(f'{{"iss": {{"refresh_token": "tok", "expires_at": "{past}"}}}}')
+    monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
+    status, detail, expires_at = grok_x.stored_auth_status()
+    assert status == grok_x.AUTH_EXPIRED
+    assert "expired" in detail.lower()
+    assert expires_at is not None
+
+
+def test_stored_auth_status_no_expires_at_is_ok(monkeypatch, tmp_path):
+    """Credentials without expires_at default to AUTH_OK (legacy stores)."""
+    store = tmp_path / "auth.json"
+    store.write_text('{"iss": {"refresh_token": "tok"}}')
+    monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
+    status, _, expires_at = grok_x.stored_auth_status()
+    assert status == grok_x.AUTH_OK
+    assert expires_at is None
+
+
+def test_stored_auth_status_unparseable_json_is_ok_with_markers(monkeypatch, tmp_path):
+    """Malformed JSON with credential markers reports AUTH_OK (graceful degradation)."""
+    store = tmp_path / "auth.json"
+    store.write_text('{"refresh_token": "tok" this is not valid json')
+    monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
+    status, _, _ = grok_x.stored_auth_status()
+    assert status == grok_x.AUTH_OK
+
+
+def test_stored_auth_status_unparseable_expires_at_is_ok(monkeypatch, tmp_path):
+    """Malformed expires_at is ignored, status is AUTH_OK."""
+    store = tmp_path / "auth.json"
+    store.write_text('{"iss": {"refresh_token": "tok", "expires_at": "not-a-date"}}')
+    monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
+    status, _, expires_at = grok_x.stored_auth_status()
+    assert status == grok_x.AUTH_OK
+    assert expires_at is None
+
+
+def test_stored_auth_status_z_suffix_parses_correctly(monkeypatch, tmp_path):
+    """ISO 8601 timestamps with Z suffix parse correctly."""
+    from datetime import datetime, timezone, timedelta
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    store = tmp_path / "auth.json"
+    store.write_text(f'{{"iss": {{"refresh_token": "tok", "expires_at": "{past}"}}}}')
+    monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
+    status, _, _ = grok_x.stored_auth_status()
+    assert status == grok_x.AUTH_EXPIRED
+
+
+def test_has_stored_auth_true_when_expired(monkeypatch, tmp_path):
+    """has_stored_auth returns True even when expired (refresh may work)."""
+    from datetime import datetime, timezone, timedelta
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    store = tmp_path / "auth.json"
+    store.write_text(f'{{"iss": {{"refresh_token": "tok", "expires_at": "{past}"}}}}')
+    monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
+    assert grok_x.has_stored_auth() is True
+
+
+def test_is_available_true_when_expired(monkeypatch, tmp_path):
+    """is_available returns True when expired (CLI will try refresh at runtime)."""
+    from datetime import datetime, timezone, timedelta
+    past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    store = tmp_path / "auth.json"
+    store.write_text(f'{{"iss": {{"refresh_token": "tok", "expires_at": "{past}"}}}}')
+    monkeypatch.setattr(grok_x, "token_store_path", lambda: store)
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
+    grok_x.clear_availability_cache()
+    assert grok_x.is_available() is True
+
+
+# --- auth revocation detection ----------------------------------------------
+
+def test_is_auth_revoked_error_detects_markers():
+    """Auth revocation markers are detected."""
+    assert grok_x.is_auth_revoked_error("Not signed in")
+    assert grok_x.is_auth_revoked_error("invalid_grant: Refresh token has been revoked")
+    assert grok_x.is_auth_revoked_error("Authentication failed")
+    assert grok_x.is_auth_revoked_error("grok CLI exited 1: not logged in")
+    assert not grok_x.is_auth_revoked_error("timed out after 30s")
+    assert not grok_x.is_auth_revoked_error("")
+
+
+def test_classify_run_failure_returns_auth_failed_for_revocation():
+    """classify_run_failure maps revocation errors to AUTH_FAILED."""
+    from lib import health
+    assert grok_x.classify_run_failure("Not signed in") == health.AUTH_FAILED
+    assert grok_x.classify_run_failure("invalid_grant") == health.AUTH_FAILED
+    assert grok_x.classify_run_failure("timed out") == health.TIMEOUT
+    assert grok_x.classify_run_failure("some other error") == health.ERROR
+
+
+def test_search_x_returns_auth_revoked_on_session_failure(monkeypatch):
+    """search_x returns auth_revoked when the session is revoked mid-run."""
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
+    monkeypatch.setattr(
+        grok_x.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "Not signed in"),
+    )
+    result = grok_x.search_x("test topic", *WINDOW)
+    assert result.get("auth_revoked") is True
+    assert "error" in result
 
 
 def test_availability_cache_is_resettable(monkeypatch):
@@ -314,12 +439,16 @@ def test_from_lane_filters_by_actual_author(monkeypatch):
     """Operator fidelity is not guaranteed: a measured from: query returned a
     post by a different account."""
     _stub_response(monkeypatch, _block("2087568620465607078", handle="leojr94_"))
-    assert grok_x.search_handles(["steipete"], "topic", *WINDOW) == []
+    items, revoked = grok_x.search_handles(["steipete"], "topic", *WINDOW)
+    assert items == []
+    assert revoked is False
 
 
 def test_from_lane_keeps_matching_author(monkeypatch):
     _stub_response(monkeypatch, _block("2087568620465607078", handle="steipete"))
-    assert len(grok_x.search_handles(["steipete"], "topic", *WINDOW)) == 1
+    items, revoked = grok_x.search_handles(["steipete"], "topic", *WINDOW)
+    assert len(items) == 1
+    assert revoked is False
 
 
 def test_from_lane_does_not_and_the_topic_into_the_query(monkeypatch):
@@ -338,13 +467,16 @@ def test_from_lane_does_not_and_the_topic_into_the_query(monkeypatch):
 def test_mention_lane_excludes_the_subject_client_side(monkeypatch):
     """A measured run carrying -from:X still returned a post authored by X."""
     _stub_response(monkeypatch, _block("2087568620465607078", handle="GetEnergy_"))
-    assert grok_x.search_mentions(["GetEnergy_"], *WINDOW) == []
+    items, revoked = grok_x.search_mentions(["GetEnergy_"], *WINDOW)
+    assert items == []
+    assert revoked is False
 
 
 def test_name_lane_needs_no_handle(monkeypatch):
     _stub_response(monkeypatch, _block("2087568620465607078", handle="iamcaroren"))
-    items = grok_x.search_name("Bentgo", *WINDOW)
+    items, revoked = grok_x.search_name("Bentgo", *WINDOW)
     assert len(items) == 1
+    assert revoked is False
 
 
 def test_name_lane_quotes_multi_word_names(monkeypatch):
@@ -362,7 +494,9 @@ def test_name_lane_quotes_multi_word_names(monkeypatch):
 
 def test_name_lane_excludes_subject_authored_posts(monkeypatch):
     _stub_response(monkeypatch, _block("2087568620465607078", handle="Bentgo"))
-    assert grok_x.search_name("Bentgo", *WINDOW, exclude_handles=["Bentgo"]) == []
+    items, revoked = grok_x.search_name("Bentgo", *WINDOW, exclude_handles=["Bentgo"])
+    assert items == []
+    assert revoked is False
 
 
 def test_name_lane_applies_an_engagement_floor(monkeypatch):
@@ -380,6 +514,70 @@ def test_name_lane_applies_an_engagement_floor(monkeypatch):
         "other two do not"
     )
 
+
+# --- lane revocation propagation -------------------------------------------
+
+def test_from_lane_returns_revoked_on_auth_failure(monkeypatch):
+    """search_handles should return (items, True) when auth is revoked mid-lane."""
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, "", "Error: Not signed in")
+
+    monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
+    items, revoked = grok_x.search_handles(["steipete"], "topic", *WINDOW)
+    assert revoked is True
+    assert items == []
+
+
+def test_mention_lane_returns_revoked_on_auth_failure(monkeypatch):
+    """search_mentions should return (items, True) when auth is revoked."""
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, "", "Error: Not signed in")
+
+    monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
+    items, revoked = grok_x.search_mentions(["steipete"], *WINDOW)
+    assert revoked is True
+    assert items == []
+
+
+def test_name_lane_returns_revoked_on_auth_failure(monkeypatch):
+    """search_name should return (items, True) when auth is revoked."""
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, "", "Error: Not signed in")
+
+    monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
+    items, revoked = grok_x.search_name("Bentgo", *WINDOW)
+    assert revoked is True
+    assert items == []
+
+
+def test_from_lane_preserves_items_collected_before_revocation(monkeypatch):
+    """Items collected before auth revocation should be returned with revoked=True."""
+    monkeypatch.setattr(grok_x, "binary_path", lambda: "/usr/bin/grok")
+    call_count = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # First handle succeeds
+            return subprocess.CompletedProcess(
+                cmd, 0, _block("2087568620465607078", handle="steipete"), ""
+            )
+        else:
+            # Second handle hits auth revocation
+            return subprocess.CompletedProcess(cmd, 1, "", "Error: Not signed in")
+
+    monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
+    items, revoked = grok_x.search_handles(["steipete", "other"], "topic", *WINDOW)
+    # Should return items from first successful call AND signal revocation
+    assert len(items) == 1
+    assert items[0]["author_handle"] == "steipete"
+    assert revoked is True
 
 
 # --- fixes applied after review --------------------------------------------

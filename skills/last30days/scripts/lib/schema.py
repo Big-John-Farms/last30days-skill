@@ -357,9 +357,18 @@ class RetrievalBundle:
         *,
         attempted: bool = True,
     ) -> None:
-        """Record a failure, preserving already-returned items as partial."""
+        """Record a failure, preserving already-returned items as partial.
+
+        AUTH_FAILED is preserved even when items exist, since the re-login
+        signal shouldn't be downgraded to generic PARTIAL guidance.
+        """
         count = len(self.items_by_source.get(source, []))
-        outcome_state: RunOutcomeState = PARTIAL if count else state
+        # Preserve AUTH_FAILED even when items exist: it's an actionable signal
+        # (re-login needed) that shouldn't be downgraded to PARTIAL.
+        if state == AUTH_FAILED:
+            outcome_state: RunOutcomeState = AUTH_FAILED
+        else:
+            outcome_state = PARTIAL if count else state
         self.errors_by_source.setdefault(source, detail)
         self.source_status[source] = SourceOutcome(
             source=source,
@@ -379,7 +388,13 @@ class RetrievalBundle:
         detail = None
         fix_hint = None
         if previous and previous.state not in (health.OK, NO_RESULTS):
-            state = PARTIAL if self.items_by_source[source] else previous.state
+            # Preserve AUTH_FAILED state even when items are added: it's an
+            # actionable signal (re-login needed) that shouldn't be downgraded
+            # to PARTIAL. Other failure states become PARTIAL when items exist.
+            if previous.state == AUTH_FAILED:
+                state = AUTH_FAILED
+            else:
+                state = PARTIAL if self.items_by_source[source] else previous.state
             detail = previous.detail
             fix_hint = previous.fix_hint
         self.source_status[source] = SourceOutcome(

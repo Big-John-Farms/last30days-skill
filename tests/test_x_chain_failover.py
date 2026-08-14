@@ -80,10 +80,11 @@ def test_lane_budget_stops_issuing_queries(monkeypatch):
 
     monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
     past = _time.monotonic() - 1
-    got = grok_x.search_handles(
+    items, revoked = grok_x.search_handles(
         ["a", "b", "c"], "topic", "2026-07-14", "2026-08-13", deadline=past
     )
-    assert got == []
+    assert items == []
+    assert revoked is False
     assert calls["n"] == 0, "an expired budget must stop the lane before any call"
 
 
@@ -103,9 +104,10 @@ def test_clean_empty_is_not_retried(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, "The search returned no posts.", "")
 
     monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
-    items, error = grok_x._run_query("topic", "2026-07-14", "2026-08-13")
+    items, error, auth_revoked = grok_x._run_query("topic", "2026-07-14", "2026-08-13")
     assert items == [] and error == ""
     assert calls["n"] == 1, "a clean empty result must not be retried"
+    assert not auth_revoked
 
 
 def test_fabricated_response_is_still_retried(monkeypatch):
@@ -185,9 +187,10 @@ def test_a_call_is_not_started_when_it_cannot_finish_in_budget(monkeypatch):
     monkeypatch.setattr(grok_x.subprocess, "run", fake_run)
     # 5s left: below the minimum useful call, so nothing should start.
     near = _time.monotonic() + 5
-    items, error = grok_x._run_query("topic", "2026-07-14", "2026-08-13", deadline=near)
+    items, error, auth_revoked = grok_x._run_query("topic", "2026-07-14", "2026-08-13", deadline=near)
     assert calls["n"] == 0
     assert "budget exhausted" in error
+    assert not auth_revoked
 
 
 def test_timeout_never_exceeds_the_remaining_budget(monkeypatch):
