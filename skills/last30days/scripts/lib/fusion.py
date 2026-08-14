@@ -11,7 +11,18 @@ RRF_K = 60
 
 
 def _candidate_sort_key(c: schema.Candidate) -> tuple:
-    return (-c.rrf_score, -c.local_relevance, -c.freshness, schema.candidate_source_label(c), c.title)
+    # Out-of-window evidence sorts strictly below anything in the window. A
+    # "last 30 days" brief that ranks a nine-month-old video at #1 breaks its
+    # own contract, however relevant that video is; it still appears, just
+    # never above in-window evidence.
+    return (
+        1 if schema.candidate_out_of_window(c) else 0,
+        -c.rrf_score,
+        -c.local_relevance,
+        -c.freshness,
+        schema.candidate_source_label(c),
+        c.title,
+    )
 
 
 def _normalize_url(url: str) -> str:
@@ -112,8 +123,16 @@ def weighted_rrf(
     plan: schema.QueryPlan,
     *,
     pool_limit: int,
+    range_from: str | None = None,
+    range_to: str | None = None,
 ) -> list[schema.Candidate]:
-    """Fuse ranked lists into a single candidate pool."""
+    """Fuse ranked lists into a single candidate pool.
+
+    When ``range_from`` and ``range_to`` are provided, they are stored in each
+    candidate's metadata so ``candidate_out_of_window`` can compare the actual
+    date against the run window (instead of relying solely on adapter-provided
+    ``date_confidence``).
+    """
     subqueries = {subquery.label: subquery for subquery in plan.subqueries}
     candidates: dict[str, schema.Candidate] = {}
     # Track (source, item_id) pairs already attached to each candidate for O(1) dedup.
@@ -129,6 +148,20 @@ def weighted_rrf(
             item_freshness = item.freshness if item.freshness is not None else int(item.metadata.get("freshness", 0))
             item_source_quality = item.source_quality if item.source_quality is not None else float(item.metadata.get("source_quality", 0.6))
             if key not in candidates:
+                candidate_metadata: dict = {
+                    "provenance": [
+                        {
+                            "source": source,
+                            "subquery_label": label,
+                            "native_rank": rank,
+                            "item_id": item.item_id,
+                        }
+                    ]
+                }
+                if range_from:
+                    candidate_metadata["range_from"] = range_from
+                if range_to:
+                    candidate_metadata["range_to"] = range_to
                 candidates[key] = schema.Candidate(
                     candidate_id=key,
                     item_id=item.item_id,
@@ -145,16 +178,7 @@ def weighted_rrf(
                     rrf_score=score,
                     sources=[item.source],
                     source_items=[item],
-                    metadata={
-                        "provenance": [
-                            {
-                                "source": source,
-                                "subquery_label": label,
-                                "native_rank": rank,
-                                "item_id": item.item_id,
-                            }
-                        ]
-                    },
+                    metadata=candidate_metadata,
                 )
                 seen_source_items[key] = {(item.source, item.item_id)}
                 continue
