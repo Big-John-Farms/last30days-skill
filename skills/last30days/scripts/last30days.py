@@ -733,6 +733,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--amazon-query",
+        help=(
+            "Product keyword the amazon source searches, when that source is active. "
+            "Defaults to the topic. Supply it whenever the topic is not the product: "
+            "a person topic searches their company's product line "
+            "(--amazon-query='June Oven'), and a brand searches brand-plus-category "
+            "(--amazon-query='Weber grill', not 'Weber' -- a bare brand keyword lands "
+            "on an ad-heavy page that can miss the brand's own bestsellers). "
+            "Requires the brightdata CLI on PATH and logged in."
+        ),
+    )
+    parser.add_argument(
         "--competitors",
         nargs="?",
         const=2,
@@ -2746,6 +2758,40 @@ def _run_library_search(
     return 0
 
 
+def _looks_like_entity_topic(topic: str) -> bool:
+    """Whether a topic names a person, company, or product rather than a theme.
+
+    Keys on brevity, not capitalization. People type lowercase: "bentgo",
+    "peter steinberger" and "getenergy.com" are entity searches every bit as
+    much as their title-cased forms, and requiring a capital meant the most
+    common real-world spelling never resolved a handle.
+
+    A short topic is an entity search; a longer one is a theme. "Peter
+    Steinberger", "bentgo" and "getenergy.com" qualify; "best AI coding tools
+    2026" and "how to build agents that scale" do not. Question-shaped topics
+    are themes regardless of length.
+
+    Used only to decide whether resolving an X handle is worth one web search,
+    so a false negative costs the old behavior and a false positive costs a
+    single search.
+    """
+    text = (topic or "").strip()
+    if not text or text.endswith("?"):
+        return False
+    words = [w for w in re.findall(r"[A-Za-z0-9_.@'-]+", text) if w]
+    if not words or len(words) > 4:
+        return False
+    if any(w.startswith("@") for w in words):
+        return True
+    # A theme reads as a phrase built from common words; an entity does not.
+    common = {
+        "best", "top", "how", "why", "what", "when", "vs", "versus", "guide",
+        "tips", "review", "reviews", "news", "latest", "update", "updates",
+        "trends", "tools", "and", "or", "for", "the", "with", "about",
+    }
+    return not any(w.lower() in common for w in words)
+
+
 def main() -> int:
     parser = build_parser()
     # Use parse_known_args so setup sub-flags (--device-auth, --github,
@@ -3224,6 +3270,28 @@ def _main(
         # without WebSearch (OpenClaw, Codex, raw CLI).
         repos_from_auto_resolve = False
         trustpilot_domain_is_hint = False
+        # Resolve automatically for entity-shaped topics even without the flag.
+        # A person or company topic whose handle the user did not supply is the
+        # case where first-party evidence is hardest to protect: the handle is
+        # absent from the topic and may never appear in retrieved mentions, so
+        # nothing downstream can identify the subject's own posts. One web
+        # search closes that. If it returns nothing, pipeline.run skips the X
+        # relevance floor entirely — a noisier report beats losing evidence.
+        # Skipped when a handle was already supplied, when an external plan
+        # owns resolution, or in mock runs.
+        if (
+            not args.auto_resolve
+            and not external_plan
+            and not args.x_handle
+            and not args.mock
+            and _looks_like_entity_topic(topic)
+        ):
+            args.auto_resolve = True
+            sys.stderr.write(
+                "[AutoResolve] entity-shaped topic with no --x-handle; "
+                "resolving the subject's handle so its own posts are not pruned\n"
+            )
+
         if args.auto_resolve and not external_plan:
             from lib import resolve
             resolution = resolve.auto_resolve(topic, config)
@@ -3233,6 +3301,8 @@ def _main(
             if resolution.get("x_handle") and not args.x_handle:
                 args.x_handle = resolution["x_handle"]
                 sys.stderr.write(f"[AutoResolve] X handle: @{args.x_handle}\n")
+            # Empty x_handle is intentional: do not invent a lexical stand-in.
+            # pipeline.run treats an unidentified subject as "skip the X floor".
             if resolution.get("github_user") and not args.github_user:
                 args.github_user = resolution["github_user"]
                 sys.stderr.write(f"[AutoResolve] GitHub user: @{args.github_user}\n")
@@ -3307,6 +3377,28 @@ def _main(
             ]
             if keywords:
                 config["_polymarket_keywords"] = keywords
+
+        # Product keyword for the amazon source. Carried on config rather than
+        # threaded through the run signature (the _polymarket_keywords idiom):
+        # it is one optional string consumed in exactly two places.
+        if getattr(args, "amazon_query", None):
+            config["_amazon_query"] = args.amazon_query.strip()
+            # Unlike --trustpilot-domain, this flag deliberately does NOT
+            # auto-activate its source: the lane spends metered credits, so
+            # turning it on stays an explicit request. But silence is the
+            # wrong failure mode -- a model that resolves the keyword and
+            # forgets the --search token would otherwise get no signal at
+            # all that the flag did nothing.
+            _amazon_requested = (
+                (requested_sources and "amazon" in requested_sources)
+                or "amazon" in str(config.get("INCLUDE_SOURCES") or "").lower()
+            )
+            if not _amazon_requested:
+                sys.stderr.write(
+                    "[Amazon] --amazon-query was set but the amazon source was not "
+                    "requested; add it to --search (e.g. --search reddit,x,amazon) "
+                    "or set INCLUDE_SOURCES=amazon. Ignoring the keyword.\n"
+                )
 
         # vs-mode / plan routing: split a vs-topic into main + peers unless
         # discover-N or an explicit --competitors-list already decided who runs.
@@ -3428,6 +3520,14 @@ def _main(
                 # leak across sub-runs. Each sub-run writes its own
                 # `_auto_resolve_context` into its local config copy.
                 entity_config = dict(config)
+                # The Amazon keyword is entity-SPECIFIC, unlike the depth caps
+                # this shallow copy exists to inherit. Leaving the main topic's
+                # keyword in place would search Weber SKUs for a Traeger peer,
+                # render a rival's products as that peer's buyer evidence, and
+                # multiply the metered spend by the number of entities. Drop it
+                # so each peer derives its own keyword from its own topic; a
+                # per-entity keyword can ride in the --competitors-plan entry.
+                entity_config.pop("_amazon_query", None)
                 plan_entry = comp_plan.get(entity.strip().lower(), {})
                 resolved = {
                     "entity": entity,
